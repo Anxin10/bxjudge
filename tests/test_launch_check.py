@@ -279,3 +279,86 @@ def test_air_cutoff_requires_battle_landing_not_lid_settle(th):
     assert lc.landing_zone == {'X': 'lid', 'B': 'lid'}
     assert lc.landed == {'X': False, 'B': False}
     assert lc.air_collision == 'yes'
+
+@pytest.mark.parametrize('missing', [set(range(1, 30)), {0}, {15}, {29}])
+def test_partial_motion_coverage_leaves_both_sides_unknown(missing, th):
+    disp = {f: 0.0 for f in range(30) if f not in missing}
+    touch, notes = detect_touch(disp, [], {}, set(), (0, 30), make_calibration(), th)
+    assert touch == {'X': 'unknown', 'B': 'unknown'}
+    assert 'stadium_motion_missing' in notes
+
+
+@pytest.mark.parametrize('missing', [5, 20])
+def test_missing_motion_preserves_affirmative_touch(missing, th):
+    disp = pulse(n=30)
+    del disp[missing]
+    body = make_track(9, 'launcher', {10: (100, 22)})
+    touch, notes = detect_touch(disp, [body], {9: 'X'}, set(), (0, 30), make_calibration(), th)
+    assert touch == {'X': 'yes', 'B': 'unknown'}
+    assert 'stadium_motion_missing' in notes
+
+
+@pytest.mark.parametrize(('at', 'expected'), [
+    (9, {'X': 'no', 'B': 'no'}),
+    (10, {'X': 'unknown', 'B': 'unknown'}),
+    (29, {'X': 'unknown', 'B': 'unknown'}),
+    (30, {'X': 'no', 'B': 'no'}),
+])
+def test_touch_window_is_start_inclusive_end_exclusive(at, expected, th):
+    touch, _ = detect_touch(pulse(at, 31), [], {}, set(), (10, 30), make_calibration(), th)
+    assert touch == expected
+
+
+def test_end_frame_is_not_required_motion_evidence(th):
+    touch, notes = detect_touch({f: 0.0 for f in range(30)}, [], {}, set(),
+                                (0, 30), make_calibration(), th)
+    assert touch == {'X': 'no', 'B': 'no'}
+    assert notes == []
+
+
+@pytest.mark.parametrize(('at', 'expected'), [
+    (31, {'X': 'unknown', 'B': 'unknown'}),
+    (32, {'X': 'no', 'B': 'no'}),
+])
+def test_successful_launch_touch_window_excludes_post_end_frame(at, expected, th):
+    # Separate floor rests at frame 2; the configured 0.5 s interval ends at 32.
+    tracks = [make_track(tid, 'bey', fall_then_rest(2, (x, 180), (x, 0)))
+              for tid, x in ((1, 150), (2, 500))]
+    lc, _ = check_launch(tracks, [], pulse(at, 33), make_calibration(), th, 60)
+    assert lc.landing_frame == {'X': 2, 'B': 2}
+    assert lc.touch == expected
+
+
+def test_post_deadline_physical_settle_still_excludes_touch(th):
+    x = {0: (150, 0), 1: (150, 100)}
+    x.update({f: (150, 100) for f in range(2, 181)})
+    x.update({f: (150, 120) for f in range(181, 221)})
+    b = {0: (560, 0), 1: (560, 60)}
+    b.update({f: (560, 60) for f in range(2, 170)})
+    b.update({f: (500, 180) for f in range(170, 221)})
+    tracks = [make_track(1, 'bey', x), make_track(2, 'bey', b)]
+    body = make_track(9, 'launcher', {182: (100, 22)})
+    # Both successful launches extend [0, 201), past the eligibility cap 180.
+    lc, _ = check_launch(tracks, [body], pulse(182, 201), make_calibration(), th, 60)
+    assert lc.landed == {'X': True, 'B': True}
+    assert lc.landing_frame == {'X': 2, 'B': 171}
+    assert lc.touch == {'X': 'no', 'B': 'no'}
+    assert 'shake_by_bey_impact@182' in lc.notes
+
+
+def test_late_physical_floor_still_cuts_off_ground_collision(th):
+    tracks = []
+    for tid, startx, floorx, direction in ((1, 80, 180, -1), (2, 560, 420, 1)):
+        centers = {0: (startx, 0), 1: (startx, 60)}
+        centers.update({f: (startx, 60) for f in range(2, 190)})
+        centers.update({f: (floorx, 180) for f in range(190, 200)})
+        centers.update({f: (300 + direction * 12 * abs(f - 210), 180)
+                        for f in range(200, 231)})
+        tracks.append(make_track(tid, 'bey', centers))
+    lc, _ = check_launch(tracks, [], pulse(250, 180), make_calibration(), th, 60)
+    assert lc.landed == {'X': False, 'B': False}
+    assert lc.landing_frame == {'X': 2, 'B': 2}
+    assert lc.landing_zone == {'X': 'lid', 'B': 'lid'}
+    assert 'landing_timing_unknown@X:191' in lc.notes
+    assert 'landing_timing_unknown@B:191' in lc.notes
+    assert lc.air_collision == 'maybe'

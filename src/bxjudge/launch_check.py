@@ -110,7 +110,8 @@ def detect_touch(disp: dict[int, float], launchers: list[Track], sides_of_launch
     """Attribute each above-threshold shake onset using observed launcher bodies.
 
     Positive evidence survives later uncertainty; uncertainty survives later no-touch
-    evidence. A nonfinite alignment result cannot establish absence of touch.
+    evidence. Every frame in the half-open window [start, end) needs finite
+    observed displacement to establish absence of touch.
     """
     touch: dict[Side, TouchState] = {'X': 'no', 'B': 'no'}
     notes = []
@@ -120,8 +121,8 @@ def detect_touch(disp: dict[int, float], launchers: list[Track], sides_of_launch
             if touch[side] != 'yes':
                 touch[side] = 'unknown'
 
-    observed = sorted(f for f in disp if window[0] <= f <= window[1])
-    if not observed:
+    observed = sorted(f for f in disp if window[0] <= f < window[1])
+    if len(observed) < window[1] - window[0]:
         unknown()
         notes.append('stadium_motion_missing')
     for f in observed:
@@ -181,6 +182,8 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
 
     The missing-landing cap bounds the search for battle-area settling. Within that
     search, a battle-area episode takes precedence over an earlier lid/rim episode.
+    Physical settle impacts and the first actual floor cutoff remain independent
+    of that eligibility deadline. The touch window is half-open [start, end).
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
@@ -191,8 +194,12 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
     start = max(0, first - round(th.launch_pre_s * fps))
     cap = first + round(th.launch_missing_landing_s * fps)
     all_episodes = {t.track_id: find_settles(t, c, th) for t in valid}
-    episodes = {t.track_id: [(f, z) for f, z in all_episodes[t.track_id] if f + th.settle_frames - 1 <= cap]
-                for t in valid}
+    eligible_episodes = {
+        tid: [(f, z) for f, z in settles if f + th.settle_frames - 1 <= cap]
+        for tid, settles in all_episodes.items()
+    }
+    physical_floor = {tid: next((f for f, z in settles if z == 'battle_area'), None)
+                      for tid, settles in all_episodes.items()}
     landing_frame = dict.fromkeys(_SIDES)
     landing_zone = dict.fromkeys(_SIDES)
     landed = dict.fromkeys(_SIDES, False)
@@ -201,7 +208,7 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
         if len(tracks) != 1:
             notes.append(f'track_evidence_{"missing" if not tracks else "duplicate"}@{side}')
             continue
-        settles = episodes[tracks[0].track_id]
+        settles = eligible_episodes[tracks[0].track_id]
         late = next((f for f, z in all_episodes[tracks[0].track_id]
                      if z == 'battle_area' and f + th.settle_frames - 1 > cap), None)
         if late is not None and not any(z == 'battle_area' for _, z in settles):
@@ -210,9 +217,9 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
         landing_frame[side], landing_zone[side] = selected
         landed[side] = selected[1] == 'battle_area'
     end = max(landing_frame.values()) + round(th.launch_post_s * fps) if all(landed.values()) else cap
-    impacts = impact_frames(valid, {t.track_id: landing_frame[sides[t.track_id]] for t in valid}, c, th)
-    # Earlier physical lid/rim settles can also cause a shake.
-    impacts.update(f for settles in episodes.values() for f, _ in settles)
+    impacts = impact_frames(valid, physical_floor, c, th)
+    # Every physical settle can cause a shake, including post-deadline episodes.
+    impacts.update(f for settles in all_episodes.values() for f, _ in settles)
     launcher_counts = Counter(t.track_id for t in launchers)
     launcher_sides = {}
     for t in launchers:
@@ -224,8 +231,8 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
     notes.extend(touch_notes)
     if all(len(tracks) == 1 for tracks in by_side.values()):
         air = detect_air_collision(by_side['X'][0], by_side['B'][0],
-                                   landing_frame['X'] if landed['X'] else None,
-                                   landing_frame['B'] if landed['B'] else None, th)
+                                   physical_floor[by_side['X'][0].track_id],
+                                   physical_floor[by_side['B'][0].track_id], th)
     else:
         air = 'maybe'
         for side in _SIDES:
