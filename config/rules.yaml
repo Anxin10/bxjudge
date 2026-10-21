@@ -1,0 +1,12 @@
+# Match rules (spec section 7). Source: Takara Tomy BEYBLADE X official tournament rules.
+# TODO(user): verify every value against the latest official rules PDF.
+rules_version: "takara-tomy-bx-2025-reg8"
+win_points: 4                      # first side to reach this many points wins the match
+finish_points: {spin: 1, burst: 2, over: 2, xtreme: 3}
+launch_check:                      # per-failure action: redo | ignore
+  stadium_touch: redo
+  bey_not_in_battle_area: redo
+  mid_air_collision: redo
+  repeat_miss_penalty: none        # none | opponent_1pt_on_2nd_miss
+draw:
+  action: redo                     # only "redo" is supported
