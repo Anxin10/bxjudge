@@ -12,6 +12,7 @@ Side = Literal["X", "B"]
 Finish = Literal["spin", "over", "burst", "xtreme"]
 TouchState = Literal["yes", "no", "unknown"]
 AirState = Literal["yes", "no", "maybe"]
+SpinDir = Literal["right", "left", "unknown"]
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]  # x1, y1, x2, y2
 Polygon = list[Point]
@@ -100,3 +101,4 @@ class RoundResult:
     vlm_note: str | None = None
     reviewed: bool = False
     reviewer_fix: dict | None = None
+    spin_dir: dict[Side, SpinDir] | None = None

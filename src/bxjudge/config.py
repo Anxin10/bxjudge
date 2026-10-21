@@ -24,6 +24,15 @@ class Thresholds:
     settle_frames: int
     fall_speed_px: float
     rim_margin_px: float
+    spin_dir_window_s: float
+    spin_dir_min_turn_deg: float
+    orbit_to_spin: dict[str, str]
+    reverse_frames: int
+    reverse_max_rate_deg: float
+    reverse_max_move_px: float
+    burst_part_radius_px: float
+    id_swap_confidence_factor: float
+    track_gap_confidence_factor: float
     still_px: float
     still_activity: float
     still_frames: int
@@ -55,7 +64,13 @@ def load_thresholds(path: str | Path = "config/thresholds.yaml") -> Thresholds:
     for name, f in flds.items():
         v = raw[name]
         # `from __future__ import annotations` makes f.type a string
-        if f.type in ("int", int):
+        if name == "orbit_to_spin":
+            if (not isinstance(v, dict) or set(v) != {"cw", "ccw"}
+                    or any(not isinstance(value, str) for value in v.values())
+                    or set(v.values()) != {"left", "right"}):
+                raise ValueError(f"{path}: orbit_to_spin must map cw/ccw bijectively to left/right")
+            v = dict(v)
+        elif f.type in ("int", int):
             if isinstance(v, bool) or not isinstance(v, int):
                 raise ValueError(f"{path}: {name} must be an int, got {v!r}")
         elif f.type in ("float", float):

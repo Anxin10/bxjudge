@@ -239,3 +239,59 @@ def fall_then_rest(
     for f in range(rest_at, n):
         out[f] = (rx, ry)
     return out
+
+
+def circle_path(center=(320, 170), r=60, deg_per_frame=4, n=120):
+    """Screen-coordinate orbit; positive angular steps are clockwise."""
+    import math
+
+    return {f: (center[0] + r * math.cos(math.radians(f * deg_per_frame)),
+                center[1] + r * math.sin(math.radians(f * deg_per_frame)))
+            for f in range(n)}
+
+
+def rotating_crops(deg_per_frame=5, n=10):
+    """Fixed 64x64 random texture, rotated clockwise by positive screen angles."""
+    import cv2
+    import numpy as np
+
+    texture = np.random.default_rng(42).integers(0, 256, (64, 64), dtype=np.uint8)
+    texture = cv2.GaussianBlur(texture, (3, 3), 0)
+    return {f: cv2.warpAffine(
+        texture, cv2.getRotationMatrix2D((31.5, 31.5), -f * deg_per_frame, 1.0),
+        (64, 64), borderMode=cv2.BORDER_REFLECT)
+        for f in range(n)}
+
+
+def slowing_bey(reverse_at=None, aliasing_flips_at=(), still_at=None, n=320):
+    """Known right baseline is screen-CCW under the default mapping."""
+    centers = {f: (250, 180) for f in range(n)}
+    activity = {f: 10.0 for f in range(n)}
+    rate = {f: -40.0 if f < 180 else -5.0 for f in range(n)}
+    for f in aliasing_flips_at:
+        rate[f] = 40.0
+    if reverse_at is not None:
+        rate.update({f: 5.0 for f in range(reverse_at, n)})
+    if still_at is not None:
+        activity.update({f: 0.0 for f in range(still_at, n)})
+        rate.update({f: 0.0 for f in range(still_at, n)})
+    return make_track(1, 'bey', centers), activity, rate
+
+
+def scene(*, b_path_into=None, x_path_into=None, b_enter_at=100, x_enter_at=100,
+          b_burst_at=None, stops=None, overlap_frames=0, n=340):
+    """Separated complete tracks, with explicit stable whole-box pocket entries."""
+    targets = {'xtreme': (320, 320), 'over_left': (75, 250), 'over_right': (565, 250)}
+    x = {f: (180, 180) for f in range(n)}
+    b = {f: (450, 180) for f in range(n)}
+    for centers, zone, at in ((x, x_path_into, x_enter_at), (b, b_path_into, b_enter_at)):
+        if zone:
+            centers.update({f: targets[zone] for f in range(at, n)})
+    for f in range(20, 20 + overlap_frames):
+        x[f] = b[f] = (300, 180)
+    parts = []
+    if b_burst_at is not None:
+        b = {f: p for f, p in b.items() if f < b_burst_at}
+        parts = [make_track(3, 'bey_part', {b_burst_at: (455, 185)})]
+    return ({'X': make_track(1, 'bey', x), 'B': make_track(2, 'bey', b)},
+            parts, stops or {'X': None, 'B': None}, make_calibration())
