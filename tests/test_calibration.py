@@ -9,8 +9,11 @@ from bxjudge.calibration import (
     load_calibration,
     save_calibration,
 )
-from bxjudge.cli import build_parser, main
-from tests.helpers import cal_with, make_calibration
+from bxjudge.cli import main
+from bxjudge.geometry import polygon_mask
+import cv2
+
+from tests.helpers import cal_with, make_calibration, make_ref_img, make_smooth_img
 
 
 def test_roundtrip(tmp_path):
@@ -63,8 +66,7 @@ def test_polygon_collector_order_undo_and_min_points():
     assert col.current.startswith("lid")
 
 
-def test_cli_has_calibrate_subcommand():
-    assert "calibrate" in build_parser()._subparsers._group_actions[0].choices
+def test_cli_calibrate_help_exits_zero():
     with pytest.raises(SystemExit) as e:
         main(["calibrate", "--help"])
     assert e.value.code == 0
@@ -81,5 +83,47 @@ def test_cli_calibrate_wires_to_interactive_calibrate(tmp_path, ref_img, monkeyp
     assert calibration_similarity(ref_img, c) > 0.95
 
 
-def test_interactive_calibrate_importable():
-    assert callable(calibration.interactive_calibrate)
+@pytest.mark.parametrize("shift", [10, 15, 20])
+def test_smooth_content_small_shift_detected(tmp_path, shift):
+    img = make_smooth_img()
+    c = cal_with(img, tmp_path)
+    assert calibration_similarity(img, c) > 0.95
+    assert calibration_similarity(np.roll(img, shift, axis=1), c) < 0.8
+    assert calibration_similarity(np.roll(img, shift, axis=0), c) < 0.8
+
+
+def test_change_outside_stadium_ignored(tmp_path):
+    img = make_smooth_img()
+    c = cal_with(img, tmp_path)
+    changed = img.copy()
+    changed[:15] = make_ref_img(seed=5)[:15]  # y < 20: above the stadium polygon (y 20..340)
+    changed[:, :30] = 0  # x < 40: left of the stadium
+    assert calibration_similarity(changed, c) > 0.95
+
+
+def test_change_inside_masked_region_drops_similarity(tmp_path):
+    img = make_smooth_img()
+    c = cal_with(img, tmp_path)
+    changed = img.copy()
+    ring = polygon_mask(c.stadium, c.frame_size) > 0
+    ring &= polygon_mask(c.battle_area, c.frame_size) == 0  # rim + lid region only
+    changed[ring] = make_ref_img(seed=6)[ring]
+    assert calibration_similarity(changed, c) < 0.8
+
+
+def test_change_inside_battle_area_ignored(tmp_path):
+    """Beys, launchers and hands in the reference/test frame must not break a genuine match."""
+    img = make_smooth_img()
+    c = cal_with(img, tmp_path)
+    changed = img.copy()
+    cv2.circle(changed, (320, 200), 40, (255, 255, 255), -1)
+    changed[150:250, 200:260] = make_ref_img(seed=7)[150:250, 200:260]
+    assert calibration_similarity(changed, c) > 0.95
+
+
+@pytest.mark.parametrize("gain,offset", [(1.0, 30), (0.8, 0), (1.2, -20), (0.7, 25)])
+def test_brightness_gain_offset_keeps_similarity_high(tmp_path, gain, offset):
+    img = make_smooth_img()
+    c = cal_with(img, tmp_path)
+    bright = np.clip(img.astype(np.float32) * gain + offset, 0, 255).astype(np.uint8)
+    assert calibration_similarity(bright, c) > 0.9

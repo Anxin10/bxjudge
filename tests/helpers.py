@@ -117,3 +117,22 @@ def cal_with(img, tmp_path, name: str = "test"):
     c.frame_size = (img.shape[1], img.shape[0])
     c.ref_frame = str(png)
     return c
+
+
+def make_smooth_img(seed: int = 0, size: tuple[int, int] = (640, 360)):
+    """Spatially smooth, structured BGR image: blurred noise + gradient + filled shapes
+    (closer to a real flat-floor/lid frame than white noise)."""
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    w, h = size
+    base = cv2.GaussianBlur(rng.random((h, w), dtype=np.float32), (0, 0), 8) * 255 * 3
+    base = np.clip(base - base.mean() + 110, 0, 255)
+    base += np.linspace(0, 60, w, dtype=np.float32)[None, :]
+    img = cv2.merge([np.clip(base, 0, 255).astype(np.uint8)] * 3)
+    for _ in range(30):
+        x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
+        r = int(rng.integers(12, 40))
+        cv2.circle(img, (x, y), r, tuple(int(v) for v in rng.integers(0, 256, 3)), -1)
+    return img

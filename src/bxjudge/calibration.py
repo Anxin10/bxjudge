@@ -22,6 +22,8 @@ from bxjudge.types import Calibration, Polygon
 log = logging.getLogger(__name__)
 
 SIM_WIDTH = 320  # similarity is computed on frames downscaled to this width
+_BLUR_SIGMA = 1.0  # px at SIM_WIDTH; implementation constants, not rule thresholds
+_MASK_MARGIN = 3  # px at SIM_WIDTH
 
 # Click order in the GUI: (Calibration field, English label, Chinese label).
 # OpenCV putText cannot draw CJK, so only the English label is drawn on screen.
@@ -73,23 +75,49 @@ def _gray_small(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(g, size, interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
+def _edge_map(gray: np.ndarray) -> np.ndarray:
+    """Lightly blurred gradient magnitude (insensitive to brightness gain/offset)."""
+    blurred = cv2.GaussianBlur(gray, (0, 0), _BLUR_SIGMA)
+    gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+    return cv2.magnitude(gx, gy)
+
+
+def _similarity_mask(c: Calibration, size: tuple[int, int]) -> np.ndarray:
+    """Stadium minus battle_area (rim + lid region), at ``size``. Both polygons are shrunk /
+    grown by ``_MASK_MARGIN`` px so blur/Sobel bleed from outside the region cannot enter it."""
+    k = np.ones((2 * _MASK_MARGIN + 1, 2 * _MASK_MARGIN + 1), np.uint8)
+
+    def small(poly) -> np.ndarray:
+        return cv2.resize(polygon_mask(poly, c.frame_size), size, interpolation=cv2.INTER_NEAREST)
+
+    return (cv2.erode(small(c.stadium), k) > 0) & (cv2.dilate(small(c.battle_area), k) == 0)
+
+
 def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:
     """0-1 similarity between ``frame`` and the calibration's reference frame.
 
-    Both are converted to grayscale and resized to 320 px wide; only pixels inside the
-    ``stadium`` polygon are compared, using zero-mean normalised cross-correlation
-    (negative correlation is clipped to 0).
+    Compared region: the ``stadium`` polygon minus the ``battle_area`` polygon (rim and lid
+    area). The beys, launchers and hands move inside battle_area, so it is excluded; the
+    static rim is what shows whether the camera moved. Both images are converted to
+    grayscale, resized to 320 px wide, lightly Gaussian-blurred and turned into
+    Sobel gradient-magnitude maps; the score is the zero-mean normalised cross-correlation
+    of those maps over the region, clipped to 0-1. Gradient maps make the score insensitive
+    to brightness gain/offset and sensitive to a few-pixel camera shift, where raw
+    intensity NCC on smooth footage stays high. Blur/Sobel parameters are implementation
+    constants; the decision threshold is ``calibration_min_similarity`` in config.
+    Tuning on real footage is deferred to the user.
     """
     ref = cv2.imread(c.ref_frame, cv2.IMREAD_COLOR) if c.ref_frame else None
     if ref is None:
         raise FileNotFoundError(f"calibration {c.name!r}: cannot read reference frame {c.ref_frame!r}")
     w, h = c.frame_size
     size = (SIM_WIDTH, max(1, round(SIM_WIDTH * h / w)))
-    mask = cv2.resize(polygon_mask(c.stadium, c.frame_size), size, interpolation=cv2.INTER_NEAREST) > 0
+    mask = _similarity_mask(c, size)
     if not mask.any():
         return 0.0
-    a = _gray_small(frame, size)[mask]
-    b = _gray_small(ref, size)[mask]
+    a = _edge_map(_gray_small(frame, size))[mask]
+    b = _edge_map(_gray_small(ref, size))[mask]
     a -= a.mean()
     b -= b.mean()
     denom = float(np.sqrt((a * a).sum() * (b * b).sum()))
