@@ -1,0 +1,15 @@
+# All labeling policy defaults live here. SAM input resources are genuinely bounded.
+input_folder: ~/bx/videos/20261001
+output_dir: data/labeling
+per_video: 8
+energy_long_edge: 640
+uniform_ratio: 0.3
+min_gap_s: 0.1
+launcher_max_aspect: 4.0
+val_ratio: 0.2
+window_frames: 120
+checkpoint: weights/sam3.1/sam3.1_multiplex.pt
+prompts:
+  bey: spinning top
+  bey_part: small plastic part
+  launcher: toy launcher

@@ -1,0 +1,9 @@
+<View>
+  <Header value="launcher 只框發射器本體；棉線與拉條一律不框。預標若包含棉線或拉條，請縮回本體。"/>
+  <Image name="image" value="$image"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="bey" background="#2980B9"/>
+    <Label value="bey_part" background="#27AE60"/>
+    <Label value="launcher" background="#E67E22"/>
+  </RectangleLabels>
+</View>

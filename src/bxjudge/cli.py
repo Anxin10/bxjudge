@@ -69,7 +69,9 @@ def _add_scan(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_scan)
 
 
-_REGISTRARS = [_add_calibrate, _add_scan]
+from bxjudge.labeling.cli import add_label
+
+_REGISTRARS = [_add_calibrate, _add_scan, add_label]
 
 
 def build_parser() -> argparse.ArgumentParser:
