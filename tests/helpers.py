@@ -161,3 +161,22 @@ def make_video(
     cmd.append(str(path))
     subprocess.run(cmd, check=True, capture_output=True)
     return path
+
+
+def shift(img, dx: float, dy: float):
+    """Translate img by (dx, dy) px (content moves right/down for positive values);
+    the vacated border replicates the edge pixels."""
+    import cv2
+    import numpy as np
+
+    h, w = img.shape[:2]
+    m = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def draw_blob(img, center: tuple[int, int], r: int, color: tuple[int, int, int] = (255, 255, 255)):
+    """Draw a filled circle (a stand-in for a bey) onto img in place and return it."""
+    import cv2
+
+    cv2.circle(img, center, r, color, -1)
+    return img

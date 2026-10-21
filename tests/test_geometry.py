@@ -33,3 +33,18 @@ def test_abrupt_change():
 def test_velocities():
     v = velocities({0:(0,0), 1:(3,4), 2:(6,8)})
     assert v[1] == (3,4) and v[2] == (3,4)
+
+
+def test_rim_mask_is_stadium_minus_battle_area_with_margins():
+    from bxjudge.geometry import rim_mask
+    from tests.helpers import make_calibration
+
+    c = make_calibration()
+    m = rim_mask(c, (640, 360), margin=3)
+    assert m.shape == (360, 640) and m.dtype == bool
+    assert m[80, 80]  # rim, between stadium edge (40) and battle_area edge (120)
+    assert not m[170, 300]  # inside battle_area
+    assert not m[10, 10]  # outside stadium
+    assert not m[80, 42] and not m[80, 118]  # within the margin of stadium / battle_area edge
+    half = rim_mask(c, (320, 180), margin=3)
+    assert half.shape == (180, 320) and half[40, 40] and not half[85, 150]

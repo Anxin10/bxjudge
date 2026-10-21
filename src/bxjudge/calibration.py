@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from bxjudge.geometry import polygon_mask
+from bxjudge.geometry import rim_mask
 from bxjudge.types import Calibration, Polygon
 
 log = logging.getLogger(__name__)
@@ -83,17 +83,6 @@ def _edge_map(gray: np.ndarray) -> np.ndarray:
     return cv2.magnitude(gx, gy)
 
 
-def _similarity_mask(c: Calibration, size: tuple[int, int]) -> np.ndarray:
-    """Stadium minus battle_area (rim + lid region), at ``size``. Both polygons are shrunk /
-    grown by ``_MASK_MARGIN`` px so blur/Sobel bleed from outside the region cannot enter it."""
-    k = np.ones((2 * _MASK_MARGIN + 1, 2 * _MASK_MARGIN + 1), np.uint8)
-
-    def small(poly) -> np.ndarray:
-        return cv2.resize(polygon_mask(poly, c.frame_size), size, interpolation=cv2.INTER_NEAREST)
-
-    return (cv2.erode(small(c.stadium), k) > 0) & (cv2.dilate(small(c.battle_area), k) == 0)
-
-
 def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:
     """0-1 similarity between ``frame`` and the calibration's reference frame.
 
@@ -113,7 +102,7 @@ def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:
         raise FileNotFoundError(f"calibration {c.name!r}: cannot read reference frame {c.ref_frame!r}")
     w, h = c.frame_size
     size = (SIM_WIDTH, max(1, round(SIM_WIDTH * h / w)))
-    mask = _similarity_mask(c, size)
+    mask = rim_mask(c, size, _MASK_MARGIN)
     if not mask.any():
         return 0.0
     a = _edge_map(_gray_small(frame, size))[mask]

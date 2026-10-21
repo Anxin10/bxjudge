@@ -58,6 +58,20 @@ def polygon_mask(poly: Polygon, size: tuple[int, int]) -> np.ndarray:
     return mask
 
 
+def rim_mask(c: Calibration, size: tuple[int, int], margin: int) -> np.ndarray:
+    """Stadium minus battle_area (rim + lid region) as a bool array of shape (height, width),
+    at ``size`` = (width, height). The polygons are rasterised at ``c.frame_size`` and resized.
+    The stadium is eroded and the battle_area dilated by ``margin`` px (at ``size``) so
+    blur / gradient / alignment bleed from outside the region cannot enter it. Shared by
+    calibration similarity and stadium-motion measurement so both look at the same region."""
+    k = np.ones((2 * margin + 1, 2 * margin + 1), np.uint8)
+
+    def small(poly: Polygon) -> np.ndarray:
+        return cv2.resize(polygon_mask(poly, c.frame_size), size, interpolation=cv2.INTER_NEAREST)
+
+    return (cv2.erode(small(c.stadium), k) > 0) & (cv2.dilate(small(c.battle_area), k) == 0)
+
+
 def velocities(centers: dict[int, Point]) -> dict[int, tuple[float, float]]:
     """Per-frame velocity keyed by the later frame of each pair of neighbouring samples.
     If frames are missing between two samples the difference is divided by the frame gap."""
