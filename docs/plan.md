@@ -528,21 +528,38 @@ def test_collision_after_first_landing_is_not_air(th):
 
 ---
 
-### Task 9: 停轉與終結判定
+### Task 9: 旋轉方向、停轉與終結判定
 
 **Files:**
 - Create: `src/bxjudge/finish.py`, `tests/test_finish.py`
+- Modify: `src/bxjudge/types.py`（新增 `SpinDir`、`RoundResult.spin_dir`）、`src/bxjudge/config.py` 與 `config/thresholds.yaml`（新增下列門檻鍵）
+
+新增門檻（初始值，Task 16 以資料校正）：
+
+```yaml
+spin_dir_window_s: 2.0        # 落地後量繞行方向的時間窗
+spin_dir_min_turn_deg: 180    # 繞行累計角度未達此值 → unknown
+orbit_to_spin: {cw: left, ccw: right}   # 繞行方向 → 旋轉方向；驗收時用已知陀螺影片確認
+reverse_frames: 6             # 反轉需持續的格數
+reverse_max_rate_deg: 20      # 只有畫面旋轉速率（度/格）低於此值時看到的反轉才算數
+reverse_max_move_px: 3.0      # 且中心移動（px/格）低於此值
+```
 
 **Interfaces:**
 - Consumes: Tasks 2, 8
 - Produces:
+  - `types.py`：`SpinDir = Literal["right","left","unknown"]`；`RoundResult` 新增 `spin_dir: dict[Side, SpinDir] | None = None`（放在既有預設欄位之後）
   - `spin_activity(crops: dict[int, np.ndarray]) -> dict[int, float]`（輸入為「格號 → 該陀螺框裁切後縮至 64×64 的灰階圖」；輸出每格與前一格的平均絕對差）
-  - `stop_frame(t: Track, activity: dict[int, float], th: Thresholds) -> int | None`（中心移動 < `still_px` 且 activity < `still_activity`，連續 `still_frames` 格的第一格）
+  - `rotation_rate(crops: dict[int, np.ndarray]) -> dict[int, float]`（相鄰兩格 Farneback 光流，對裁切中心取切向分量的加權平均換算成**帶正負號的畫面旋轉速率**（度/格；正 = 畫面上順時針））
+  - `orbit_direction(t: Track, c: Calibration, landing_frame: int | None, th: Thresholds, fps: float) -> SpinDir`（落地後 `spin_dir_window_s` 秒內，中心相對 `battle_area` 重心的累計角度；|累計| < `spin_dir_min_turn_deg` → unknown；否則依 `orbit_to_spin` 換算）
+  - `stop_frame(t: Track, activity: dict[int, float], rate: dict[int, float], spin_dir: SpinDir, th: Thresholds) -> tuple[int | None, str | None]`：回傳最早的轉停格與原因 `"still"` 或 `"reversed"`。
+    - still：中心移動 < `still_px` 且 activity < `still_activity`，連續 `still_frames` 格的第一格。
+    - reversed：連續 `reverse_frames` 格滿足「`|rate|` < `reverse_max_rate_deg`、中心移動 < `reverse_max_move_px`、rate 的符號與基準方向相反」的第一格。基準方向 = `spin_dir` 經 `orbit_to_spin` 反查後的畫面旋轉方向；`spin_dir == "unknown"` 時，基準 = 第一段連續 `reverse_frames` 格滿足速率與移動條件、符號一致的方向。**快速旋轉時的符號變化一律忽略**（混疊）。
   - `id_swap_risk(tx: Track, tb: Track, th: Thresholds) -> bool`（框重疊連續 ≥ `id_swap_overlap_frames` 格）
   - `FinishResult(finish: Finish | None, loser: Side | None, frame: int | None, confidence: float, reasons: list[str])`
   - `detect_finish(bey: dict[Side, Track], parts: list[Track], stops: dict[Side, int | None], c: Calibration, th: Thresholds, fps: float) -> FinishResult`
 
-判定：對每方找最早的終結事件：Xtreme（中心進入 `xtreme`）、Over（進入 `over_left` / `over_right`）、Burst（該方軌跡結束後 `burst_part_window_s` 內、末位置附近出現 ≥ 1 條 `bey_part` 軌跡）、Spin（雙方都在戰鬥區，`stops` 較早者）。取時間最早的事件；winner = 對方。兩方 stop 相差 ≤ `simultaneous_stop_frames`，或兩方在同一窗內同時出局 → `finish=None`，reasons 加 `draw`。信心 = 相關偵測平均分數；`id_swap_risk` 為真 → 信心 ×0.5 並加 `id_swap_risk`。
+判定：對每方找最早的終結事件：Xtreme（中心進入 `xtreme`）、Over（進入 `over_left` / `over_right`）、Burst（該方軌跡結束後 `burst_part_window_s` 內、末位置附近出現 ≥ 1 條 `bey_part` 軌跡）、Spin（雙方都在戰鬥區，`stops` 較早者；`stops` 由 `stop_frame` 的格號組成，原因寫入 reasons，例如 `B_stop_reversed`）。取時間最早的事件；winner = 對方。兩方 stop 相差 ≤ `simultaneous_stop_frames`，或兩方在同一窗內同時出局 → `finish=None`，reasons 加 `draw`。信心 = 相關偵測平均分數；`id_swap_risk` 為真 → 信心 ×0.5 並加 `id_swap_risk`。
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -563,12 +580,38 @@ def test_simultaneous_stop_is_draw(th):
 def test_id_swap_risk_lowers_confidence(th):            # Review Focus 2
     r = detect_finish(*scene(overlap_frames=5, stops={"X":300,"B":250}), th, 60)
     assert "id_swap_risk" in r.reasons and r.confidence < th.review_confidence
+
+def test_rotation_rate_sign():
+    crops = rotating_crops(deg_per_frame=5, n=10)          # helper：合成紋理每格順時針轉 5°
+    assert all(v > 0 for v in list(rotation_rate(crops).values())[1:])
+    crops = rotating_crops(deg_per_frame=-5, n=10)
+    assert all(v < 0 for v in list(rotation_rate(crops).values())[1:])
+
+def test_orbit_direction(th):
+    c = make_calibration()
+    cw = make_track(1, "bey", circle_path(center=(320,170), r=60, deg_per_frame=4, n=120))   # 畫面順時針繞行
+    assert orbit_direction(cw, c, 0, th, 60) == th.orbit_to_spin["cw"]
+    wobble = make_track(2, "bey", circle_path(center=(320,170), r=60, deg_per_frame=1, n=60))  # 只繞 60°
+    assert orbit_direction(wobble, c, 0, th, 60) == "unknown"
+
+def test_stop_by_reversal_when_slow(th):
+    t, act, rate = slowing_bey(reverse_at=200)              # 慢速且幾乎不動時方向反轉，持續 ≥ reverse_frames
+    assert stop_frame(t, act, rate, "right", th) == (200, "reversed")
+
+def test_fast_sign_flips_ignored(th):                       # 混疊防護
+    t, act, rate = slowing_bey(reverse_at=None, aliasing_flips_at=[50, 90])   # 快速階段 |rate| 大、符號亂跳
+    assert stop_frame(t, act, rate, "right", th) == (None, None)
+
+def test_still_detected(th):
+    t, act, rate = slowing_bey(reverse_at=None, still_at=260)
+    assert stop_frame(t, act, rate, "right", th) == (260, "still")
 ```
 
-（`scene(...)` 在 `tests/helpers.py` 中以 `make_calibration()` 座標生成兩方軌跡、零件軌跡與 stops。）
+（`scene(...)`、`rotating_crops`、`circle_path`、`slowing_bey` 都在 `tests/helpers.py`，以 `make_calibration()` 座標生成。`rotating_crops` 以 `cv2.warpAffine` 旋轉一張 64×64 隨機紋理。）
 
 - [ ] **Step 2–4: FAIL → 實作 → PASS**
-- [ ] **Step 5: Commit** — `feat: finish detection with id-swap risk`
+- [ ] **Step 5: 校正記錄**：在報告中記下 `rotation_rate` 對 `rotating_crops(±5)` 的實測值，供 Task 16 調整 `reverse_max_rate_deg`。
+- [ ] **Step 6: Commit** — `feat: spin direction, stop-by-reversal, finish detection`
 
 ---
 
@@ -682,7 +725,7 @@ def test_tracks_split_by_class():
 - Consumes: Tasks 3–10、12
 - Produces:
   - `judge_video(info: VideoInfo, calib_dir: Path, detector: Detector, rules: Rules, th: Thresholds) -> list[RoundResult]`
-  - `write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None`（`rounds.json` 為權威資料；`rounds.csv` 欄位照 spec §9：`video, round, t_launch, t_end, x_touch, b_touch, x_landed, b_landed, x_land_zone, b_land_zone, air_collision, finish, winner, points, confidence, needs_review, review_reasons, vlm_note, reviewed, reviewer_fix`；`matches.csv` 由 `group_matches` 以 effective 值重建）
+  - `write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None`（`rounds.json` 為權威資料；`rounds.csv` 欄位照 spec §9：`video, round, t_launch, t_end, x_touch, b_touch, x_landed, b_landed, x_land_zone, b_land_zone, x_spin_dir, b_spin_dir, air_collision, finish, winner, points, confidence, needs_review, review_reasons, vlm_note, reviewed, reviewer_fix`；`matches.csv` 由 `group_matches` 以 effective 值重建）
   - `effective(row: dict) -> dict`（`reviewer_fix` 覆蓋原欄位後的結果）、`row_to_result(row: dict) -> RoundResult`
   - `record_video_timing(out_dir: Path, video: str, duration_s: float, processing_s: float) -> None`（寫入 `videos.json`，供 Task 16 計算速度）
   - `write_trajectory(out_dir: Path, r: RoundResult, bey: dict[Side, Track], parts: list[Track], c: Calibration, fps: float, events: dict[str, int | None]) -> tuple[Path, Path]`：
@@ -691,7 +734,7 @@ def test_tracks_split_by_class():
     - 重跑時覆寫同名檔案（軌跡不屬於覆核資料）
   - `run_batch(folder: Path, calib_dir: Path, out_dir: Path) -> None`（`scan` → 逐支 `judge_video` → `write_results` → `record_video_timing` → `mark_processed`；單支例外不中斷批次）
 
-`judge_video` 流程：取第 1 秒畫面 → `find_calibration`，None → 回傳單筆 `needs_review`、reasons `["recalibrate"]`；解碼一次，同時產生 `stadium_displacement`（以校準 PNG 為參考）、`track_frames`，並把每條 `bey` 軌跡每格的框裁切縮成 64×64 灰階存入 `crops[track_id]`（供 `spin_activity`）→ `segment_rounds`，空 → 單筆 `["no_round"]`；每回合：`check_launch` → `stop_frame(t, spin_activity(crops[t.track_id]), th)` → `detect_finish` → 組 `RoundResult`（`points = finish_points`）→ `write_trajectory`。`needs_review` = 信心 < `review_confidence`，或任一 touch 為 unknown，或 air 為 maybe，或 finish 為 None，或 reasons 非空。`VideoDecodeError` → 單筆 `["decode_error"]`。
+`judge_video` 流程：取第 1 秒畫面 → `find_calibration`，None → 回傳單筆 `needs_review`、reasons `["recalibrate"]`；解碼一次，同時產生 `stadium_displacement`（以校準 PNG 為參考）、`track_frames`，並把每條 `bey` 軌跡每格的框裁切縮成 64×64 灰階存入 `crops[track_id]`（供 `spin_activity`）→ `segment_rounds`，空 → 單筆 `["no_round"]`；每回合：`check_launch` → 每方 `orbit_direction(t, c, landing_frame, th, fps)` 得 `spin_dir` → `stop_frame(t, spin_activity(crops[t.track_id]), rotation_rate(crops[t.track_id]), spin_dir, th)` → `detect_finish` → 組 `RoundResult`（`points = finish_points`）→ `write_trajectory`。`needs_review` = 信心 < `review_confidence`，或任一 touch 為 unknown，或 air 為 maybe，或 finish 為 None，或 reasons 非空。`VideoDecodeError` → 單筆 `["decode_error"]`。
 
 `write_results` 合併規則：以 `(video, round)` 為鍵；既有列 `reviewed == True` 時**保留不動**，否則以新結果取代；不得產生重複鍵。
 
@@ -787,7 +830,7 @@ def test_fallback_on_error(monkeypatch):
   - `load_corrections(out_dir: Path) -> list[Correction]`
   - 使用 Task 13 的 `effective()` 與 `write_results` 的 csv 重建邏輯，不另寫一份
 
-介面：側欄篩選（全部 / 需覆核 / 已覆核）；每列顯示發射瞬間與結束瞬間截圖並疊上校準多邊形、**該回合軌跡圖**（`write_trajectory` 的 PNG）、`review_reasons`、`vlm_note`；`st.video` 從 `t_launch - 1` 秒開始播放；可編輯 `x_touch, b_touch, x_landed, b_landed, air_collision, finish, winner`，以及「確認無誤」按鈕（只設 `reviewed = True`）。
+介面：側欄篩選（全部 / 需覆核 / 已覆核）；每列顯示發射瞬間與結束瞬間截圖並疊上校準多邊形、**該回合軌跡圖**（`write_trajectory` 的 PNG）、`review_reasons`、`vlm_note`；`st.video` 從 `t_launch - 1` 秒開始播放；可編輯 `x_touch, b_touch, x_landed, b_landed, x_spin_dir, b_spin_dir, air_collision, finish, winner`，以及「確認無誤」按鈕（只設 `reviewed = True`）。
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -843,6 +886,7 @@ def test_derive_shake_px_midpoint():
 
 - [ ] **Step 2–4: FAIL → 實作 → PASS**
 - [ ] **Step 5: 整批驗收（與使用者一起）**：`bxjudge run ~/bx/videos/20261001` → `bxjudge vlm` → 使用者在覆核介面覆核全部回合 → `bxjudge eval`。Expected：報告列出 spec §11 五項指標與是否達標。未達標項目交由 Claude 依報告調整 `config/thresholds.yaml` / 校準 / 補標註後重跑（spec §10 的優化迴圈）。
+- [ ] **Step 5b: 確認旋轉方向對應**：用已知右旋 / 左旋陀螺的回合，檢查 `x_spin_dir` / `b_spin_dir` 是否正確；錯了就對調 `orbit_to_spin` 並重跑；`tune` 報告列出覆核後 spin_dir 的正確率與 `reversed` 轉停被推翻的比例。
 - [ ] **Step 6: 核對官方規則**：取得 Takara Tomy 官方最新規則 PDF，逐項核對 `config/rules.yaml`，更新 `rules_version` 並移除 TODO 註解。
 - [ ] **Step 7: Commit** — `feat: evaluation report and threshold tuning`
 
@@ -861,6 +905,7 @@ def test_derive_shake_px_midpoint():
 | §7 規則設定檔 | 3、16（核對官方） |
 | §8 VLM 不覆蓋 | 14 |
 | §9 輸出欄位與覆核介面 | 13、15 |
+| §6.5 轉停 = 靜止或反轉（混疊防護）、§6.6 旋轉方向 flag | 9、13（輸出欄位）、15（可修正）、16（對應表確認） |
 | §9 陀螺軌跡紀錄（CSV + 軌跡圖） | 2（`zone_of`）、13（`write_trajectory`）、15（顯示） |
 | §6.2 校準：場地、上盤（蓋子）、下盤戰鬥區、擊飛區域、極限區域 | 2、4 |
 | §6.4 停在蓋子上 = 未落入戰鬥區 | 2（`zone_of`）、7、8 |
