@@ -475,7 +475,7 @@ def test_never_enters_battle_area(th):
   - `detect_air_collision(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> AirState`
   - `check_launch(bey_tracks, launchers, disp, c, th, fps) -> tuple[LaunchCheck, dict[int, Side]]`（`landing_zone[side]` = `find_settle` 的區域；`landed[side] = landing_zone[side] == "battle_area"`；從未停穩為 None 且 landed 為 False）（發射窗 = 第一顆陀螺出現前 `launch_pre_s` 到兩顆都落地後 `launch_post_s`；任一方未落地時窗口結束於第一顆出現後 3 秒）
 
-`detect_touch` 規則（spec 6.4 三條件）：在窗內找 `disp > shake_px` 的晃動起點 s。若 s 與 `impacts` 中任一格距離 ≤ `impact_coincide_frames` → 不算觸碰，notes 加 `shake_by_bey_impact@{s}`。否則找 s 時刻框與 `stadium` 邊界距離 ≤ `rim_margin_px` 的 launcher：有 → 該 launcher 所屬方 `yes`；無 launcher 入鏡 → 雙方 `unknown`，notes 加 `shake_cause_unknown@{s}`。無晃動 → 雙方 `no`。launcher 的方別以其中心在 `launch_left` / `launch_right` 判定。
+`detect_touch` 規則（spec 6.4 三條件）：在窗內找 `disp > shake_px` 的晃動起點 s。若 s 與 `impacts` 中任一格距離 ≤ `impact_coincide_frames` → 不算觸碰，notes 加 `shake_by_bey_impact@{s}`。否則找 s 時刻框與 `stadium` 邊界距離 ≤ `rim_margin_px` 的 launcher：有 → 該 launcher 所屬方 `yes`；s 時刻**有** launcher 入鏡但都不在盤緣附近 → 雙方 `no`，notes 加 `shake_not_by_launcher_body@{s}`（launcher 只代表發射器本體，拉繩棉線、拉條碰盤不算觸碰）；s 時刻**無** launcher 入鏡 → 雙方 `unknown`，notes 加 `shake_cause_unknown@{s}`。無晃動 → 雙方 `no`。launcher 的方別以其中心在 `launch_left` / `launch_right` 判定。
 
 `detect_air_collision`：檢查期間 = 兩軌跡共同存在、且早於 `min(land_x, land_b)` 的格（任一為 None 時用另一個；皆 None 用整段）。條件 A：`boxes_touch`；條件 B：在同一格 ±`air_collision_frames` 內兩者都 `is_abrupt_change`。A 且 B → `yes`；僅其一 → `maybe`；皆無 → `no`。
 
@@ -501,6 +501,12 @@ def test_shake_without_launcher_is_unknown(th):
     disp = {f: (5.0 if f == 10 else 0.0) for f in range(30)}
     touch, _ = detect_touch(disp, [], {}, set(), (0,30), make_calibration(), th)
     assert touch == {"X":"unknown","B":"unknown"}
+
+def test_shake_with_launcher_body_away_from_rim_is_no(th):   # 拉繩 / 拉條碰盤不算
+    disp = {f: (5.0 if f == 10 else 0.0) for f in range(30)}
+    launcher = make_track(9, "launcher", {10: (150, 5)})          # 本體入鏡但離盤緣遠
+    touch, notes = detect_touch(disp, [launcher], {9:"X"}, set(), (0,30), make_calibration(), th)
+    assert touch == {"X":"no","B":"no"} and any(n.startswith("shake_not_by_launcher_body") for n in notes)
 
 def test_shake_outside_window_ignored(th):
     disp = {f: (5.0 if f == 50 else 0.0) for f in range(60)}
@@ -647,10 +653,13 @@ def test_no_tracks(th):     assert segment_rounds([], 60, th) == []          # R
   - `change_energy(path: Path, long_edge: int = 640) -> dict[int, float]`（相鄰格灰階平均絕對差）
   - `select_frames(energy: dict[int, float], fps: float, n: int, uniform_ratio: float = 0.3, min_gap_s: float = 0.1) -> list[int]`（(1-uniform_ratio)·n 取能量峰值，其餘均勻取樣；任兩格間隔 ≥ min_gap_s）
   - `to_label_studio(image: str, w: int, h: int, boxes: list[tuple[str, Box, float]]) -> dict`（Label Studio task，`predictions[0].result` 為 rectanglelabels，座標為百分比）
+  - `filter_launcher_boxes(boxes: list[tuple[str, Box, float]], max_aspect: float = 4.0) -> list[tuple[str, Box, float]]`（只過濾 `launcher` 類：長邊 / 短邊 > max_aspect 的框丟掉；其他類別原樣保留）
   - `prelabel(video: Path, frames: list[int], prompts: dict[str, str], out_json: Path) -> int`（SAM 3.1 文字提示，影片模式在選定格之間傳播；寫出 Label Studio 匯入 JSON 與 JPG；回傳框數）
   - `label_studio_to_coco(export_json: Path, out_dir: Path, val_ratio: float = 0.2) -> None`（**依影片**切 train/val，同一支影片不跨集合；類別固定 `["bey","bey_part","launcher"]`）
 
 初始提示詞（spec §13 留給實作者調整）：`{"bey": "spinning top", "bey_part": "small plastic part", "launcher": "toy launcher"}`。
+
+**標註準則（寫進 README 並在 Label Studio 標籤說明中顯示）**：`launcher` 只框**發射器本體**；拉繩式發射器的棉線、拉條式發射器的拉條**一律不框**。SAM 3.1 預標若把拉繩或拉條框進去，使用者修正時要縮回本體。`prelabel` 對 `launcher` 預標框做一次後處理：去掉細長比 > 4 的框（多半是拉繩或拉條），並在報告中列出被去掉的數量。
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -664,6 +673,11 @@ def test_to_label_studio_percent_units():
     t = to_label_studio("a.jpg", 1000, 500, [("bey", (100,50,200,150), 0.9)])
     v = t["predictions"][0]["result"][0]["value"]
     assert (v["x"], v["y"], v["width"], v["height"], v["rectanglelabels"]) == (10.0, 10.0, 10.0, 20.0, ["bey"])
+
+def test_prelabel_drops_elongated_launcher_boxes():
+    boxes = [("launcher", (100,100,140,130), 0.9), ("launcher", (100,100,400,110), 0.8)]   # 第二個是細長拉繩 / 拉條
+    kept = filter_launcher_boxes(boxes, max_aspect=4.0)
+    assert kept == [("launcher", (100,100,140,130), 0.9)]
 
 def test_coco_split_by_video(tmp_path):
     label_studio_to_coco(fixture_export(videos=["a","a","b","b","c"]), tmp_path)
