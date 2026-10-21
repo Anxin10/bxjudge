@@ -4,12 +4,11 @@ Airborne tops can project inside the battle-area polygon. Settling therefore nee
 ``settle_frames`` of slow vertical motion in one zone, after the first fast fall
 if the track contains one. A track with no fast fall has no fall precondition.
 
-Each episode is a maximal run of slow vertical motion in the same zone. A zone
-change, fast vertical motion, or a detection gap longer than
-``max(1, settle_frames // 2)`` starts a new run. Runs qualify once they span
-``settle_frames`` in frame time, including both endpoints. Short missing-detection
-gaps can extend the confirmation window to the next observed frame. The first
-sample has no velocity and is not checked, matching ``geometry.velocities``.
+Each episode is a maximal run of consecutive observed frames with slow vertical
+motion in the same zone. A zone change, fast vertical motion, or any missing frame
+starts a new run. Runs qualify only after ``settle_frames`` consecutive observed
+frames; missing frames never count as evidence of quiet motion or zone membership.
+The first sample has no velocity and is not checked, matching ``geometry.velocities``.
 
 ``find_settle`` reports the first episode in any zone. ``find_landing_frame``
 reports the first battle-area episode, including after an earlier lid/rim pause.
@@ -28,7 +27,6 @@ def find_settles(t: Track, c: Calibration, th: Thresholds) -> list[tuple[int, Zo
     frames = sorted(centers)
     vel = velocities(centers)
     first_fast = min((f for f in frames if f in vel and vel[f][1] > th.fall_speed_px), default=None)
-    max_gap = max(1, th.settle_frames // 2)
     settles: list[tuple[int, Zone]] = []
     start: int | None = None
     run_zone: Zone | None = None
@@ -41,7 +39,7 @@ def find_settles(t: Track, c: Calibration, th: Thresholds) -> list[tuple[int, Zo
             start = None
             continue
         zone = zone_of(centers[f], c)
-        if start is None or zone != run_zone or (i > 0 and f - frames[i - 1] > max_gap):
+        if start is None or zone != run_zone or (i > 0 and f - frames[i - 1] != 1):
             start = f
             run_zone = zone
             emitted = False

@@ -53,13 +53,11 @@ def test_falls_into_over_zone_not_landed(th):
     assert find_landing_frame(t, make_calibration(), th) is None
 
 
-def test_detection_gap_during_settling_still_lands(th):
-    # gap rule: the window may skip frames; consecutive missing detections inside it are fine
-    for missing in ({35}, {31, 32}, {30}, {33, 34}):
-        centers = {f: p for f, p in parabola_then_orbit(land_at=30).items() if f not in missing}
-        t = make_track(1, "bey", centers)
-        got = find_landing_frame(t, make_calibration(), th)
-        assert got is not None and abs(got - 30) <= 3, (missing, got)
+@pytest.mark.parametrize("missing, expected", [({35}, 36), ({31, 32}, 33), ({30}, 31), ({33, 34}, 35)])
+def test_detection_gap_restarts_consecutive_settle_window(missing, expected, th):
+    centers = {f: p for f, p in parabola_then_orbit(land_at=30).items() if f not in missing}
+    t = make_track(1, "bey", centers)
+    assert find_landing_frame(t, make_calibration(), th) == expected
 
 
 def test_long_blackout_inside_window_does_not_settle(th):
@@ -147,10 +145,10 @@ def test_track_without_full_settle_window_has_no_episodes(centers, th):
     assert find_landing_frame(t, c, th) is None
 
 
-def test_short_gap_does_not_repeat_settle_episode(th):
+def test_missing_frame_splits_observed_settle_episodes(th):
     centers = {f: p for f, p in fall_then_rest(20, (300, 200), (300, 20)).items() if f != 30}
     assert find_settles(make_track(1, "bey", centers), make_calibration(), th) == [
-        (20, "battle_area")
+        (20, "battle_area"), (31, "battle_area")
     ]
 
 
@@ -162,3 +160,11 @@ def test_episode_duration_and_vertical_speed_use_configured_thresholds(th):
     ]
     assert find_settles(t, c, replace(th, settle_frames=6, fall_speed_px=2)) == []
     assert find_settles(t, c, replace(th, settle_frames=5, fall_speed_px=1)) == []
+
+
+def test_sparse_observations_cannot_confirm_settle(th):
+    t = make_track(1, "bey", {f: (300, 200) for f in (0, 3, 6)})
+    c = make_calibration()
+    assert find_settles(t, c, th) == []
+    assert find_settle(t, c, th) == (None, None)
+    assert find_landing_frame(t, c, th) is None
