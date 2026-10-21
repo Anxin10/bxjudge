@@ -14,11 +14,13 @@ class Thresholds:
     decode_hwaccel: str  # "cuda" | "cpu"
     launch_pre_s: float
     launch_post_s: float
+    launch_missing_landing_s: float
     shake_px: float
     impact_coincide_frames: int
     air_collision_frames: int
     abrupt_angle_deg: float
     abrupt_speed_ratio: float
+    abrupt_min_speed_px: float
     settle_frames: int
     fall_speed_px: float
     rim_margin_px: float
