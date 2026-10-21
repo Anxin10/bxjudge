@@ -136,3 +136,28 @@ def make_smooth_img(seed: int = 0, size: tuple[int, int] = (640, 360)):
         r = int(rng.integers(12, 40))
         cv2.circle(img, (x, y), r, tuple(int(v) for v in rng.integers(0, 256, 3)), -1)
     return img
+
+
+def make_video(
+    path,
+    seconds: float = 2,
+    fps: int = 60,
+    audio: bool = False,
+    size: tuple[int, int] = (320, 180),
+):
+    """Generate a tiny H.264 test video (ffmpeg ``testsrc``; ``sine`` audio if ``audio``)."""
+    import subprocess
+    from pathlib import Path
+
+    path = Path(path)
+    w, h = size
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+           "-i", f"testsrc=size={w}x{h}:rate={fps}:duration={seconds}"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}"]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+    if audio:
+        cmd += ["-c:a", "aac", "-shortest"]
+    cmd.append(str(path))
+    subprocess.run(cmd, check=True, capture_output=True)
+    return path

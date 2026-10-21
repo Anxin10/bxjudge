@@ -38,7 +38,38 @@ def _add_calibrate(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_calibrate)
 
 
-_REGISTRARS = [_add_calibrate]
+def _cmd_scan(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import manifest
+
+    folder = Path(args.folder).expanduser()
+    if not folder.is_dir():
+        print(f"error: {folder} is not a folder", file=sys.stderr)
+        return 2
+    failed: list[Path] = []
+
+    def on_error(path: Path, err: Exception) -> None:
+        failed.append(path)
+        print(f"warning: skipped {path}: {err}", file=sys.stderr)
+
+    found = manifest.scan(folder, Path(args.db).expanduser(), on_error=on_error)
+    for i in found:
+        print(f"{i.path.name}  {i.duration:.1f}s  {i.fps:.2f}fps  {i.width}x{i.height}  "
+              f"{i.codec}  audio={'yes' if i.has_audio else 'no'}")
+    print(f"{len(found)} new/changed video(s), {len(failed)} unreadable", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def _add_scan(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("scan", help="list new/changed videos in a folder (does not mark them processed)")
+    p.add_argument("folder", help="folder of synced videos, e.g. ~/bx/videos/20261001")
+    p.add_argument("--db", default="data/processed_videos.json",
+                   help="processed-videos record (default data/processed_videos.json)")
+    p.set_defaults(func=_cmd_scan)
+
+
+_REGISTRARS = [_add_calibrate, _add_scan]
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,0 +1,152 @@
+"""ffmpeg-based frame decoding: stream BGR frames through a rawvideo pipe.
+
+Frame indices count at the SOURCE frame rate; frames are never dropped (``-fps_mode
+passthrough``). Frames are streamed one at a time, so a 1 GB 4K file never sits in memory.
+"""
+from __future__ import annotations
+
+import logging
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Iterator
+
+import numpy as np
+
+from bxjudge.manifest import probe
+
+log = logging.getLogger(__name__)
+
+_HWACCELS = ("cuda", "cpu")
+
+
+class VideoDecodeError(Exception):
+    """A video could not be decoded (corrupt, missing, no frames, ffmpeg failure)."""
+
+
+def _hwaccel_args(hwaccel: str) -> list[str]:
+    # No `-hwaccel_output_format`: frames come back to system memory so the scale filter and
+    # the BGR conversion run on the CPU regardless of where the decoding happened.
+    return ["-hwaccel", "cuda"] if hwaccel == "cuda" else []
+
+
+def _even(x: float) -> int:
+    return max(2, int(round(x / 2.0)) * 2)
+
+
+def _out_size(width: int, height: int, long_edge: int) -> tuple[int, int]:
+    """Downscale so the long edge is <= ``long_edge`` (never upscale), even dims, same aspect."""
+    scale = min(1.0, long_edge / max(width, height))
+    if scale >= 1.0:
+        return width - width % 2 or 2, height - height % 2 or 2
+    return _even(width * scale), _even(height * scale)
+
+
+def _decode(
+    path: Path,
+    *,
+    start: float,
+    end: float | None,
+    out_w: int,
+    out_h: int,
+    hwaccel: str,
+    first_index: int,
+    skip: int,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """One ffmpeg run. Yields ``(frame_index, frame)`` skipping the first ``skip`` frames;
+    raises ``VideoDecodeError`` on ffmpeg failure, a truncated frame, or zero frames."""
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", *_hwaccel_args(hwaccel)]
+    if start > 0:
+        cmd += ["-ss", f"{start:.6f}"]
+    cmd += ["-i", str(path)]
+    if end is not None:
+        cmd += ["-t", f"{end - start:.6f}"]
+    cmd += ["-an", "-sn", "-vf", f"scale={out_w}:{out_h}", "-pix_fmt", "bgr24",
+            "-fps_mode", "passthrough", "-f", "rawvideo", "-"]
+
+    frame_bytes = out_w * out_h * 3
+    n = 0
+    with tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, bufsize=0)
+        except FileNotFoundError as e:
+            raise VideoDecodeError("ffmpeg not found; install ffmpeg") from e
+        try:
+            assert proc.stdout is not None
+            while True:
+                buf = bytearray(frame_bytes)
+                view = memoryview(buf)
+                got = 0
+                while got < frame_bytes:
+                    k = proc.stdout.readinto(view[got:])
+                    if not k:
+                        break
+                    got += k
+                if got == 0:
+                    break
+                if got < frame_bytes:
+                    raise VideoDecodeError(f"{path}: truncated frame {first_index + n} "
+                                           f"({got}/{frame_bytes} bytes)")
+                idx = first_index + n
+                n += 1
+                if n > skip:
+                    yield idx, np.frombuffer(buf, np.uint8).reshape(out_h, out_w, 3)
+            rc = proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+        if rc != 0:
+            err.seek(0)
+            msg = err.read().decode(errors="replace").strip()
+            raise VideoDecodeError(f"{path}: ffmpeg exited with {rc} ({hwaccel}): {msg[-500:]}")
+        if n == 0:
+            err.seek(0)
+            msg = err.read().decode(errors="replace").strip()
+            raise VideoDecodeError(f"{path}: no frames decoded ({hwaccel}) {msg[-500:]}")
+
+
+def iter_frames(
+    path: Path,
+    start: float = 0.0,
+    end: float | None = None,
+    long_edge: int = 1280,
+    hwaccel: str = "cuda",
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield ``(source_frame_index, BGR frame)`` for ``[start, end)`` seconds.
+
+    Frames are downscaled so the long edge is <= ``long_edge`` (aspect kept, even dims). With
+    ``hwaccel="cuda"`` NVDEC is tried first; if it fails, the decode is retried once on the CPU
+    (continuing after the frames already delivered). Any remaining failure, a non-zero ffmpeg
+    exit, or a decode that yields zero frames raises ``VideoDecodeError``.
+    """
+    if hwaccel not in _HWACCELS:
+        raise ValueError(f"hwaccel must be one of {_HWACCELS}, got {hwaccel!r}")
+    if start < 0 or (end is not None and end <= start):
+        raise ValueError(f"bad window: start={start}, end={end}")
+
+    path = Path(path)
+    try:
+        info = probe(path)
+    except (ValueError, OSError) as e:
+        raise VideoDecodeError(f"cannot read {path}: {e}") from e
+
+    out_w, out_h = _out_size(info.width, info.height, long_edge)
+    first_index = int(round(start * info.fps))
+    attempts = ["cuda", "cpu"] if hwaccel == "cuda" else ["cpu"]
+    delivered = 0
+    for i, hw in enumerate(attempts):
+        try:
+            for idx, frame in _decode(
+                path, start=start, end=end, out_w=out_w, out_h=out_h,
+                hwaccel=hw, first_index=first_index, skip=delivered,
+            ):
+                delivered += 1
+                yield idx, frame
+            return
+        except VideoDecodeError as e:
+            if i + 1 >= len(attempts):
+                raise
+            log.warning("cuda decode of %s failed (%s); retrying on cpu", path.name, e)
