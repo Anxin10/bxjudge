@@ -16,14 +16,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from bxjudge.geometry import rim_mask
+from bxjudge.geometry import RIM_BLUR_SIGMA, RIM_MASK_MARGIN, rim_mask
 from bxjudge.types import Calibration, Polygon
 
 log = logging.getLogger(__name__)
 
 SIM_WIDTH = 320  # similarity is computed on frames downscaled to this width
-_BLUR_SIGMA = 1.0  # px at SIM_WIDTH; implementation constants, not rule thresholds
-_MASK_MARGIN = 3  # px at SIM_WIDTH
 
 # Click order in the GUI: (Calibration field, English label, Chinese label).
 # OpenCV putText cannot draw CJK, so only the English label is drawn on screen.
@@ -77,7 +75,7 @@ def _gray_small(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 
 def _edge_map(gray: np.ndarray) -> np.ndarray:
     """Lightly blurred gradient magnitude (insensitive to brightness gain/offset)."""
-    blurred = cv2.GaussianBlur(gray, (0, 0), _BLUR_SIGMA)
+    blurred = cv2.GaussianBlur(gray, (0, 0), RIM_BLUR_SIGMA)
     gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
     return cv2.magnitude(gx, gy)
@@ -102,7 +100,7 @@ def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:
         raise FileNotFoundError(f"calibration {c.name!r}: cannot read reference frame {c.ref_frame!r}")
     w, h = c.frame_size
     size = (SIM_WIDTH, max(1, round(SIM_WIDTH * h / w)))
-    mask = rim_mask(c, size, _MASK_MARGIN)
+    mask = rim_mask(c, size, RIM_MASK_MARGIN)
     if not mask.any():
         return 0.0
     a = _edge_map(_gray_small(frame, size))[mask]

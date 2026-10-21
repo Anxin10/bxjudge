@@ -13,13 +13,11 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from bxjudge.geometry import rim_mask
+from bxjudge.geometry import RIM_BLUR_SIGMA, RIM_MASK_MARGIN, rim_mask
 from bxjudge.types import Calibration
 
 # Implementation constants (alignment-quality tuning, not rule thresholds).
 WORK_WIDTH = 640  # ECC runs on frames downscaled to at most this width; shift is scaled back
-_BLUR_SIGMA = 1.0  # px at 320 px width (same as calibration similarity); scales with work width
-_MASK_MARGIN = 3  # px at 320 px width (same as calibration similarity); scales with work width
 _ECC_ITERATIONS = 50
 _ECC_EPS = 1e-5
 _CROP_PAD = 16  # px at work size kept around the mask bounding box
@@ -34,8 +32,8 @@ class _Template:
         wh = max(1, round(fh * ww / fw))
         self.work_size = (ww, wh)
         self.scale = fw / ww  # work px -> frame px
-        self.sigma = _BLUR_SIGMA * ww / 320.0
-        margin = max(1, round(_MASK_MARGIN * ww / 320.0))
+        self.sigma = RIM_BLUR_SIGMA * ww / 320.0
+        margin = max(1, round(RIM_MASK_MARGIN * ww / 320.0))
         mask = rim_mask(c, self.work_size, margin)
         ys, xs = np.nonzero(mask)
         self.empty = ys.size == 0

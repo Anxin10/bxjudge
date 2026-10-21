@@ -58,6 +58,13 @@ def polygon_mask(poly: Polygon, size: tuple[int, int]) -> np.ndarray:
     return mask
 
 
+# Implementation constants for the rim region (not rule thresholds), in px at a 320 px wide image;
+# callers working at another width scale them by width/320. Shared by calibration similarity and
+# stadium-motion so both measure the same region the same way.
+RIM_BLUR_SIGMA = 1.0
+RIM_MASK_MARGIN = 3
+
+
 def rim_mask(c: Calibration, size: tuple[int, int], margin: int) -> np.ndarray:
     """Stadium minus battle_area (rim + lid region) as a bool array of shape (height, width),
     at ``size`` = (width, height). The polygons are rasterised at ``c.frame_size`` and resized.
