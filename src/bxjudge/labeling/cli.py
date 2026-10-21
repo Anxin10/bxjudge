@@ -8,6 +8,18 @@ from bxjudge.manifest import probe
 from .config import load_config
 
 
+def _reject_duplicate_content(entries: list[dict]) -> None:
+    seen = {}
+    for entry in entries:
+        digest = entry["video_sha256"]
+        if digest in seen:
+            raise ValueError(
+                f"duplicate video content: {entry['video']} matches {seen[digest]} "
+                f"(SHA256 {digest}); remove the duplicate input"
+            )
+        seen[digest] = entry["video"]
+
+
 def command(args):
     cfg = load_config(args.config)
     out = Path(args.out or cfg["output_dir"]).expanduser().resolve()
@@ -21,8 +33,13 @@ def command(args):
         )
         if not videos:
             raise ValueError(f"no MP4 videos in {folder}")
-        entries = []
-        for video in videos:
+        entries = [
+            {"video": str(video.resolve()), "video_sha256": video_digest(video)}
+            for video in videos
+        ]
+        _reject_duplicate_content(entries)
+        for entry in entries:
+            video = Path(entry["video"])
             info = probe(video)
             energy = change_energy(video, cfg["energy_long_edge"])
             frames = select_frames(
@@ -32,14 +49,7 @@ def command(args):
                 cfg["uniform_ratio"],
                 cfg["min_gap_s"],
             )
-            entries.append(
-                {
-                    "video": str(video.resolve()),
-                    "video_sha256": video_digest(video),
-                    "fps": info.fps,
-                    "frames": frames,
-                }
-            )
+            entry.update(fps=info.fps, frames=frames)
         out.mkdir(parents=True, exist_ok=True)
         (out / "samples.json").write_text(
             json.dumps({"videos": entries}, indent=2), encoding="utf-8"
@@ -52,6 +62,7 @@ def command(args):
 
         manifest = Path(args.samples) if args.samples else out / "samples.json"
         entries = json.loads(manifest.read_text(encoding="utf-8"))["videos"]
+        _reject_duplicate_content(entries)
         jobs = []
         for entry in entries:
             if video_digest(Path(entry["video"])) != entry["video_sha256"]:

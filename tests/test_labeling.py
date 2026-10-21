@@ -401,3 +401,65 @@ def test_label_studio_rejects_invalid_probability(score):
 
     with pytest.raises(ValueError, match="score"):
         to_label_studio("image.jpg", 100, 50, [("bey", (1, 2, 11, 12), score)])
+
+
+def test_sample_cli_rejects_identical_copies_before_video_sampling(
+    tmp_path, monkeypatch
+):
+    import shutil
+
+    from bxjudge.cli import main
+    from bxjudge.labeling import cli as label_cli
+
+    original = video_file(tmp_path)
+    duplicate = tmp_path / "copy.mp4"
+    shutil.copyfile(original, duplicate)
+    out = tmp_path / "labels"
+
+    def unexpected_probe(path):
+        raise AssertionError("duplicate videos must fail before sampling starts")
+
+    monkeypatch.setattr(label_cli, "probe", unexpected_probe)
+    with pytest.raises(ValueError, match="duplicate video content") as error:
+        main(["label", "sample", str(tmp_path), "--out", str(out)])
+    assert str(original) in str(error.value) and str(duplicate) in str(error.value)
+    assert not out.exists()
+
+
+def test_prelabel_cli_rejects_duplicate_manifest_before_gpu(tmp_path, monkeypatch):
+    import hashlib
+    import shutil
+
+    from bxjudge.cli import main
+    from bxjudge.labeling import sam3_prelabel as sam
+
+    original = video_file(tmp_path)
+    duplicate = tmp_path / "copy.mp4"
+    shutil.copyfile(original, duplicate)
+    digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    manifest = tmp_path / "samples.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "videos": [
+                    {
+                        "video": str(path),
+                        "video_sha256": digest,
+                        "fps": 10,
+                        "frames": [0],
+                    }
+                    for path in [original, duplicate]
+                ]
+            }
+        )
+    )
+    out = tmp_path / "labels"
+
+    def unexpected_worker(jobs, config):
+        raise AssertionError("duplicate manifest must fail before SAM worker starts")
+
+    monkeypatch.setattr(sam, "run_prelabel_jobs", unexpected_worker)
+    with pytest.raises(ValueError, match="duplicate video content") as error:
+        main(["label", "prelabel", "--samples", str(manifest), "--out", str(out)])
+    assert str(original) in str(error.value) and str(duplicate) in str(error.value)
+    assert not out.exists()
