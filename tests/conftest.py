@@ -15,3 +15,11 @@ def ref_img():
     from tests.helpers import make_ref_img
 
     return make_ref_img()
+
+
+@pytest.fixture
+def th():
+    """Thresholds loaded from config/thresholds.yaml."""
+    from bxjudge.config import load_thresholds
+
+    return load_thresholds()

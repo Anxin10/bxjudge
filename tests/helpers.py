@@ -180,3 +180,62 @@ def draw_blob(img, center: tuple[int, int], r: int, color: tuple[int, int, int] 
 
     cv2.circle(img, center, r, color, -1)
     return img
+
+
+def parabola_then_orbit(
+    land_at: int,
+    land_point: Point = (300, 200),
+    start: Point = (150, 30),
+    orbit_radius: float = 40,
+    n: int = 120,
+) -> dict[int, Point]:
+    """Centers for a top that falls, lands at frame ``land_at`` and then circles.
+
+    Frames 0..land_at-1: x moves linearly from ``start`` to ``land_point``; y follows ``s ** p``
+    (s = f / (land_at-1)), i.e. accelerating like a falling top. The exponent p is at least 1.5
+    and is raised for long falls so the final fall steps always reach about 9 px/frame of vy
+    (above the usual fall_speed_px of 6); vy exceeds 6 for roughly the second half of a ~30 frame
+    fall. Frame land_at-1 is exactly ``land_point``.
+    Frames land_at..n-1: slow circular motion on a circle of ``orbit_radius`` that passes through
+    ``land_point`` (centre = land_point - (r, 0)); angular step 0.08 rad/frame, so speed is
+    about 3.2 px/frame for r=40, well under the usual fall_speed_px. Truth landing frame = land_at.
+    """
+    import math
+
+    assert land_at >= 2
+    sx, sy = start
+    lx, ly = land_point
+    p = max(1.5, 9.0 * (land_at - 1) / max(ly - sy, 1.0))
+    out: dict[int, Point] = {}
+    for f in range(min(land_at, n)):
+        s = f / (land_at - 1)
+        out[f] = (sx + (lx - sx) * s, sy + (ly - sy) * s ** p)
+    cx, cy = lx - orbit_radius, ly
+    for f in range(land_at, n):
+        a = 0.08 * (f - land_at)
+        out[f] = (cx + orbit_radius * math.cos(a), cy + orbit_radius * math.sin(a))
+    return out
+
+
+def fall_then_rest(
+    rest_at: int,
+    rest_point: Point,
+    start: Point,
+    n: int = 120,
+) -> dict[int, Point]:
+    """Centers for a top that falls fast in a straight line and then stays motionless.
+
+    Frames 0..rest_at-1: linear from ``start`` to ``rest_point`` (frame rest_at-1 is exactly
+    ``rest_point``; the caller picks start/rest_at so the per-frame vy is above fall_speed_px).
+    Frames rest_at..n-1: motionless at ``rest_point``. Truth landing frame = rest_at.
+    """
+    assert rest_at >= 2
+    sx, sy = start
+    rx, ry = rest_point
+    out: dict[int, Point] = {}
+    for f in range(min(rest_at, n)):
+        s = f / (rest_at - 1)
+        out[f] = (sx + (rx - sx) * s, sy + (ry - sy) * s)
+    for f in range(rest_at, n):
+        out[f] = (rx, ry)
+    return out
