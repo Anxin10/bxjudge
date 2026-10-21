@@ -232,7 +232,6 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         frames = list(dets)
         if any(b != a + 1 for a, b in zip(frames, frames[1:])):
             reasons.append(f'track_evidence_gap@{side}')
-        final = dets[frames[-1]]
         whole = {f: next((i for i, (_, poly) in enumerate(pockets)
                           if _whole_box_inside(d.box, poly)), None) for f, d in dets.items()}
         entered = [f for f in frames if whole[f] is not None]
@@ -247,19 +246,21 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
                 start = f
             events.append(FinishResult(pockets[pocket][0], side, start,
                                        _score([dets[f] for f in frames if f >= start]), []))
-        else:
-            final_zone = zone_of(centers[side][final.frame], c)
-            if final_zone in ('xtreme', 'over_left', 'over_right', 'outside'):
-                reason = 'position_unknown' if final_zone == 'outside' else 'pocket_entry_unconfirmed'
-                reasons.append(f'{reason}@{side}')
-                # Timestamp uncertainty at the start of this final episode:
-                # a later known exit cannot hide an earlier partial/offscreen exit.
-                start = final.frame
-                for f in reversed(frames[:-1]):
-                    if f != start - 1 or zone_of(centers[side][f], c) != final_zone:
-                        break
-                    start = f
-                unresolved.append(start)
+        # Chronological uncertainty is independent of the final whole-pocket
+        # event. A later pocket observation does not prove when an earlier
+        # partial/offscreen exit occurred; only an observed whole-body return
+        # to the battle floor explicitly cancels that potential earlier exit.
+        ambiguous = {}
+        for f in frames:
+            if _whole_box_inside(dets[f].box, c.battle_area):
+                ambiguous.clear()
+            elif whole[f] is None:
+                zone = zone_of(centers[side][f], c)
+                if zone in ('xtreme', 'over_left', 'over_right', 'outside'):
+                    reason = 'position_unknown' if zone == 'outside' else 'pocket_entry_unconfirmed'
+                    ambiguous.setdefault(f'{reason}@{side}', f)
+        reasons.extend(ambiguous)
+        unresolved.extend(ambiguous.values())
 
     for part in parts:
         if part.cls != 'bey_part' or not part.dets:

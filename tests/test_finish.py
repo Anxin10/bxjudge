@@ -308,3 +308,60 @@ def test_id_swap_exact_run_length_and_confidence_factor_are_configured(th):
     assert not id_swap_risk(bey['X'], bey['B'], replace(th, id_swap_overlap_frames=4))
     result = detect_finish(bey, parts, stops, c, replace(th, id_swap_confidence_factor=0.2), 60)
     assert result.confidence == pytest.approx(0.18)
+
+
+@pytest.mark.parametrize(('box', 'reason'), [
+    ((-100, -100, -80, -80), 'position_unknown@B'),
+    ((275, 300, 295, 320), 'pocket_entry_unconfirmed@B'),
+])
+def test_ambiguous_interval_before_final_whole_pocket_blocks_intervening_finish(box, reason, th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=100,
+                                b_path_into='xtreme', b_enter_at=150)
+    for d in bey['B'].dets:
+        if 80 <= d.frame < 150:
+            d.box = box
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert result.finish is None and result.loser is None and result.frame is None
+    assert reason in result.reasons and 'finish_unknown' in result.reasons
+    assert result.confidence == 0
+
+
+@pytest.mark.parametrize('box', [
+    (-100, -100, -80, -80), (275, 300, 295, 320),
+])
+def test_observed_whole_battle_return_cancels_earlier_ambiguous_interval(box, th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=100,
+                                b_path_into='xtreme', b_enter_at=150)
+    for d in bey['B'].dets:
+        if 80 <= d.frame < 90:
+            d.box = box
+    # Frames90..149 visibly place B's whole box back on the battle floor.
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('over', 'X', 100)
+    assert result.confidence == pytest.approx(0.9)
+    assert 'position_unknown@B' not in result.reasons
+    assert 'pocket_entry_unconfirmed@B' not in result.reasons
+
+
+def test_initial_outside_launch_is_resolved_by_observed_battle_entry(th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=100,
+                                b_path_into='xtreme', b_enter_at=150)
+    for d in bey['B'].dets:
+        if d.frame < 5:
+            d.box = (-100, -100, -80, -80)
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('over', 'X', 100)
+    assert result.confidence == pytest.approx(0.9)
+    assert 'position_unknown@B' not in result.reasons
+
+
+def test_center_only_battle_return_does_not_resolve_exit_uncertainty(th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=100,
+                                b_path_into='xtreme', b_enter_at=150)
+    for d in bey['B'].dets:
+        if 80 <= d.frame < 90:
+            d.box = (-100, -100, -80, -80)
+        elif 90 <= d.frame < 150:
+            d.box = (115, 170, 135, 190)  # center inside floor, whole body unproven
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert result.finish is None and 'position_unknown@B' in result.reasons
