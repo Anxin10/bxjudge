@@ -95,3 +95,25 @@ def rr(
         needs_review=False,
         review_reasons=list(review_reasons or []),
     )
+
+
+def make_ref_img(seed: int = 0, size: tuple[int, int] = (640, 360)):
+    """Random BGR texture (width, height) = ``size``; stand-in for a real reference frame."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    w, h = size
+    return rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+
+
+def cal_with(img, tmp_path, name: str = "test"):
+    """``make_calibration()`` whose reference frame is ``img`` saved as PNG under ``tmp_path``."""
+    import cv2
+
+    c = make_calibration()
+    c.name = name
+    png = tmp_path / f"{name}.png"
+    assert cv2.imwrite(str(png), img)
+    c.frame_size = (img.shape[1], img.shape[0])
+    c.ref_frame = str(png)
+    return c
