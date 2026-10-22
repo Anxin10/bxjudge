@@ -123,6 +123,66 @@ def test_stop_reasons_gating_motion_provenance(
     assert (tmp_path / "out/trajectories/a_r1.png").exists()
 
 
+@pytest.mark.parametrize(
+    "finish,stop_at,review,stop_reasons",
+    [
+        # Pocket finish at 30: loser B and winner X reversals long after it are notes.
+        (
+            FinishResult("xtreme", "B", 30, 0.95, ["after_finish:track_lost@X"]),
+            70,
+            False,
+            {"after_finish:X_stop_reversed", "after_finish:B_stop_reversed"},
+        ),
+        # The loser's later stop is a note; the winner's stop inside the window
+        # where a competing stop is not yet established still triggers review.
+        (
+            FinishResult("xtreme", "B", 30, 0.95, []),
+            40,
+            True,
+            {"X_stop_reversed", "after_finish:B_stop_reversed"},
+        ),
+        # Unprefixed finish uncertainty still flags a confident result.
+        (
+            FinishResult("xtreme", "B", 30, 0.95, ["track_lost@X"]),
+            70,
+            True,
+            {"after_finish:X_stop_reversed", "after_finish:B_stop_reversed"},
+        ),
+    ],
+)
+def test_post_finish_notes_do_not_trigger_review(
+    monkeypatch, tmp_path, th, rules, finish, stop_at, review, stop_reasons
+):
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(120)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(120)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    from bxjudge.launch_check import LaunchAnalysis
+    from bxjudge.types import LaunchCheck
+
+    launch = LaunchCheck(
+        {"X": "no", "B": "no"},
+        {"X": True, "B": True},
+        {"X": 5, "B": 6},
+        {"X": "battle_area", "B": "battle_area"},
+        "no",
+        [],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "analyze_launch",
+        lambda *a: LaunchAnalysis(launch, {1: "X", 2: "B"}, (0, 21), {5, 6}),
+    )
+    monkeypatch.setattr(pipeline, "orbit_direction", lambda *a: "right")
+    monkeypatch.setattr(pipeline, "stop_frame", lambda *a: (stop_at, "reversed"))
+    monkeypatch.setattr(pipeline, "detect_finish", lambda *a: finish)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    assert r.needs_review == review
+    assert (r.finish, r.winner) == ("xtreme", "X")
+    assert stop_reasons <= set(r.review_reasons)
+
+
 def test_missing_side_and_synthetic_always_review(monkeypatch, tmp_path, th, rules):
     calibrated(
         monkeypatch,

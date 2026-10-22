@@ -44,6 +44,10 @@ def test_short_track_gap_stays_in_same_round(th):
         (60, 3.0, 421, [(0, 500)]),
         (29.97, 0.5, 315, [(0, 500)]),
         (29.97, 0.5, 316, [(0, 300), (316, 500)]),
+        # R41 ratio form: 55/25 == 2.2 exactly, although 2.2 * 25 > 55 in floats.
+        (25, 2.2, 356, [(0, 300), (356, 500)]),
+        (25, 2.2, 355, [(0, 500)]),
+        (50, 1.1, 356, [(0, 300), (356, 500)]),
     ],
 )
 def test_gap_uses_inactive_frames_actual_fps_and_configured_threshold(
@@ -54,6 +58,12 @@ def test_gap_uses_inactive_frames_actual_fps_and_configured_threshold(
         fps,
         replace(th, round_gap_s=gap_s),
     ) == want
+
+
+@pytest.mark.parametrize("fps", [0, -30, float("nan"), float("inf")])
+def test_invalid_fps_is_rejected(th, fps):
+    with pytest.raises(ValueError, match="fps"):
+        segment_rounds([trk(0, 300), trk(400, 500)], fps, th)
 
 
 def test_empty_and_non_bey_tracks_do_not_extend_or_bridge_rounds(th):

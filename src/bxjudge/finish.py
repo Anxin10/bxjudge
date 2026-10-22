@@ -7,7 +7,7 @@ gaps and nonfinite measurements never count as consecutive motion evidence.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import cv2
@@ -22,6 +22,9 @@ from bxjudge.types import Box, Calibration, Detection, Finish, Polygon, Side, Sp
 _FLOW_PARAMS = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=3,
                     poly_n=5, poly_sigma=1.2, flags=0)
 _SIDES: tuple[Side, Side] = ('X', 'B')
+# R22/R55: reasons with this prefix are informational notes about evidence that
+# arose only after the result was settled; the pipeline does not gate on them.
+AFTER_FINISH_PREFIX = 'after_finish:'
 
 
 @dataclass
@@ -31,6 +34,40 @@ class FinishResult:
     frame: int | None
     confidence: float
     reasons: list[str]
+
+
+@dataclass
+class _Note:
+    frame: int | None        # None: not tied to a time, always review-relevant
+    reason: str
+    side: Side | None
+    blocks: bool             # a possible earlier finish at an unknown time
+    owner: Side | None = None  # transit into this side's own pocket entry (R55a)
+
+
+def _settled_frame(result: FinishResult, th: Thresholds) -> int | None:
+    """Last frame at which the non-losing side's evidence can change a result.
+
+    A competing stop starting inside the draw window is only established
+    max(still_frames, reverse_frames) frames later (R55b).
+    """
+    if result.finish is None or result.loser is None or result.frame is None:
+        return None
+    return (result.frame + th.simultaneous_stop_frames
+            + max(th.still_frames, th.reverse_frames) - 1)
+
+
+def is_after_finish(result: FinishResult, side: Side | None, frame: int,
+                    th: Thresholds) -> bool:
+    """Whether evidence of ``side`` at ``frame`` arose only after a known result.
+
+    The loser's later observations cannot change who lost; other evidence
+    matters until a competing draw-window stop would be established (R55b).
+    """
+    settled = _settled_frame(result, th)
+    if settled is None:
+        return False
+    return frame > (result.frame if side == result.loser else settled)
 
 
 def _gray(crop: np.ndarray) -> np.ndarray:
@@ -203,65 +240,90 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
                   th: Thresholds, fps: float) -> FinishResult:
     """Earliest evidenced finish; stop reasons are propagated by Task13 (R21).
 
-    Whole-box pocket entry must remain the final observed position. A return
-    cancels the earlier exit conservatively, since this API has no crop rates.
-    Unexplained early track loss cannot establish a finish or be hidden by a
-    later event. Stops require both sides observed in the battle area.
+    Evidence is judged up to the decisive event (R55). A whole-box pocket run
+    is an entry once it is the final observation or lasts ``pocket_confirm_s``;
+    a shorter run followed by a battle-floor return is cancelled, since this
+    API has no crop rates to rule out a rotating return (R25). Partial or
+    offscreen frames leading into that entry belong to it: they bound its
+    earliest time against the other side instead of blocking it. Unexplained
+    earlier track loss or position uncertainty cannot be hidden by a later
+    event. Stops require both sides observed in the battle area. Uncertainty
+    arising only after the result is settled is reported with
+    ``AFTER_FINISH_PREFIX`` as an informational note.
     """
     _positive_fps(fps)
-    reasons = []
+    notes: list[_Note] = []
     observations = {}
     for side in _SIDES:
         t = bey.get(side)
         if t is None or not t.dets:
-            reasons.append(f'track_missing@{side}')
+            notes.append(_Note(None, f'track_missing@{side}', side, False))
             continue
         if (t.cls != 'bey' or len({d.frame for d in t.dets}) != len(t.dets)
                 or any(d.cls != 'bey' or not all(map(math.isfinite, d.box)) for d in t.dets)):
-            reasons.append(f'track_evidence_invalid@{side}')
+            notes.append(_Note(None, f'track_evidence_invalid@{side}', side, False))
             continue
         observations[side] = {d.frame: d for d in sorted(t.dets, key=lambda d: d.frame)}
     if len(observations) != len(_SIDES):
-        return FinishResult(None, None, None, 0.0, reasons)
+        return FinishResult(None, None, None, 0.0, [n.reason for n in notes])
 
     centers = {side: t.centers() for side, t in bey.items()}
     pockets = [('xtreme', c.xtreme), ('over', c.over_left), ('over', c.over_right)]
-    events: list[FinishResult] = []
-    unresolved = []
+    confirm = round(th.pocket_confirm_s * fps)
+    window = round(th.burst_part_window_s * fps)
+    events: list[tuple[FinishResult, int]] = []  # (event, earliest possible frame)
     for side, dets in observations.items():
         frames = list(dets)
-        if any(b != a + 1 for a, b in zip(frames, frames[1:])):
-            reasons.append(f'track_evidence_gap@{side}')
+        gaps = [a + 1 for a, b in zip(frames, frames[1:]) if b != a + 1]
+        if gaps:
+            notes.append(_Note(gaps[0], f'track_evidence_gap@{side}', side, False))
         whole = {f: next((i for i, (_, poly) in enumerate(pockets)
                           if _whole_box_inside(d.box, poly)), None) for f, d in dets.items()}
-        entered = [f for f in frames if whole[f] is not None]
-        if entered and any(f > entered[0] and zone_of(centers[side][f], c) == 'battle_area' for f in frames):
-            reasons.append(f'exit_returned@{side}')
-        pocket = whole[frames[-1]]
-        if pocket is not None:
-            start = frames[-1]
-            for f in reversed(frames[:-1]):
-                if f != start - 1 or whole[f] != pocket:
-                    break
-                start = f
-            events.append(FinishResult(pockets[pocket][0], side, start,
-                                       _score([dets[f] for f in frames if f >= start]), []))
-        # Chronological uncertainty is independent of the final whole-pocket
-        # event. A later pocket observation does not prove when an earlier
-        # partial/offscreen exit occurred; only an observed whole-body return
-        # to the battle floor explicitly cancels that potential earlier exit.
-        ambiguous = {}
+        runs: list[list[int]] = []  # [start, end, pocket] of consecutive whole-pocket frames
         for f in frames:
+            if whole[f] is None:
+                continue
+            if runs and runs[-1][1] == f - 1 and runs[-1][2] == whole[f]:
+                runs[-1][1] = f
+            else:
+                runs.append([f, f, whole[f]])
+        entry = next((r for r in runs if r[1] == frames[-1] or r[1] - r[0] + 1 >= confirm), None)
+        # Chronological uncertainty since the last whole-body battle-floor frame.
+        # A later pocket observation does not prove when an earlier partial,
+        # offscreen or transient exit occurred, unless that run of frames leads
+        # straight into this side's own confirmed entry (R55a).
+        pending: dict[str, int] = {}
+        entered = False
+        earliest = None
+        for f in frames:
+            if entry is not None and f == entry[0]:
+                notes.extend(_Note(g, r, side, True, owner=side) for r, g in pending.items())
+                earliest = min(pending.values(), default=f)
+                pending.clear()
+            if whole[f] is not None:
+                entered = True
+            elif entered and zone_of(centers[side][f], c) == 'battle_area':
+                notes.append(_Note(f, f'exit_returned@{side}', side, False))
+                entered = False
+            if entry is not None and entry[0] <= f <= entry[1]:
+                continue
             if _whole_box_inside(dets[f].box, c.battle_area):
-                ambiguous.clear()
-            elif whole[f] is None:
+                pending.clear()
+            elif whole[f] is not None:
+                pending.setdefault(f'pocket_entry_unconfirmed@{side}', f)
+            else:
                 zone = zone_of(centers[side][f], c)
                 if zone in ('xtreme', 'over_left', 'over_right', 'outside'):
                     reason = 'position_unknown' if zone == 'outside' else 'pocket_entry_unconfirmed'
-                    ambiguous.setdefault(f'{reason}@{side}', f)
-        reasons.extend(ambiguous)
-        unresolved.extend(ambiguous.values())
+                    pending.setdefault(f'{reason}@{side}', f)
+        notes.extend(_Note(g, r, side, True) for r, g in pending.items())
+        if entry is not None:
+            start, end, pocket = entry
+            events.append((FinishResult(pockets[pocket][0], side, start,
+                                        _score([dets[f] for f in frames if start <= f <= end]), []),
+                           earliest))
 
+    overlap = round(th.burst_part_overlap_s * fps)
     for part in parts:
         if part.cls != 'bey_part' or not part.dets:
             continue
@@ -272,16 +334,17 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         near = []
         for side, dets in observations.items():
             last = max(dets)
-            if (last < f <= last + round(th.burst_part_window_s * fps)
+            # A split may co-exist with the top's final boxes (spec 6.5, R55d).
+            if (last - overlap <= f <= last + window
                     and math.dist(centers[side][last], part.center_at(f)) <= th.burst_part_radius_px):
                 near.append(side)
         if len(near) == 1:
             side = near[0]
-            events.append(FinishResult('burst', side, f,
-                                       _score([observations[side][max(observations[side])], pd]), []))
+            events.append((FinishResult('burst', side, f,
+                                        _score([observations[side][max(observations[side])], pd]), []),
+                           f))
         elif near:
-            reasons.append('burst_side_unknown')
-            unresolved.append(f)
+            notes.append(_Note(f, 'burst_side_unknown', None, True))
 
     for side in _SIDES:
         f = stops.get(side)
@@ -289,35 +352,45 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
             continue
         if all(f in ds and zone_of(centers[s][f], c) == 'battle_area'
                for s, ds in observations.items()):
-            events.append(FinishResult('spin', side, f,
-                                       _score([ds[f] for ds in observations.values()]), []))
+            events.append((FinishResult('spin', side, f,
+                                        _score([ds[f] for ds in observations.values()]), []), f))
         else:
-            reasons.append(f'stop_evidence_missing@{side}')
-            unresolved.append(f)
+            notes.append(_Note(f, f'stop_evidence_missing@{side}', side, True))
 
     latest = max(max(ds) for ds in observations.values())
     for side, dets in observations.items():
         last = max(dets)
-        if last < latest and not any(e.loser == side and e.frame <= last + round(th.burst_part_window_s * fps)
-                                      for e in events):
-            reasons.append(f'track_lost@{side}')
-            unresolved.append(last)
+        if last < latest and not any(e.loser == side and e.frame <= last + window for e, _ in events):
+            notes.append(_Note(last, f'track_lost@{side}', side, True))
 
-    events.sort(key=lambda e: e.frame)
-    if not events or (unresolved and min(unresolved) <= events[0].frame):
-        result = FinishResult(None, None, None, 0.0, reasons + ['finish_unknown'])
+    events.sort(key=lambda item: item[0].frame)
+    first = events[0][0] if events else None
+    if first is None or any(n.blocks and n.frame is not None and n.frame <= first.frame
+                            and n.owner != first.loser for n in notes):
+        result = FinishResult(None, None, None, 0.0, [n.reason for n in notes] + ['finish_unknown'])
     else:
-        first = events[0]
-        simultaneous = [e for e in events if e.loser != first.loser
-                        and e.frame - first.frame <= th.simultaneous_stop_frames]
+        simultaneous = [e for e, earliest in events if e.loser != first.loser
+                        and earliest - first.frame <= th.simultaneous_stop_frames]
         if simultaneous:
             result = FinishResult(None, None, first.frame,
-                                  float(np.mean([first.confidence, simultaneous[0].confidence])), reasons + ['draw'])
+                                  float(np.mean([first.confidence, simultaneous[0].confidence])),
+                                  [n.reason for n in notes] + ['draw'])
         else:
-            result = FinishResult(first.finish, first.loser, first.frame, first.confidence, reasons)
-    if any(r.startswith('track_evidence_gap@') for r in reasons):
+            result = FinishResult(first.finish, first.loser, first.frame, first.confidence, [])
+            result.reasons = [
+                AFTER_FINISH_PREFIX + n.reason
+                if n.frame is not None and is_after_finish(result, n.side, n.frame, th) else n.reason
+                for n in notes if n.owner != first.loser]
+    result.reasons = list(dict.fromkeys(result.reasons))
+    if any(r.startswith('track_evidence_gap@') for r in result.reasons):
         result.confidence *= th.track_gap_confidence_factor
-    if id_swap_risk(bey['X'], bey['B'], th):
+    settled = _settled_frame(result, th)
+    early = {side: replace(bey[side], dets=[d for d in bey[side].dets
+                                           if settled is None or d.frame <= settled])
+             for side in _SIDES}
+    if id_swap_risk(early['X'], early['B'], th):
         result.confidence *= th.id_swap_confidence_factor
         result.reasons.append('id_swap_risk')
+    elif id_swap_risk(bey['X'], bey['B'], th):
+        result.reasons.append(AFTER_FINISH_PREFIX + 'id_swap_risk')
     return result

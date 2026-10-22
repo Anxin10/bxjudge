@@ -20,7 +20,9 @@ from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
 from .finish import (
+    AFTER_FINISH_PREFIX,
     detect_finish,
+    is_after_finish,
     orbit_direction,
     rotation_rate,
     spin_activity,
@@ -185,7 +187,7 @@ def judge_video(
                 if t.track_id in sides and counts[sides[t.track_id]] == 1
             }
             parts = [t for t in selected if t.cls == "bey_part" and t.dets]
-            spin, stops, stop_reasons = {}, {}, []
+            spin, stops, stop_kinds = {}, {}, {}
             for side in ("X", "B"):
                 t = bey.get(side)
                 spin[side] = (
@@ -208,10 +210,20 @@ def judge_video(
                     )
                     stops[side] = stopped
                     if reason:
-                        stop_reasons.append(f"{side}_stop_{reason}")
+                        stop_kinds[side] = reason
                 else:
                     stops[side] = None
             finish = detect_finish(bey, parts, stops, c, th, info.fps)
+            # A stop arising only after the result is settled is a note (R55).
+            stop_reasons = [
+                (
+                    AFTER_FINISH_PREFIX
+                    if is_after_finish(finish, side, stops[side], th)
+                    else ""
+                )
+                + f"{side}_stop_{reason}"
+                for side, reason in stop_kinds.items()
+            ]
             reasons = list(
                 dict.fromkeys([*launch.notes, *finish.reasons, *stop_reasons])
             )
@@ -221,7 +233,11 @@ def judge_video(
                 for note in reasons
                 if not (
                     note.startswith(
-                        ("shake_by_bey_impact@", "shake_not_by_launcher_body@")
+                        (
+                            "shake_by_bey_impact@",
+                            "shake_not_by_launcher_body@",
+                            AFTER_FINISH_PREFIX,
+                        )
                     )
                     or note in ("X_stop_still", "B_stop_still")
                 )

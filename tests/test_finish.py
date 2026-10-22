@@ -6,7 +6,8 @@ import yaml
 
 from bxjudge.config import load_thresholds
 from bxjudge.finish import (
-    detect_finish, id_swap_risk, orbit_direction, rotation_rate, spin_activity, stop_frame,
+    AFTER_FINISH_PREFIX, detect_finish, id_swap_risk, orbit_direction, rotation_rate,
+    spin_activity, stop_frame,
 )
 from tests.helpers import (
     circle_path, make_calibration, make_track, rotating_crops, rr, scene, slowing_bey,
@@ -365,3 +366,151 @@ def test_center_only_battle_return_does_not_resolve_exit_uncertainty(th):
             d.box = (115, 170, 135, 190)  # center inside floor, whole body unproven
     result = detect_finish(bey, parts, stops, c, th, 60)
     assert result.finish is None and 'position_unknown@B' in result.reasons
+
+
+# R55: finish evidence is evaluated up to the decisive event.
+assert AFTER_FINISH_PREFIX == 'after_finish:'
+
+
+def _triggers(result):
+    return [r for r in result.reasons if not r.startswith(AFTER_FINISH_PREFIX)]
+
+
+def _gradual_b_into_xtreme(n=340):
+    b = {f: (320, 180) for f in range(100)}
+    b.update({f: (320, min(320, 270 + 5 * (f - 100))) for f in range(100, n)})
+    return b
+
+
+def _gradual_x_into_over_left(n=340):
+    x = {f: (180, 180) for f in range(100)}
+    x.update({f: (max(75, 180 - 4 * (f - 100)), min(250, 180 + 3 * (f - 100)))
+              for f in range(100, n)})
+    return x
+
+
+@pytest.mark.parametrize(('side', 'finish', 'frame'), [('B', 'xtreme', 106), ('X', 'over', 120)])
+def test_gradual_pocket_slide_transit_belongs_to_own_entry(side, finish, frame, th):
+    bey, parts, stops, c = scene()
+    if side == 'B':
+        bey['B'] = make_track(2, 'bey', _gradual_b_into_xtreme())
+    else:
+        bey['X'] = make_track(1, 'bey', _gradual_x_into_over_left())
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == (finish, side, frame)
+    assert result.confidence == pytest.approx(0.9)
+    assert result.reasons == []
+
+
+def test_gradual_entry_transit_still_blocks_other_side_event_inside_it(th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=105)
+    bey['B'] = make_track(2, 'bey', _gradual_b_into_xtreme())
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert result.finish is None and result.loser is None
+    assert 'pocket_entry_unconfirmed@B' in result.reasons
+    assert 'finish_unknown' in result.reasons
+
+
+def test_loser_still_in_pocket_after_finish_is_informational(th):
+    result = detect_finish(*scene(b_path_into='xtreme', stops={'X': None, 'B': 110}), th, 60)
+    assert (result.finish, result.loser, result.frame) == ('xtreme', 'B', 100)
+    assert _triggers(result) == []
+    assert AFTER_FINISH_PREFIX + 'stop_evidence_missing@B' in result.reasons
+    assert result.confidence == pytest.approx(0.9)
+
+
+def test_winner_track_ending_long_after_finish_is_informational(th):
+    bey, parts, stops, c = scene(b_path_into='xtreme')
+    bey['X'].dets = [d for d in bey['X'].dets if d.frame < 200]
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('xtreme', 'B', 100)
+    assert result.reasons == [AFTER_FINISH_PREFIX + 'track_lost@X']
+
+
+def test_beys_lifted_after_spin_finish_are_informational(th):
+    bey, parts, stops, c = scene(stops={'X': 330, 'B': 250})
+    for track in bey.values():
+        for d in track.dets:
+            if d.frame >= 320:
+                d.box = (d.box[0], -60, d.box[2], -40)
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('spin', 'B', 250)
+    assert _triggers(result) == []
+    assert {AFTER_FINISH_PREFIX + r for r in
+            ('position_unknown@X', 'position_unknown@B', 'stop_evidence_missing@X')} <= set(result.reasons)
+    assert result.confidence == pytest.approx(0.9)
+
+
+def test_winner_evidence_before_competing_stop_is_established_still_triggers(th):
+    # A winner stop starting inside the draw window is only established
+    # max(still_frames, reverse_frames) frames later; losing the winner before
+    # then must stay a review trigger.
+    cutoff = 250 + th.simultaneous_stop_frames + max(th.still_frames, th.reverse_frames) - 1
+    for last, informational in ((cutoff, False), (cutoff + 1, True)):
+        bey, parts, stops, c = scene(stops={'X': None, 'B': 250})
+        bey['X'].dets = [d for d in bey['X'].dets if d.frame <= last]
+        result = detect_finish(bey, parts, stops, c, th, 60)
+        assert (result.finish, result.loser) == ('spin', 'B')
+        expected = (AFTER_FINISH_PREFIX if informational else '') + 'track_lost@X'
+        assert result.reasons == [expected]
+
+
+def test_post_finish_gap_and_contact_do_not_lower_confidence(th):
+    bey, parts, stops, c = scene(stops={'X': None, 'B': 250})
+    bey['X'].dets = [d for d in bey['X'].dets if d.frame != 295]
+    for d in bey['X'].dets:
+        if 300 <= d.frame < 310:
+            d.box = bey['B'].dets[d.frame].box  # post-finish box contact
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('spin', 'B', 250)
+    assert result.confidence == pytest.approx(0.9)
+    assert set(result.reasons) == {AFTER_FINISH_PREFIX + 'track_evidence_gap@X',
+                                   AFTER_FINISH_PREFIX + 'id_swap_risk'}
+
+
+@pytest.mark.parametrize('lifted_box', [(310, 200, 330, 220), (310, -60, 330, -40)])
+def test_non_rotating_removal_after_confirmed_pocket_finish_keeps_it(lifted_box, th):
+    bey, parts, stops, c = scene(b_path_into='xtreme')
+    for d in bey['B'].dets:
+        if d.frame >= 330:
+            d.box = lifted_box
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('xtreme', 'B', 100)
+    assert _triggers(result) == []
+    assert result.confidence == pytest.approx(0.9)
+
+
+def test_return_before_pocket_confirmation_still_cancels(th):
+    confirm = round(th.pocket_confirm_s * 60)
+    for stay, expected in ((confirm - 1, None), (confirm, 'xtreme')):
+        bey, parts, stops, c = scene(b_path_into='xtreme')
+        bey['B'].dets = [d for d in bey['B'].dets if d.frame < 100 + stay]
+        bey['B'].dets.extend(make_track(2, 'bey', {f: (330, 200)
+                                                for f in range(100 + stay, 340)}).dets)
+        result = detect_finish(bey, parts, stops, c, th, 60)
+        assert result.finish == expected
+        if expected is None:
+            assert 'exit_returned@B' in result.reasons
+        else:
+            assert result.loser == 'B' and _triggers(result) == []
+
+
+@pytest.mark.parametrize('first', [79, 78])
+def test_burst_part_overlapping_last_bey_frame_is_burst(first, th):
+    bey, _, stops, c = scene(b_burst_at=80)  # B last frame 79
+    parts = [make_track(3, 'bey_part', {first: (455, 185)})]
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('burst', 'B', first)
+    assert result.reasons == []
+
+
+def test_burst_overlap_tolerance_is_configured(th):
+    bey, _, stops, c = scene(b_burst_at=80)
+    tolerance = round(th.burst_part_overlap_s * 60)
+    early = [make_track(3, 'bey_part', {79 - tolerance - 1: (455, 185)})]
+    assert detect_finish(bey, early, stops, c, th, 60).finish is None
+    edge = [make_track(3, 'bey_part', {79 - tolerance: (455, 185)})]
+    assert detect_finish(bey, edge, stops, c, th, 60).finish == 'burst'
+    same = [make_track(3, 'bey_part', {79: (455, 185)})]
+    assert detect_finish(bey, same, stops, c, replace(th, burst_part_overlap_s=0), 60).finish == 'burst'
+    assert detect_finish(bey, edge, stops, c, replace(th, burst_part_overlap_s=0), 60).finish is None

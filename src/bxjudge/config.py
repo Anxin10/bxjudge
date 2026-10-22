@@ -39,6 +39,8 @@ class Thresholds:
     still_frames: int
     simultaneous_stop_frames: int
     burst_part_window_s: float
+    burst_part_overlap_s: float
+    pocket_confirm_s: float
     id_swap_overlap_frames: int
     round_gap_s: float
     calibration_min_similarity: float

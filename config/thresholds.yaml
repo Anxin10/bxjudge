@@ -30,6 +30,8 @@ still_activity: 4.0
 still_frames: 30
 simultaneous_stop_frames: 3
 burst_part_window_s: 0.3
+burst_part_overlap_s: 0.1     # a part may start this long before the top's last frame (split, R55)
+pocket_confirm_s: 0.5         # whole-pocket stay confirming entry; later removal no longer cancels (R25/R55)
 id_swap_overlap_frames: 3
 round_gap_s: 2.0
 calibration_min_similarity: 0.8
