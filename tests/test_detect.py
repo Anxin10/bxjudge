@@ -9,10 +9,11 @@ import supervision as sv
 import yaml
 
 
+@pytest.mark.parametrize("threshold_source", ["path", "object"])
 @pytest.mark.parametrize("kind", ["rfdetr", "yolo26"])
 @pytest.mark.parametrize("inference_edge,training_edge", [(1280, 384), (960, 640)])
 def test_adapter_color_axes_classes_source_frame(
-    monkeypatch, tmp_path, kind, inference_edge, training_edge
+    monkeypatch, tmp_path, kind, inference_edge, training_edge, threshold_source
 ):
     from bxjudge.detect import load_detector
 
@@ -65,7 +66,14 @@ def test_adapter_color_axes_classes_source_frame(
     thresholds["infer_long_edge"] = inference_edge
     thresholds_path = tmp_path / "thresholds.yaml"
     thresholds_path.write_text(yaml.safe_dump(thresholds))
-    detector = load_detector(kind, weights, config=config, thresholds=thresholds_path)
+    from bxjudge.config import load_thresholds
+
+    thresholds_arg = (
+        load_thresholds(thresholds_path)
+        if threshold_source == "object"
+        else thresholds_path
+    )
+    detector = load_detector(kind, weights, config=config, thresholds=thresholds_arg)
     result = detector(image, 137)
     if kind == "rfdetr":
         assert seen["kwargs"]["shape"] == (inference_edge, inference_edge)

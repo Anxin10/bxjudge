@@ -6,7 +6,7 @@ from typing import Literal, Protocol
 import cv2
 import numpy as np
 
-from .config import load_thresholds
+from .config import Thresholds, load_thresholds
 from .detector_config import CLASSES, disable_uploads, load_policy
 from .types import Detection
 
@@ -36,11 +36,16 @@ class RFDETRDetector:
         conf: float | None = None,
         *,
         config: Path | str = "config/detection.yaml",
-        thresholds: Path | str = "config/thresholds.yaml",
+        thresholds: Thresholds | Path | str = "config/thresholds.yaml",
     ):
         cfg = load_policy(config)
         self.conf = _confidence(conf, cfg)
-        self.inference_long_edge = load_thresholds(thresholds).infer_long_edge
+        th = (
+            thresholds
+            if isinstance(thresholds, Thresholds)
+            else load_thresholds(thresholds)
+        )
+        self.inference_long_edge = th.infer_long_edge
         if not Path(weights).is_file():
             raise FileNotFoundError(weights)
         disable_uploads()
@@ -90,11 +95,16 @@ class YOLODetector:
         conf: float | None = None,
         *,
         config: Path | str = "config/detection.yaml",
-        thresholds: Path | str = "config/thresholds.yaml",
+        thresholds: Thresholds | Path | str = "config/thresholds.yaml",
     ):
         self.cfg = load_policy(config)
         self.conf = _confidence(conf, self.cfg)
-        self.inference_long_edge = load_thresholds(thresholds).infer_long_edge
+        th = (
+            thresholds
+            if isinstance(thresholds, Thresholds)
+            else load_thresholds(thresholds)
+        )
+        self.inference_long_edge = th.infer_long_edge
         if not Path(weights).is_file():
             raise FileNotFoundError(weights)
         disable_uploads()
@@ -133,7 +143,7 @@ def load_detector(
     *,
     conf: float | None = None,
     config: Path | str = "config/detection.yaml",
-    thresholds: Path | str = "config/thresholds.yaml",
+    thresholds: Thresholds | Path | str = "config/thresholds.yaml",
 ) -> Detector:
     if kind == "rfdetr":
         return RFDETRDetector(weights, conf, config=config, thresholds=thresholds)

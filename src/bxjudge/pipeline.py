@@ -150,9 +150,28 @@ def judge_video(
                 [_review(info.path.name, info.duration, "no_round")], provenance
             )
         results = []
+        last_decoded_frame = max(disp)
         for number, (start, end) in enumerate(rounds, 1):
+            next_start = (
+                rounds[number][0] if number < len(rounds) else last_decoded_frame + 1
+            )
+            part_end = min(
+                end + round(th.burst_part_window_s * info.fps),
+                next_start - 1,
+                last_decoded_frame,
+            )
             selected = [
-                Track(t.track_id, t.cls, [d for d in t.dets if start <= d.frame <= end])
+                Track(
+                    t.track_id,
+                    t.cls,
+                    [
+                        d
+                        for d in t.dets
+                        if start
+                        <= d.frame
+                        <= (part_end if t.cls == "bey_part" else end)
+                    ],
+                )
                 for t in tracks
             ]
             current = [t for t in selected if t.cls == "bey" and t.dets]
@@ -340,11 +359,14 @@ def run_batch(
         raise ValueError("limit must be positive")
     paths = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"]
     duplicates = [
-        name for name, count in Counter(p.name for p in paths).items() if count > 1
+        name
+        for name, count in Counter(p.name.casefold() for p in paths).items()
+        if count > 1
     ]
     if duplicates:
-        raise ValueError(f"duplicate video basename(s): {duplicates}")
+        raise ValueError(f"duplicate video basename/artifact(s): {duplicates}")
     # Configuration and model initialization fail globally, before any result/cache writes.
+    injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
     rules = load_rules(rules_path) if rules is None else rules
     _validate_thresholds(th)
@@ -354,7 +376,9 @@ def run_batch(
         provenance = _load_selection(Path(selection).expanduser(), th)
         provenance["runtime"] = {
             "detection_config": str(Path(detection_config).resolve()),
-            "thresholds_path": str(Path(thresholds).resolve()),
+            "thresholds_path": None
+            if injected_thresholds
+            else str(Path(thresholds).resolve()),
             "rules_path": str(Path(rules_path).resolve()),
             "confidence": policy["confidence"],
             "tracking": policy["tracking"],
@@ -366,7 +390,7 @@ def run_batch(
             provenance["kind"],
             Path(provenance["weights"]),
             config=detection_config,
-            thresholds=thresholds,
+            thresholds=th,
         )
     db = out_dir / "processed_videos.json"
     failures = []

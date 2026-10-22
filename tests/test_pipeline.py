@@ -362,3 +362,139 @@ def test_selection_accepts_current_export_provenance(tmp_path, th, marker):
         [result] = pipeline._provenance([rr("spin", "X")], selected)
         assert ("synthetic_detector" in result.review_reasons) == (marker is True)
         assert result.needs_review == (marker is True)
+
+
+def test_trailing_burst_part_keeps_event_time_and_trajectory(
+    monkeypatch, tmp_path, th, rules
+):
+    import csv
+
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(11)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(11)}),
+        make_track(3, "bey_part", {11: (365, 360)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    [r] = pipeline.judge_video(
+        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out"
+    )
+    assert r.finish == "burst" and r.winner == "B" and r.t_end == 11 / 30
+    path = tmp_path / "out/trajectories/a_r1.csv"
+    rows = list(csv.DictReader(path.open()))
+    assert any(row["cls"] == "bey_part" and row["frame"] == "11" for row in rows)
+
+
+def test_trailing_parts_do_not_leak_from_next_round(monkeypatch, tmp_path, th, rules):
+    from dataclasses import replace
+
+    th = replace(th, round_gap_s=0)
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(11)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(11)}),
+        make_track(3, "bey", {f: (360, 360) for f in range(12, 20)}),
+        make_track(4, "bey", {f: (900, 360) for f in range(12, 20)}),
+        make_track(5, "bey_part", {11: (365, 360), 12: (365, 360), 20: (365, 360)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    seen = []
+    actual = pipeline.detect_finish
+
+    def finish(bey, parts, *args):
+        seen.append([d.frame for t in parts for d in t.dets])
+        return actual(bey, parts, *args)
+
+    monkeypatch.setattr(pipeline, "detect_finish", finish)
+    results = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    assert len(results) == 2
+    assert seen == [[11], [12, 20]]
+    assert results[0].finish == "burst" and results[0].t_end == 11 / 30
+
+
+@pytest.mark.parametrize("window,frame", [(0.1, 14), (10, 120)])
+def test_trailing_part_window_and_video_end_are_bounded(
+    monkeypatch, tmp_path, th, rules, window, frame
+):
+    from dataclasses import replace
+
+    th = replace(th, burst_part_window_s=window)
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(11)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(11)}),
+        make_track(3, "bey_part", {frame: (365, 360)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    captured = []
+    actual = pipeline.detect_finish
+
+    def finish(bey, parts, *args):
+        captured.extend(parts)
+        return actual(bey, parts, *args)
+
+    monkeypatch.setattr(pipeline, "detect_finish", finish)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    assert captured == [] and r.finish is None
+
+
+def test_injected_thresholds_are_the_detector_policy(tmp_path, monkeypatch, th, rules):
+    from dataclasses import replace
+
+    th = replace(th, infer_long_edge=640)
+    weights = tmp_path / "model.pt"
+    weights.touch()
+    selection = tmp_path / "selected.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "kind": "yolo26",
+                "weights": str(weights),
+                "dataset": {"provenance": {"synthetic": False}},
+                "inference": {"long_edge": 640},
+            }
+        )
+    )
+    captured = []
+
+    def loader(*args, **kwargs):
+        captured.append(kwargs["thresholds"])
+        return lambda *args: []
+
+    monkeypatch.setattr(pipeline, "load_detector", loader)
+    pipeline.run_batch(
+        tmp_path, tmp_path, tmp_path / "out", selection=selection, th=th, rules=rules
+    )
+    assert captured == [th]
+
+
+@pytest.mark.parametrize(
+    "tracking_change",
+    [
+        {"unknown_tracker_option": 1},
+        {"lost_track_buffer": -1},
+        {"minimum_iou_threshold": float("nan")},
+    ],
+)
+def test_invalid_tracking_is_startup_failure(tmp_path, monkeypatch, tracking_change):
+    import yaml
+
+    policy = yaml.safe_load(Path("config/detection.yaml").read_text())
+    policy["tracking"].update(tracking_change)
+    config = tmp_path / "detection.yaml"
+    config.write_text(yaml.safe_dump(policy))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid global tracker config reached model construction")
+
+    monkeypatch.setattr(pipeline, "load_detector", forbidden)
+    with pytest.raises(ValueError, match="tracking"):
+        pipeline.run_batch(
+            tmp_path, tmp_path, tmp_path / "out", detection_config=config
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_case_variant_video_artifact_collision_fails_preflight(tmp_path):
+    (tmp_path / "a.mp4").touch()
+    (tmp_path / "a.MP4").touch()
+    with pytest.raises(ValueError, match="basename|artifact"):
+        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out")
+    assert not (tmp_path / "out").exists()

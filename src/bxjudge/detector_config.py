@@ -38,10 +38,41 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
         raise ValueError("latency_warmup_frames must be a nonnegative integer")
     if type(cfg["training"]["epochs"]) is not int or cfg["training"]["epochs"] <= 0:
         raise ValueError("epochs must be a positive integer")
-    if cfg["tracking"]["minimum_consecutive_frames"] not in (1, 2):
+    tracking = cfg["tracking"]
+    tracking_keys = {
+        "lost_track_buffer",
+        "track_activation_threshold",
+        "minimum_consecutive_frames",
+        "minimum_iou_threshold",
+        "high_conf_det_threshold",
+    }
+    if not isinstance(tracking, dict) or set(tracking) != tracking_keys:
         raise ValueError(
-            "ByteTrack observation retention supports confirmation within two frames"
+            f"tracking requires exactly {sorted(tracking_keys)}; got {tracking!r}"
         )
+    if (
+        type(tracking["lost_track_buffer"]) is not int
+        or tracking["lost_track_buffer"] < 0
+    ):
+        raise ValueError("tracking lost_track_buffer must be a nonnegative integer")
+    if type(tracking["minimum_consecutive_frames"]) is not int or tracking[
+        "minimum_consecutive_frames"
+    ] not in (1, 2):
+        raise ValueError(
+            "tracking minimum_consecutive_frames must be 1 or 2 for observation retention"
+        )
+    for key in (
+        "track_activation_threshold",
+        "minimum_iou_threshold",
+        "high_conf_det_threshold",
+    ):
+        value = tracking[key]
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not 0 <= value <= 1
+        ):
+            raise ValueError(f"tracking {key} must be a finite number in [0, 1]")
     return cfg
 
 

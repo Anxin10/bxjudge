@@ -164,3 +164,24 @@ def test_trajectory_labels_stay_inside_image(tmp_path, monkeypatch):
         x >= 0 and y >= height and x + width <= 640 and y + baseline <= 360
         for (x, y), width, height, baseline in positions
     )
+
+
+def test_burst_finish_marker_uses_trailing_part_observation(tmp_path, monkeypatch):
+    c = cal_with(make_ref_img(), tmp_path)
+    markers = []
+    original = cv2.drawMarker
+
+    def marker(image, point, *args, **kwargs):
+        markers.append(point)
+        return original(image, point, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "drawMarker", marker)
+    bey = {
+        "X": make_track(1, "bey", {f: (200, 180) for f in range(11)}),
+        "B": make_track(2, "bey", {f: (450, 180) for f in range(11)}),
+    }
+    parts = [make_track(3, "bey_part", {11: (205, 180)})]
+    output.write_trajectory(
+        tmp_path, rr("burst", "B"), bey, parts, c, 30, {"finish": 11}
+    )
+    assert (205, 180) in markers

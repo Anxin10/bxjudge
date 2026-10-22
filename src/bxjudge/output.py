@@ -277,6 +277,15 @@ def write_trajectory(
                     point = tuple(np.rint(centers[frame]).astype(int))
                     cv2.drawMarker(image, point, color, cv2.MARKER_CROSS, 12, 2)
                     label(f"{event}@{frame}", point, 0.4, color)
+        if (
+            track.cls == "bey_part"
+            and r.finish == "burst"
+            and events.get("finish") in centers
+        ):
+            frame = events["finish"]
+            point = tuple(np.rint(centers[frame]).astype(int))
+            cv2.drawMarker(image, point, (0, 255, 255), cv2.MARKER_CROSS, 12, 2)
+            label(f"finish@{frame} (part)", point, 0.4, (0, 255, 255))
     _csv(
         csv_p,
         ["frame", "t", "side", "track_id", "cls", "x", "y", "zone", "score"],

@@ -80,3 +80,90 @@ def test_short_gap_preserves_identity_without_inventing_detections():
     )
     assert len(tracks) == 1
     assert [d.frame for d in tracks[0].dets] == [10, 11, 14, 15]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"unknown_tracker_option": 1},
+        {"lost_track_buffer": -1},
+        {"lost_track_buffer": 1.5},
+        {"lost_track_buffer": True},
+        {"minimum_consecutive_frames": True},
+        {"minimum_consecutive_frames": 3},
+        {"track_activation_threshold": float("nan")},
+        {"track_activation_threshold": -0.1},
+        {"track_activation_threshold": 1.1},
+        {"track_activation_threshold": True},
+        {"minimum_iou_threshold": float("inf")},
+        {"minimum_iou_threshold": -1},
+        {"minimum_iou_threshold": "0.1"},
+        {"high_conf_det_threshold": 2},
+    ],
+)
+def test_tracking_policy_rejects_invalid_supported_values(tmp_path, change):
+    from pathlib import Path
+
+    import yaml
+
+    from bxjudge.detector_config import load_policy
+
+    policy = yaml.safe_load(Path("config/detection.yaml").read_text())
+    policy["tracking"].update(change)
+    config = tmp_path / "bad.yaml"
+    config.write_text(yaml.safe_dump(policy))
+    with pytest.raises(ValueError, match="tracking"):
+        load_policy(config)
+
+
+@pytest.mark.parametrize("tracking", [None, [], {}])
+def test_tracking_policy_requires_complete_mapping(tmp_path, tracking):
+    from pathlib import Path
+
+    import yaml
+
+    from bxjudge.detector_config import load_policy
+
+    policy = yaml.safe_load(Path("config/detection.yaml").read_text())
+    policy["tracking"] = tracking
+    config = tmp_path / "bad.yaml"
+    config.write_text(yaml.safe_dump(policy))
+    with pytest.raises(ValueError, match="tracking"):
+        load_policy(config)
+
+
+def test_track_frames_shares_startup_tracking_validation(tmp_path):
+    from pathlib import Path
+
+    import yaml
+
+    from bxjudge.track import track_frames
+
+    policy = yaml.safe_load(Path("config/detection.yaml").read_text())
+    policy["tracking"]["unknown_tracker_option"] = 1
+    config = tmp_path / "bad.yaml"
+    config.write_text(yaml.safe_dump(policy))
+    with pytest.raises(ValueError, match="tracking"):
+        track_frames([], lambda *args: [], 30, config=config)
+
+
+def test_tracking_policy_valid_boundaries_use_native_constructor(tmp_path):
+    from pathlib import Path
+
+    import yaml
+
+    from bxjudge.detector_config import load_policy
+    from bxjudge.track import track_frames
+
+    policy = yaml.safe_load(Path("config/detection.yaml").read_text())
+    policy["tracking"] = {
+        "lost_track_buffer": 0,
+        "minimum_consecutive_frames": 2,
+        "track_activation_threshold": 0,
+        "minimum_iou_threshold": 1,
+        "high_conf_det_threshold": 1,
+    }
+    config = tmp_path / "valid.yaml"
+    config.write_text(yaml.safe_dump(policy))
+    assert load_policy(config)["tracking"] == policy["tracking"]
+    assert track_frames([], lambda *args: [], 30, config=config) == []
