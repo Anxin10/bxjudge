@@ -239,8 +239,120 @@ def _add_review(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_review)
 
 
+def _eval_inputs(args: argparse.Namespace):
+    """Prediction rows/timings, optionally with R37 reference truth applied (read-only)."""
+    from bxjudge import evaluate as ev
+
+    cfg = ev.load_eval_config(Path(args.config).expanduser())
+    results = Path(args.results).expanduser()
+    rows, timings = ev.read_results(results)
+    truth = None
+    if args.truth:
+        truth_rows, _ = ev.read_results(Path(args.truth).expanduser())
+        truth = ev.match_truth(rows, truth_rows, cfg.truth_t_launch_tolerance_s)
+        rows = truth.rows
+    return cfg, results, rows, timings, truth
+
+
+def _report_path(args: argparse.Namespace, kind: str) -> tuple[Path, str]:
+    from datetime import date
+
+    today = f"{date.today():%Y%m%d}"
+    if args.report:
+        return Path(args.report).expanduser(), today
+    return Path("reports") / f"{kind}-{today}.md", today
+
+
+def _write_report(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    import math
+    import sys
+
+    from bxjudge import evaluate as ev
+    from bxjudge.rules import load_rules
+
+    try:
+        cfg, results, rows, timings, truth = _eval_inputs(args)
+        rules = load_rules(Path(args.rules).expanduser())
+        metrics = ev.evaluate(rows, timings, config=cfg)
+        ok = ev.passes(metrics, cfg)
+        extra = ev.report_metrics(rows, timings, cfg, rules=rules)
+        path, today = _report_path(args, "eval")
+        _write_report(path, ev.render_eval_report(
+            results, rows, timings, metrics, ok, extra, cfg, truth=truth,
+            truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today))
+    except (ValueError, OSError, KeyError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    def shown(name: str) -> str:
+        value = getattr(metrics, name)
+        return f"{value:.3f}" if math.isfinite(value) else "unverified"
+
+    summary = ", ".join(f"{name}={shown(name)} {'PASS' if ok[name] else 'FAIL'}"
+                        for name in ev.METRIC_NAMES)
+    print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
+    if ev.is_synthetic(rows):
+        print("SMOKE ONLY: synthetic-detector rounds are not acceptance evidence")
+    print(f"report: {path}")
+    return 0
+
+
+def _add_eval(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("eval", help="spec section 11 metrics from reviewed rounds (read-only)")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--truth", help="explicit reviewed reference results directory used as "
+                                   "truth for these (fresh) predictions; read-only (R37)")
+    p.add_argument("--config", default="config/evaluation.yaml")
+    p.add_argument("--rules", default="config/rules.yaml", help="for match score agreement")
+    p.add_argument("--report", help="report path (default reports/eval-YYYYMMDD.md)")
+    p.set_defaults(func=_cmd_eval)
+
+
+def _cmd_tune(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import evaluate as ev
+    from bxjudge.config import load_thresholds
+
+    try:
+        cfg, results, rows, _, truth = _eval_inputs(args)
+        th_path = Path(args.thresholds).expanduser()
+        th = load_thresholds(th_path)
+        samples = ev.shake_samples(rows, th.impact_coincide_frames)
+        derivation = ev.derive_shake(samples.samples, cfg.shake_overlap_percentile)
+        diff = ("" if derivation.method == "insufficient"
+                else ev.thresholds_diff(th_path, "shake_px", derivation.value))
+        path, today = _report_path(args, "tune")
+        _write_report(path, ev.render_tune_report(
+            results, rows, samples, derivation, diff, th.shake_px,
+            ev.spin_dir_check(rows, cfg.spin_min_samples), ev.reversed_finish_check(rows),
+            impact_coincide_frames=th.impact_coincide_frames, thresholds_path=th_path,
+            truth=truth, today=today))
+    except (ValueError, OSError, KeyError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(diff.rstrip() if diff else f"shake_px: no change proposed ({derivation.method})")
+    print(f"advisory only, {th_path} not modified; report: {path}")
+    return 0
+
+
+def _add_tune(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("tune", help="advisory shake_px / spin-direction checks from reviewed rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--truth", help="explicit reviewed reference results directory (R37)")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="current thresholds (read only; the diff is printed, never applied)")
+    p.add_argument("--config", default="config/evaluation.yaml")
+    p.add_argument("--report", help="report path (default reports/tune-YYYYMMDD.md)")
+    p.set_defaults(func=_cmd_tune)
+
+
 _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
-               _add_vlm, _add_review]
+               _add_vlm, _add_review, _add_eval, _add_tune]
 
 
 def build_parser() -> argparse.ArgumentParser:

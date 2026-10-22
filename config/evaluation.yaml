@@ -1,0 +1,25 @@
+# Evaluation and tuning policy (spec sections 10-11; Rulings R11/R37/R40/R59/R60).
+# `bxjudge eval` / `bxjudge tune` read this file; nothing here changes how videos are judged.
+
+# Spec section 11 success criteria (initial values). min = at least, max = at most.
+# A metric whose denominator is empty is "unverified" and never passes.
+targets:
+  finish_accuracy_unflagged: {min: 0.95}  # unflagged reviewed rounds: finish AND winner right
+  touch_recall: {min: 0.90}               # true touches detected or flagged for review
+  air_recall: {min: 0.90}                 # true air collisions detected or flagged
+  review_ratio: {max: 0.30}               # share of real rounds flagged needs_review
+  speed_ratio: {max: 1.0}                 # median (core + VLM) / playback duration (R59)
+
+# Spec section 11 speed criterion covers videos up to 5 minutes of playback.
+speed_max_video_s: 300
+# Tail statistic reported next to medians for core / VLM-request / end-to-end latency (R60).
+latency_percentile: 95
+
+# R37 read-only reference truth: a reviewed truth round is used only when the prediction
+# set has the same unique (video, round) key, the same real-round count for that video,
+# and a t_launch within this many playback seconds.
+truth_t_launch_tolerance_s: 0.5
+
+# Tuning (advisory only: config/thresholds.yaml is never overwritten).
+shake_overlap_percentile: 99   # shake_px candidate when touch/normal samples overlap
+spin_min_samples: 10           # judged known-direction sides before an orbit_to_spin swap is suggested

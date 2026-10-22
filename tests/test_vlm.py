@@ -751,6 +751,12 @@ def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypat
     assert timing["a.mp4"]["processing_s"] == 2.5 and timing["a.mp4"]["vlm_s"] >= 0
     assert "vlm_s" in timing["b.mp4"] and "vlm_s" not in timing["c.mp4"]
     assert summary["answered"] == 2 and summary["unavailable"] == 1
+    # R60: one record per request actually sent; frame failures send nothing
+    requests = timing["a.mp4"]["vlm_requests"]
+    assert [(q["round"], q["model"], q["ok"], q["cold"]) for q in requests] == [
+        (1, PRIMARY, True, True), (3, PRIMARY, True, False)]
+    assert all(q["seconds"] >= 0 for q in requests)
+    assert timing["b.mp4"]["vlm_requests"] == []
 
 
 def test_results_dir_relative_or_missing_source_is_unavailable(tmp_path, monkeypatch, rules, th):
@@ -849,3 +855,25 @@ def test_vlm_cli_runs_results_dir_and_reports_errors(tmp_path, monkeypatch, caps
     assert main(["vlm", str(tmp_path)]) == 2
     assert "non-loopback" in capsys.readouterr().err
     assert main(["vlm", str(tmp_path / "missing")]) == 2
+
+
+def test_session_records_each_request_with_cold_and_failure(monkeypatch):
+    def fake(host, payload, path="/api/chat", **_):
+        if path == "/api/generate":
+            return {"model": payload["model"], "done": True, "done_reason": "unload"}
+        if payload["model"] == PRIMARY:
+            raise VlmError("HTTP 500: out of memory")
+        return reply('{"answer":"a","reason":"r"}')
+
+    monkeypatch.setattr(vlm, "_post", fake)
+    session = vlm.VlmSession(cfg())
+    session.ask([blank()], "q", round=4)
+    session.ask([blank()], "q", round=5)
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: (_ for _ in ()).throw(VlmError("down")))
+    with pytest.raises(VlmError):
+        session.ask([blank()], "q", round=6)
+    with pytest.raises(vlm.VlmFramesError):
+        session.ask([np.zeros((4, 4, 3), dtype=np.float32)], "q", round=7)  # never sent
+    assert [(q["round"], q["model"], q["ok"], q["cold"]) for q in session.requests] == [
+        (4, FALLBACK, True, True), (5, FALLBACK, True, False), (6, None, False, None)]
+    assert all(q["seconds"] >= 0 for q in session.requests)

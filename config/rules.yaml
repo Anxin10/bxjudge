@@ -1,12 +1,31 @@
-# Match rules (spec section 7). Source: Takara Tomy BEYBLADE X official tournament rules.
-# TODO(user): verify every value against the latest official rules PDF.
-rules_version: "takara-tomy-bx-2025-reg8"
+# Match rules (spec section 7).
+# Checked against the official Takara Tomy "BEYBLADE X Regulation" PDF, 12th edition
+# (第12版, March 2026, enacted/effective 2026-03-13), all 4 pages:
+#   https://beyblade.takaratomy.co.jp/beyblade-x/_image/regulation.pdf
+#   SHA256 c0950dba96979d99c88a53bd7114c8bf1b2b4ff470875f475cbe1dcdeed26541
+# Official (page 2): first to 4 points; spin 1, burst 2, over 2, xtreme 3; simultaneous
+# finishes are a draw and replayed; tops colliding in the air before touching the stadium
+# are replayed; a launch that lands outside the stadium or on the cover is a shoot miss.
+# USER OVERRIDES (project policy chosen by the user, NOT official-compliance claims; see
+# README "規則核對"):
+#   - stadium_touch: only the launcher BODY counts; cord/ripcord contact never counts (the
+#     official text forbids body/launcher/accessory contact and only conditionally exempts
+#     string-launcher handles/cords). A detected touch is a redo + miss (2025 world event
+#     practice); the official intentional-touch disqualification is out of scope.
+#   - repeat_miss_penalty: none (default) = no extra penalty for repeat misses. The
+#     optional opponent_1pt_on_2nd_miss mode implements the official v12 tally.
+# Known limitation: the generic bey_part detector class cannot tell the v12 Barrel Griffon
+# detached barrel (which is NOT a burst) from other parts, so a burst judged from that
+# barrel alone is wrong; such matches need human review.
+rules_version: "takara-tomy-bx-regulation-v12-2026-03"
 win_points: 4                      # first side to reach this many points wins the match
 finish_points: {spin: 1, burst: 2, over: 2, xtreme: 3}
 launch_check:                      # per-failure action: redo | ignore
   stadium_touch: redo
   bey_not_in_battle_area: redo
   mid_air_collision: redo
-  repeat_miss_penalty: none        # none | opponent_1pt_on_2nd_miss
+  # none | opponent_1pt_on_2nd_miss (official v12: a side's 2nd miss in the same battle
+  # gives the opponent 1 point and clears both tallies; simultaneous 2nd misses are void)
+  repeat_miss_penalty: none
 draw:
   action: redo                     # only "redo" is supported

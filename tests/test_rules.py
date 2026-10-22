@@ -87,7 +87,81 @@ def test_both_sides_second_miss_does_not_penalise_either(rules):
     rules.launch_check["repeat_miss_penalty"] = "opponent_1pt_on_2nd_miss"
     m = {"X": 1, "B": 1}
     o = decide_round(rr("spin", "X", touch={"X": "yes", "B": "yes"}), rules, m)
-    assert o.action == "redo" and m == {"X": 2, "B": 2}
+    # official v12: simultaneous second faults are void; both stay at their first (R23)
+    assert o.action == "redo" and m == {"X": 1, "B": 1}
+
+
+# ---- R23: official v12 repeat-miss tally (optional penalty mode) -------------
+
+MISS_X = {"touch": {"X": "yes"}}
+MISS_B = {"touch": {"B": "yes"}}
+
+
+@pytest.fixture
+def penalty(rules):
+    rules.launch_check["repeat_miss_penalty"] = "opponent_1pt_on_2nd_miss"
+    return rules
+
+
+def test_normal_scored_round_resets_both_miss_counts(penalty):
+    m = {"X": 1, "B": 1}
+    o = decide_round(rr("spin", "X"), penalty, m)
+    assert (o.action, o.scorer) == ("score", "X") and m == {"X": 0, "B": 0}
+    assert decide_round(rr("spin", "X", **MISS_X), penalty, m).action == "redo"
+
+
+def test_penalty_resets_both_miss_counts(penalty):
+    m = {"X": 1, "B": 1}
+    o = decide_round(rr("spin", "X", **MISS_X), penalty, m)
+    assert (o.action, o.scorer, o.points) == ("score", "B", 1) and m == {"X": 0, "B": 0}
+    # B's earlier first miss was cleared with the point: its next miss is only a redo
+    assert decide_round(rr("spin", "X", **MISS_B), penalty, m).action == "redo"
+
+
+def test_simultaneous_second_misses_cancel_then_next_single_miss_penalises(penalty):
+    m = {"X": 1, "B": 1}
+    both = {"touch": {"X": "yes", "B": "yes"}}
+    assert decide_round(rr("spin", "X", **both), penalty, m).action == "redo"
+    assert m == {"X": 1, "B": 1}
+    o = decide_round(rr("spin", "X", **MISS_B), penalty, m)
+    assert (o.action, o.scorer, o.points) == ("score", "X", 1) and m == {"X": 0, "B": 0}
+
+
+def test_second_miss_with_opponent_first_miss_penalises_the_second(penalty):
+    m = {"X": 1, "B": 0}
+    o = decide_round(rr("spin", "X", touch={"X": "yes", "B": "yes"}), penalty, m)
+    assert (o.action, o.scorer, o.points) == ("score", "B", 1)
+    assert o.reasons[-1] == "repeat_miss_penalty_X" and m == {"X": 0, "B": 0}
+
+
+def test_count_never_stays_at_two_to_penalise_every_later_miss(penalty):
+    rs = [rr("spin", "B", **MISS_X, round=n) for n in range(1, 6)]
+    (m,) = group_matches(rs, penalty)
+    assert [o.action for _, o in m.rounds] == ["redo", "score", "redo", "score", "redo"]
+    assert m.score == {"X": 0, "B": 2}
+
+
+def test_air_collision_and_draw_replays_keep_the_miss_count(penalty):
+    m = {"X": 1, "B": 0}
+    assert decide_round(rr("spin", "X", air="yes"), penalty, m).action == "redo"
+    assert decide_round(rr(None, None), penalty, m).action == "redo"
+    assert decide_round(rr("spin", None), penalty, m).action == "redo"
+    assert m == {"X": 1, "B": 0}
+    o = decide_round(rr("spin", "X", **MISS_X), penalty, m)
+    assert (o.scorer, o.points) == ("B", 1)
+
+
+def test_ignored_launch_failure_scores_and_resets(penalty):
+    penalty.launch_check["stadium_touch"] = "ignore"
+    m = {"X": 1, "B": 0}
+    o = decide_round(rr("spin", "B", **MISS_X), penalty, m)
+    assert (o.action, o.scorer) == ("score", "B") and m == {"X": 0, "B": 0}
+
+
+def test_default_mode_never_penalises_repeat_misses(rules):
+    rs = [rr("spin", "B", **MISS_X, round=n) for n in range(1, 5)]
+    (m,) = group_matches(rs, rules)
+    assert [o.action for _, o in m.rounds] == ["redo"] * 4 and m.score == {"X": 0, "B": 0}
 
 
 def test_redo_reasons_reported(rules):
@@ -170,7 +244,7 @@ def test_group_matches_empty(rules):
 
 
 def test_default_rules_values(rules):
-    assert rules.rules_version == "takara-tomy-bx-2025-reg8"
+    assert rules.rules_version == "takara-tomy-bx-regulation-v12-2026-03"
     assert rules.win_points == 4
     assert rules.finish_points == {"spin": 1, "burst": 2, "over": 2, "xtreme": 3}
     assert rules.launch_check == {

@@ -9,10 +9,11 @@ cd "$(dirname "$0")/.."
 sudo apt-get update
 sudo apt-get install -y ffmpeg rclone
 
-# 2. uv (installed into ~/.local/bin, no sudo)
+# 2. uv (installed into ~/.local/bin, no sudo). User-installed tools (uv, the
+#    standalone rclone) live in ~/.local/bin, which a normal login PATH may lack.
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # 3. Python 3.12 managed by uv

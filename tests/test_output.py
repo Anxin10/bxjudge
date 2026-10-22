@@ -4,6 +4,7 @@ import csv
 import json
 
 import cv2
+import pytest
 
 from bxjudge import output
 from tests.helpers import cal_with, make_ref_img, make_track, rr
@@ -189,14 +190,31 @@ def test_burst_finish_marker_uses_trailing_part_observation(tmp_path, monkeypatc
 
 def test_vlm_timing_is_separate_and_accumulates(tmp_path):
     output.record_video_timing(tmp_path, "a.mp4", 10, 2, source_video=tmp_path / "a.mp4")
-    output.record_vlm_timing(tmp_path, "a.mp4", 30.5)
-    output.record_vlm_timing(tmp_path, "a.mp4", 1.5)
+    first = {"round": 1, "seconds": 30.0, "model": "m", "ok": True, "cold": True}
+    second = {"round": 2, "seconds": 1.0, "model": None, "ok": False, "cold": None}
+    output.record_vlm_timing(tmp_path, "a.mp4", 30.5, [first])
+    output.record_vlm_timing(tmp_path, "a.mp4", 1.5, [second])
     data = json.loads((tmp_path / "videos.json").read_text())
     assert data["a.mp4"]["processing_s"] == 2 and data["a.mp4"]["vlm_s"] == 32.0
+    # per-request seconds accumulate next to the phase total (R60)
+    assert data["a.mp4"]["vlm_requests"] == [first, second]
     assert data["a.mp4"]["source_video"] == str(tmp_path / "a.mp4")
     # A fresh core analysis replaces the rounds, so earlier VLM time no longer applies.
     output.record_video_timing(tmp_path, "a.mp4", 10, 3)
-    assert "vlm_s" not in json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+    entry = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+    assert "vlm_s" not in entry and "vlm_requests" not in entry
+
+
+@pytest.mark.parametrize("bad", [
+    {"round": 1, "seconds": -1.0, "model": "m", "ok": True, "cold": True},
+    {"round": 1, "seconds": float("nan"), "model": "m", "ok": True, "cold": True},
+    {"round": 1, "seconds": 1.0, "model": "m", "ok": True},
+    {"round": True, "seconds": 1.0, "model": "m", "ok": True, "cold": True},
+])
+def test_vlm_request_records_are_validated(tmp_path, bad):
+    with pytest.raises(ValueError):
+        output.record_vlm_timing(tmp_path, "a.mp4", 1.0, [bad])
+    assert not (tmp_path / "videos.json").exists()
 
 
 def test_match_start_is_sparse_typed_metadata(tmp_path, rules):

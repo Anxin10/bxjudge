@@ -125,6 +125,12 @@ def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> Round
     action; otherwise score ``finish_points`` for ``r.winner``. ``r.launch is None``
     means "no launch failure". ``touch == "unknown"`` / ``air_collision == "maybe"`` never
     trigger a redo.
+
+    Miss tally (official regulation v12, R23): a decided round (finish points or a
+    repeat-miss penalty) resets BOTH sides to 0; air-collision, draw and other replays
+    keep the tally. In ``opponent_1pt_on_2nd_miss`` mode a side's second miss gives the
+    opponent 1 point; if both sides make their second miss in the same round those
+    second misses are void and both stay at 1.
     """
     reasons: list[str] = []
     missers: list[Side] = []  # sides at fault (an air collision blames nobody)
@@ -146,10 +152,15 @@ def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> Round
         for side in missers:
             misses[side] = misses.get(side, 0) + 1
         if cfg["repeat_miss_penalty"] == "opponent_1pt_on_2nd_miss":
-            # If both sides hit the threshold in the same round there is no fair
-            # penalty target, so it stays a plain redo.
+            # Official v12 tally (R23): a second miss gives the opponent the point and
+            # clears every miss so far; second misses by both sides in the same round
+            # are void, leaving both at their first miss.
             penalised = [s for s in missers if misses[s] >= _PENALTY_MISSES]
-            if len(penalised) == 1:
+            if len(penalised) == len(SIDES):
+                for side in penalised:
+                    misses[side] = _PENALTY_MISSES - 1
+            elif penalised:
+                _reset(misses)
                 return RoundOutcome(
                     "score", _other(penalised[0]), _PENALTY_POINTS,
                     [*reasons, f"repeat_miss_penalty_{penalised[0]}"],
@@ -160,7 +171,13 @@ def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> Round
         return RoundOutcome(rules.draw["action"], None, 0, ["draw"])
     if r.winner is None:  # inconsistent upstream result; don't invent a scorer
         return RoundOutcome("redo", None, 0, ["finish_without_winner"])
+    _reset(misses)  # a decided round ends the miss tally of that battle
     return RoundOutcome("score", r.winner, finish_points(rules, r.finish), [])
+
+
+def _reset(misses: dict[Side, int]) -> None:
+    for side in SIDES:
+        misses[side] = 0
 
 
 @dataclass

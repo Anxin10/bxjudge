@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -230,16 +231,42 @@ def record_video_timing(
     _write_json(path, rows)
 
 
-def record_vlm_timing(out_dir: Path, video: str, vlm_s: float) -> None:
+VLM_REQUEST_KEYS = ("round", "seconds", "model", "ok", "cold")
+
+
+def _check_vlm_request(q) -> None:
+    ok = (
+        isinstance(q, dict)
+        and tuple(sorted(q)) == tuple(sorted(VLM_REQUEST_KEYS))
+        and type(q["round"]) is int
+        and isinstance(q["seconds"], (int, float))
+        and not isinstance(q["seconds"], bool)
+        and math.isfinite(q["seconds"])
+        and q["seconds"] >= 0
+        and (q["model"] is None or isinstance(q["model"], str))
+        and type(q["ok"]) is bool
+        and (q["cold"] is None or type(q["cold"]) is bool)
+    )
+    if not ok:
+        raise ValueError(f"invalid VLM request record: {q!r}")
+
+
+def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[dict]) -> None:
     """Add VLM phase time to ``vlm_s``, kept apart from core ``processing_s``.
 
-    A later core analysis (``record_video_timing``) replaces the entry and its rounds,
-    so accumulated VLM time always belongs to the current round set.
+    ``requests`` holds one record per request actually sent in this phase
+    (``VLM_REQUEST_KEYS``: round, seconds, answering model or None, ok, cold = first
+    answer by that model in the phase or None when it failed); they accumulate in
+    ``vlm_requests``. A later core analysis (``record_video_timing``) replaces the entry
+    and its rounds, so accumulated VLM time always belongs to the current round set.
     """
+    for q in requests:
+        _check_vlm_request(q)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     entry = rows.setdefault(video, {})
     entry["vlm_s"] = entry.get("vlm_s", 0.0) + vlm_s
+    entry["vlm_requests"] = [*entry.get("vlm_requests", []), *(dict(q) for q in requests)]
     _write_json(path, rows)
 
 

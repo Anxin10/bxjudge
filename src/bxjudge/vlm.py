@@ -380,6 +380,9 @@ class VlmSession:
         self.used = False
         self.models: Counter[str] = Counter()
         self.primary_down: str | None = None
+        # One record per request actually sent (output.VLM_REQUEST_KEYS, R60). "cold" is
+        # the first answer by that model in this phase; models are unloaded at close().
+        self.requests: list[dict] = []
 
     def _mark(self, name: str, error: VlmError) -> None:
         if name == self.config.model and not isinstance(error, VlmReplyError):
@@ -391,7 +394,8 @@ class VlmSession:
                 self.config.fallback,
             )
 
-    def ask(self, images: Sequence[np.ndarray], question: str) -> VlmAnswer:
+    def ask(self, images: Sequence[np.ndarray], question: str, *, round: int) -> VlmAnswer:
+        """Ask about one round (``round`` labels the request's timing record)."""
         cfg = self.config
         if not images:
             raise ValueError("VLM needs at least one image")
@@ -401,16 +405,28 @@ class VlmSession:
         skipped = self.primary_down is not None and len(models) == 2
         if skipped:
             models = models[1:]
+        began = time.perf_counter()
         try:
             answer = _first_answer(cfg.host, models, encoded, question, cfg, self._mark)
         except VlmError as error:
+            self._record(round, began, None)
             if skipped:
                 raise VlmError(
                     f"{cfg.model}: skipped after earlier failure ({self.primary_down}); {error}"
                 ) from None
             raise
+        self._record(round, began, answer.model)
         self.models[answer.model] += 1
         return answer
+
+    def _record(self, round: int, began: float, model: str | None) -> None:
+        self.requests.append({
+            "round": round,
+            "seconds": time.perf_counter() - began,
+            "model": model,
+            "ok": model is not None,
+            "cold": None if model is None else model not in self.models,
+        })
 
     def close(self) -> None:
         if not self.used:
@@ -496,7 +512,7 @@ def _note(r: RoundResult, get_frames, session: VlmSession) -> str:
     if not images:
         return f"{UNAVAILABLE_PREFIX}frames: none decoded near the event"
     try:
-        answer = session.ask(images, question)
+        answer = session.ask(images, question, round=r.round)
     except VlmFramesError as error:  # e.g. a non-uint8 / empty / unencodable frame
         log.warning("unusable frames for %s round %s: %s", r.video, r.round, _describe(error))
         return f"{UNAVAILABLE_PREFIX}frames: {_describe(error)}"
@@ -687,6 +703,7 @@ def review_results_dir(
                     source, event_time(r), calib_dir, session.config, th, calibrations=calibrations
                 )
 
+            sent = len(session.requests)
             reviewed = review_low_confidence(results, get_frames, session=session)
             asked = {
                 (r.video, r.round): (r.vlm_note, (r.t_launch, r.t_end))
@@ -694,7 +711,9 @@ def review_results_dir(
                 if r is not before
             }
             _persist_notes(out_dir, video, asked, rules)
-            record_vlm_timing(out_dir, video, time.perf_counter() - began)
+            record_vlm_timing(
+                out_dir, video, time.perf_counter() - began, session.requests[sent:]
+            )
             for note, _ in asked.values():
                 summary["asked"] += 1
                 summary["unavailable" if note.startswith(UNAVAILABLE_PREFIX) else "answered"] += 1

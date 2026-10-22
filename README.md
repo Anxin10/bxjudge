@@ -16,7 +16,14 @@ uv run pytest                  # 確認環境正常
 1. 先自行執行一次 `rclone config`，建立名為 **`gdrive`** 的 remote：
    - storage 選 `drive`（Google Drive）
    - **scope 選 `drive.readonly`**（rclone 的 "Read-only access" 選項；程式不會寫入、移動或刪除雲端檔案）
-   - 在瀏覽器完成授權（WSL 無瀏覽器時，用 Windows 端 `rclone authorize "drive"` 取得 token 貼回）
+   - 在瀏覽器完成授權。WSL 無瀏覽器時，回答 auto config 為 `n`，WSL 端 `rclone config`
+     會印出一行**完整的** `rclone authorize "drive" "<一長串編碼 JSON>"` 指令：把**整行**
+     原封不動複製到有瀏覽器的 Windows 端 rclone 執行，再把產生的 token 貼回 WSL。
+     **不要**只打 `rclone authorize "drive"`：第二個參數帶有剛才選的設定（含
+     `drive.readonly` scope），省略它會以預設的完整讀寫權限授權。
+     官方說明：<https://rclone.org/commands/rclone_authorize/>
+   - `scripts/setup_wsl.sh` 與 `scripts/sync_videos.sh` 一律把 `~/.local/bin` 放進 PATH，
+     所以裝在那裡的 rclone / uv 在一般登入 shell 也找得到。
 2. 同步一個批次到 WSL 檔案系統（不要從 `/mnt/c`、`/mnt/g` 直接讀影片）：
 
    ```bash
@@ -26,6 +33,8 @@ uv run pytest                  # 確認環境正常
    ```
 
    影片會放在 `~/bx/videos/<batch_name>/`（只複製 `*.mp4`，可重複執行，已下載的不會重抓）。
+   `<batch_name>` 必須是單一資料夾名稱（英數字與 `.` `_` `-`，不可含 `/`、`..` 或以 `.`/`-`
+   開頭），否則腳本直接拒絕；腳本只用 `rclone copy`，不會同步刪除或改動雲端檔案。
 3. 列出新增或變更過的影片（解析度 / fps / 編碼 / 是否有音軌）；此指令不會標記為已處理：
 
    ```bash
@@ -37,7 +46,10 @@ uv run pytest                  # 確認環境正常
 ## Setup (English summary)
 
 Run `bash scripts/setup_wsl.sh`, then once `rclone config` to create a remote named `gdrive`
-with scope `drive.readonly` and authorize it in the browser. Sync a batch with
+with scope `drive.readonly` and authorize it in the browser. Without a browser in WSL, copy
+the COMPLETE `rclone authorize "drive" "<encoded JSON>"` command that WSL `rclone config`
+prints (the second argument carries the drive.readonly scope) to a machine with a browser;
+a bare `rclone authorize "drive"` drops that scope. Sync a batch with
 `scripts/sync_videos.sh <drive_folder_id> <batch_name>` (lands in `~/bx/videos/<batch_name>`),
 and list new/changed videos with `uv run bxjudge scan ~/bx/videos/<batch_name>`.
 
@@ -75,6 +87,12 @@ uv run bxjudge label prelabel --out data/labeling
 不降幀。每區段各類別重新提示並傳播，區段間物件 ID 重設。只保存選定格的框和分數，
 不保存所有全解析遮罩。每區段在 finally 關閉迭代器、reset 並清空 state，再刪除暫存格；
 CPU offload 或 async loading 本身不代表有界記憶體。這是靜態圖片標註，不提供跨區段軌跡。
+
+`config/labeling.yaml` 的 `batched_grounding_batch_size: 4`（R47 實測）：固定版本的 SDK
+builder 寫死 16，在真實 1080p 的 120 格窗口於第 17/120 格已達約 23.4 GiB 而中止；只把
+grounding batch 改為 4（`window_frames` 120 與 SDK `postprocess_batch_size` 16 不變），同一
+窗口 126.93 s 完成，全卡峰值 12381 MiB（含桌面約 2.2 GB）。這是資源量測，不代表框的品質：
+該次 5 個 `bey_part` 框都錯把整顆陀螺或發射器框入，必須人工修正。
 
 本版繞過官方 `start_session` 的不支援參數錯誤，使用固定版本的 `predictor.model`
 直接 API。傳播不傳 optional `max_frame_num_to_track`，避免該版本兩層不同的結尾定義；
@@ -150,3 +168,60 @@ uv run python scripts/smoke_labeling.py --out .superpowers/sdd/plan/scratch/labe
 此人工觸發的自動 smoke 產生四張合成影格，以兩張為一個實際窗口，透過真正 CLI/SAM
 預標。零物件只證明管線可運作，不證明真實陀螺辨識準確率。真實批次同步/OAuth、
 約 400 張人工標註與 Windows 瀏覽器人工驗收仍須使用者完成。
+
+## 評估與門檻校正（`bxjudge eval` / `bxjudge tune`）
+
+覆核完（`bxjudge review`）後，以人工確認的回合（`reviewed`）為真值評估：
+
+```bash
+uv run bxjudge eval results/20261001            # 寫 reports/eval-YYYYMMDD.md
+uv run bxjudge tune results/20261001            # 寫 reports/tune-YYYYMMDD.md，印出建議 diff
+# 優化迴圈：新設定輸出到新資料夾，再拿已覆核的舊結果當真值（兩邊都只讀）
+uv run bxjudge run ~/bx/videos/20261001 --out results/20261001-try2
+uv run bxjudge eval results/20261001-try2 --truth results/20261001
+```
+
+- 真值 = 已覆核回合的 effective 值（原判 + `reviewer_fix`）；預測 = 原始欄位（含原始
+  `needs_review`）。`recalibrate` / `no_round` / `decode_error` / `analysis_error` 不是回合。
+- 報告最上方是摘要表：spec §11 五項（未標覆核回合判定正確率、觸碰召回、空碰召回、
+  需覆核比例、處理速度比中位數）與是否達標，以及核心判定延遲、VLM 單次請求延遲
+  （中位數 / p95 / 最大，冷 / 熱）、VLM 觸發率、端到端延遲、速度達標率、裁判正確率。
+  分母為 0 的指標顯示 unverified，一律不算達標。
+- 速度以「核心 + VLM」計（R59）；核心時間不含一次性的模型載入與掃描 / probe，核心-only
+  比值另列為診斷。影片長度用 videos.json 記錄的播放秒數，慢動作不換算。
+- 目標值、容許誤差與百分位都在 `config/evaluation.yaml`。
+- `--truth` 只用 (video, round) 唯一、該影片回合數相同、`t_launch` 差在容許內的回合；
+  重複、缺少、分段不同、時間不符都列在報告並排除，不猜最近的回合，也不改任何檔案。
+- `tune` 從已覆核回合的 `motion_evidence` 取晃動樣本（排除撞擊時間窗與未量測格），
+  算出 `shake_px` 候選值並印出 `config/thresholds.yaml` 的建議 diff，**不會自動覆寫**；
+  也列出旋轉方向 flag 正確率（必要時建議對調 `orbit_to_spin`）與 reversed 轉停被推翻比例。
+- 用合成資料訓練的偵測器（synthetic_detector）跑出的結果，報告會標示 SMOKE ONLY：
+  只證明流程可運作，不是驗收。
+
+## 規則核對（官方第 12 版）
+
+`config/rules.yaml` 已逐項核對 Takara Tomy 官方「ベイブレードエックス レギュレーション」
+第 12 版（2026 年 3 月，2026-03-13 施行，4 頁；
+<https://beyblade.takaratomy.co.jp/beyblade-x/_image/regulation.pdf>，
+SHA256 `c0950dba96979d99c88a53bd7114c8bf1b2b4ff470875f475cbe1dcdeed26541`）：
+
+- 先取得 4 分勝；spin 1、burst 2、over 2、xtreme 3：與官方一致。
+- 同時發生終結 → 平手重賽；兩顆陀螺在接觸盤面前空中相撞 → 重賽：與官方一致。
+- 發射落到盤外或蓋子上 = シュートミス → 重賽並計一次失誤：與官方一致。
+- `repeat_miss_penalty: opponent_1pt_on_2nd_miss`（選用）照官方計數：同一バトル（重賽到
+  有人得分為止）內某方第 2 次失誤 → 對手得 1 分並清除雙方失誤數；雙方在同一次發射同時
+  第 2 次失誤 → 該次無效、雙方都回到 1 次；正常得分也清除雙方失誤數；空碰、平手重賽
+  不清除。
+
+以下是**使用者自訂（不是官方規定）**，不宣稱與官方完全一致：
+
+- 觸碰只算發射器**本體**；棉線與拉條碰到盤面一律不算（官方禁止身體、發射器、裝飾品碰
+  盤面，只在不影響對戰時有條件地豁免繩式發射器的握把與繩子）。偵測到觸碰 → 重賽並計
+  失誤（2025 世界大會作法）；官方「故意觸碰判失格」不在自動判定範圍。
+- 預設 `repeat_miss_penalty: none`：重複失誤不額外扣分（spec §12.1，可在設定檔切換）。
+
+已知限制：
+
+- 第 12 版追加「Barrel Griffon 分離的 barrel 不算 burst」。偵測類別 `bey_part` 無法分辨
+  這個零件，若只因該 barrel 脫落而判 burst 會判錯，相關對戰需人工覆核。
+- 不判斷搶拍 / 慢拍（フライング、後出し）：本系統不使用音軌（spec §3）。

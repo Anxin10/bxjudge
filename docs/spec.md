@@ -216,7 +216,7 @@
 規則全部寫在 YAML 設定檔，不寫死在程式中。初始內容依目前查到的官方資訊：
 
 ```yaml
-rules_version: "takara-tomy-bx-2025-reg8"   # 待以官方第 8 版（或更新版）PDF 核對
+rules_version: "takara-tomy-bx-regulation-v12-2026-03"   # 已核對官方第 12 版（見下）
 win_points: 4
 finish_points:
   spin: 1
@@ -226,7 +226,7 @@ finish_points:
 launch_check:
   stadium_touch: redo          # 發射時接觸 → 重新對戰（2025 世界大會作法）
   bey_not_in_battle_area: redo # 陀螺落到盤外、卡在盤緣或停在蓋子上 → 重新對戰
-  mid_air_collision: redo      # 空判（空碰）→ 重新對戰（待以官方規則核對）
+  mid_air_collision: redo      # 空判（空碰）→ 重新對戰（官方第 12 版一致）
   repeat_miss_penalty: none    # 選項：none / opponent_1pt_on_2nd_miss（各比賽判法不同）
 draw:                           # 雙方同時停止、同時出局等
   action: redo
@@ -235,7 +235,11 @@ draw:                           # 雙方同時停止、同時出局等
 規則來源（2026-10-21 查詢）：
 - 計分、4 分制、發射接觸與落到盤外重來：HOBBY Watch 對 2025 世界大會的報導。
 - 官方規定只寫「發射失誤由裁判提醒」，罰則由現場工作人員判斷：玩家整理的大會注意事項。
-- **尚未取得官方規則 PDF 原文**，實作前需以官方最新版核對並更新 `rules_version`。
+- 2026-10 已取得並逐項核對官方規則 PDF 第 12 版（2026 年 3 月，2026-03-13 施行，SHA256
+  `c0950dba…26541`），`config/rules.yaml` 與 README「規則核對」記錄來源、與官方一致的項目、
+  使用者自訂項目（只算發射器本體觸碰、預設不額外罰重複失誤）與已知限制（Barrel Griffon
+  分離 barrel）。選用的 `opponent_1pt_on_2nd_miss` 依官方計數（得分或罰分清除雙方失誤數，
+  雙方同時第 2 次失誤無效）。
 
 ## 8. 視覺語言模型覆核
 
