@@ -136,6 +136,9 @@ def test_comparison_uses_coco_ap_and_explicit_smoke_selection(
     saved = json.loads(selection.read_text())
     assert saved["dataset"]["path"] == str(dataset.resolve())
     assert saved["dataset"]["provenance"]["synthetic"] is True
+    assert saved["inference"]["long_edge"] == 1280
+    assert saved["inference"]["rfdetr_shape"] == [1280, 1280]
+    assert json.loads(output.read_text())["inference"] == saved["inference"]
     assert saved["dataset"]["sha256"]["instances_val.json"]
     assert json.loads(output.read_text())["models"] == result
 

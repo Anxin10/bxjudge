@@ -14,6 +14,7 @@ import yaml
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+from .config import load_thresholds
 from .detect import load_detector
 from .detector_config import CLASSES, KINDS, disable_uploads, load_policy
 
@@ -256,6 +257,7 @@ def compare(
     output: Path = Path("runs/compare.json"),
     selection_out: Path = Path("weights/selected.json"),
     config: Path | str = "config/detection.yaml",
+    thresholds: Path | str = "config/thresholds.yaml",
 ) -> dict[str, dict]:
     """Common pycocotools bbox AP50:95 and synchronized adapter latency (no image decoding)."""
     if set(weights) != set(KINDS):
@@ -266,6 +268,13 @@ def compare(
     output, selection_out = Path(output), Path(selection_out)
     _check_synthetic_output(metadata, output)
     _check_synthetic_output(metadata, selection_out)
+    edge = load_thresholds(thresholds).infer_long_edge
+    inference = {
+        "long_edge": edge,
+        "thresholds": str(Path(thresholds).resolve()),
+        "rfdetr_shape": [edge, edge],
+        "yolo26_imgsz": edge,
+    }
     scores = {}
     coco = COCO()
     coco.dataset = splits["val"]
@@ -273,7 +282,11 @@ def compare(
     images = splits["val"]["images"]
     for kind in KINDS:
         detector = load_detector(
-            kind, weights[kind], conf=cfg["evaluation_confidence"], config=config
+            kind,
+            weights[kind],
+            conf=cfg["evaluation_confidence"],
+            config=config,
+            thresholds=thresholds,
         )
         first = cv2.imread(str(dataset / images[0]["file_name"]))
         for i in range(cfg["latency_warmup_frames"]):
@@ -339,6 +352,7 @@ def compare(
         "weights": str(Path(weights[selected]).resolve()),
         "dataset": metadata,
         "metrics": scores[selected],
+        "inference": inference,
         "comparison": str(output.resolve()),
     }
     _write_json(
@@ -348,6 +362,7 @@ def compare(
             "dataset": metadata,
             "selection": selection,
             "policy": cfg,
+            "inference": inference,
             "metric": "COCO bbox AP50:95 (IoU .50:.05:.95), AP@100",
             "latency": "mean warmed synchronized adapter ms/image; excludes image decode",
         },

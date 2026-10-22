@@ -6,6 +6,7 @@ from typing import Literal, Protocol
 import cv2
 import numpy as np
 
+from .config import load_thresholds
 from .detector_config import CLASSES, disable_uploads, load_policy
 from .types import Detection
 
@@ -35,9 +36,11 @@ class RFDETRDetector:
         conf: float | None = None,
         *,
         config: Path | str = "config/detection.yaml",
+        thresholds: Path | str = "config/thresholds.yaml",
     ):
         cfg = load_policy(config)
         self.conf = _confidence(conf, cfg)
+        self.inference_long_edge = load_thresholds(thresholds).infer_long_edge
         if not Path(weights).is_file():
             raise FileNotFoundError(weights)
         disable_uploads()
@@ -58,6 +61,9 @@ class RFDETRDetector:
             cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
             threshold=self.conf,
             include_source_image=False,
+            # RF-DETR's native preprocessing resizes to an explicit H/W square,
+            # independently of the checkpoint's training resolution.
+            shape=(self.inference_long_edge, self.inference_long_edge),
         )
         detections = []
         for box, score, cid in zip(
@@ -84,9 +90,11 @@ class YOLODetector:
         conf: float | None = None,
         *,
         config: Path | str = "config/detection.yaml",
+        thresholds: Path | str = "config/thresholds.yaml",
     ):
         self.cfg = load_policy(config)
         self.conf = _confidence(conf, self.cfg)
+        self.inference_long_edge = load_thresholds(thresholds).infer_long_edge
         if not Path(weights).is_file():
             raise FileNotFoundError(weights)
         disable_uploads()
@@ -103,7 +111,7 @@ class YOLODetector:
             frame,
             conf=self.conf,
             device=self.cfg["device"],
-            imgsz=self.cfg["training"]["yolo26"]["fit"]["imgsz"],
+            imgsz=self.inference_long_edge,
             verbose=False,
         )[0].boxes
         return [
@@ -125,9 +133,10 @@ def load_detector(
     *,
     conf: float | None = None,
     config: Path | str = "config/detection.yaml",
+    thresholds: Path | str = "config/thresholds.yaml",
 ) -> Detector:
     if kind == "rfdetr":
-        return RFDETRDetector(weights, conf, config=config)
+        return RFDETRDetector(weights, conf, config=config, thresholds=thresholds)
     if kind == "yolo26":
-        return YOLODetector(weights, conf, config=config)
+        return YOLODetector(weights, conf, config=config, thresholds=thresholds)
     raise ValueError(f"unknown detector kind: {kind}")

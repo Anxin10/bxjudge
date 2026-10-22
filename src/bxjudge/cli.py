@@ -98,7 +98,8 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     print(json.dumps(compare(
         {"rfdetr": Path(args.rfdetr), "yolo26": Path(args.yolo26)},
         Path(args.dataset), output=Path(args.output),
-        selection_out=Path(args.selection_out), config=args.config), indent=2))
+        selection_out=Path(args.selection_out), config=args.config,
+        thresholds=args.thresholds), indent=2))
     return 0
 
 
@@ -111,6 +112,8 @@ def _add_compare(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--selection-out", default="weights/selected.json",
                    help="selection manifest (synthetic datasets require an isolated path)")
     p.add_argument("--config", default="config/detection.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="canonical inference long-edge policy")
     p.set_defaults(func=_cmd_compare)
 
 

@@ -1,13 +1,19 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
 import numpy as np
 import pytest
 import supervision as sv
+import yaml
 
 
 @pytest.mark.parametrize("kind", ["rfdetr", "yolo26"])
-def test_adapter_color_axes_classes_source_frame(monkeypatch, tmp_path, kind):
+@pytest.mark.parametrize("inference_edge,training_edge", [(1280, 384), (960, 640)])
+def test_adapter_color_axes_classes_source_frame(
+    monkeypatch, tmp_path, kind, inference_edge, training_edge
+):
     from bxjudge.detect import load_detector
 
     image = np.zeros((31, 71, 3), np.uint8)
@@ -23,6 +29,7 @@ def test_adapter_color_axes_classes_source_frame(monkeypatch, tmp_path, kind):
 
         def predict(self, pixels, **kwargs):
             seen["pixels"] = pixels
+            seen["kwargs"] = kwargs
             return sv.Detections(
                 xyxy=xyxy, confidence=np.array([0.8]), class_id=np.array([2])
             )
@@ -37,20 +44,33 @@ def test_adapter_color_axes_classes_source_frame(monkeypatch, tmp_path, kind):
             import torch
 
             seen["pixels"] = pixels
+            seen["kwargs"] = kwargs
             boxes = SimpleNamespace(
                 xyxy=torch.tensor(xyxy), cls=torch.tensor([2]), conf=torch.tensor([0.8])
             )
             return [SimpleNamespace(boxes=boxes)]
 
-    import rfdetr
-    import ultralytics
-
-    monkeypatch.setattr(rfdetr, "RFDETRNano", RF)
-    monkeypatch.setattr(ultralytics, "YOLO", YO)
+    monkeypatch.setitem(sys.modules, "rfdetr", SimpleNamespace(RFDETRNano=RF))
+    monkeypatch.setitem(
+        sys.modules, "ultralytics", SimpleNamespace(YOLO=YO, settings={})
+    )
     weights = tmp_path / "weights.pt"
     weights.touch()
-    detector = load_detector(kind, weights)
+    cfg = yaml.safe_load(Path("config/detection.yaml").read_text())
+    cfg["training"]["rfdetr"]["model"]["resolution"] = training_edge
+    cfg["training"]["yolo26"]["fit"]["imgsz"] = training_edge
+    config = tmp_path / "detection.yaml"
+    config.write_text(yaml.safe_dump(cfg))
+    thresholds = yaml.safe_load(Path("config/thresholds.yaml").read_text())
+    thresholds["infer_long_edge"] = inference_edge
+    thresholds_path = tmp_path / "thresholds.yaml"
+    thresholds_path.write_text(yaml.safe_dump(thresholds))
+    detector = load_detector(kind, weights, config=config, thresholds=thresholds_path)
     result = detector(image, 137)
+    if kind == "rfdetr":
+        assert seen["kwargs"]["shape"] == (inference_edge, inference_edge)
+    else:
+        assert seen["kwargs"]["imgsz"] == inference_edge
     assert len(result) == 1
     assert result[0].frame == 137 and result[0].cls == "launcher"
     assert result[0].box == (51.0, 4.0, 68.0, 20.0)
@@ -72,11 +92,10 @@ def test_adapter_rejects_wrong_checkpoint_class_contract(monkeypatch, tmp_path, 
         def __init__(self, *args, **kwargs):
             pass
 
-    import rfdetr
-    import ultralytics
-
-    monkeypatch.setattr(rfdetr, "RFDETRNano", Wrong)
-    monkeypatch.setattr(ultralytics, "YOLO", Wrong)
+    monkeypatch.setitem(sys.modules, "rfdetr", SimpleNamespace(RFDETRNano=Wrong))
+    monkeypatch.setitem(
+        sys.modules, "ultralytics", SimpleNamespace(YOLO=Wrong, settings={})
+    )
     weights = tmp_path / "wrong.pt"
     weights.touch()
     with pytest.raises(ValueError, match="class"):
@@ -102,9 +121,8 @@ def test_rfdetr_background_is_removed_unknown_head_slot_is_rejected(
                 class_id=np.array([cid]),
             )
 
-    import rfdetr
-
-    monkeypatch.setattr(rfdetr, "RFDETRNano", RF)
+    monkeypatch.setitem(sys.modules, "rfdetr", SimpleNamespace(RFDETRNano=RF))
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(settings={}))
     weights = tmp_path / "w.pth"
     weights.touch()
     detector = RFDETRDetector(weights, conf=0.001)
