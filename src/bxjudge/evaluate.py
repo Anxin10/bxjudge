@@ -141,8 +141,8 @@ class Metrics:
     touch_recall: float
     air_recall: float
     review_ratio: float
-    # Worst per-video (core + VLM) / duration estimate. Batch throughput is diagnostic;
-    # stage sums cannot establish observed per-video wall-latency compliance (C5).
+    # Worst observed per-video / duration when complete, otherwise available evidence.
+    # Batch throughput is diagnostic; stage sums cannot establish observed per-video wall-latency compliance (C5).
     speed_ratio: float
     n_reviewed: int
     n_rounds: int = 0
@@ -152,6 +152,8 @@ class Metrics:
     n_air_truth: int = 0
     n_speed_videos: int = 0
     n_vlm_videos: int = 0
+    n_observed_videos: int = 0
+    n_required_speed_videos: int = 0
     speed_ratio_core: float = NAN  # diagnostic: median core-only ratio
     speed_ratio_sum: float = NAN  # median per-video (core + VLM) / duration
     speed_ratio_wall: float = NAN  # batch wall_s / video duration (R61)
@@ -191,7 +193,7 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
     Eligible: a positive core measurement (``processing_s``) and playback duration, at
     least one real round (an early recalibrate/decode gate is not judgment throughput),
     and playback duration within the spec limit. ``vlm_s`` (absent = no VLM phase) is
-    added for the end-to-end total. Durations are playback seconds as recorded.
+    added for the stage-sum diagnostic. Durations are playback seconds as recorded.
     """
     excluded: dict[str, list[str]] = {"no_real_round": [], "unmeasured": [], "over_max_duration": []}
     if timings is None:
@@ -218,6 +220,31 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
                 "total_ratio": total / duration, "has_vlm": "vlm_s" in entry,
             })
     return videos, excluded
+
+
+def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dict:
+    """Require a valid observation for every judged video within the duration limit.
+
+    Missing/invalid durations cannot silently remove a judged video from coverage.
+    Stage measurements and batch execution history are not substitutes for observations.
+    """
+    observed, missing = [], []
+    for video in sorted({r["video"] for r in real_rows(rows)}):
+        entry = (timings or {}).get(video)
+        entry = entry if isinstance(entry, dict) else {}
+        duration = entry.get("duration_s")
+        if _number(duration) and duration > max_s:
+            continue
+        wall = entry.get("pipeline_wall")
+        seconds = wall.get("seconds") if isinstance(wall, dict) else None
+        if (_number(duration) and duration > 0 and isinstance(wall, dict)
+                and wall.get("scope") == "core_to_final_output"
+                and _number(seconds) and seconds > 0):
+            observed.append({"video": video, "seconds": seconds, "ratio": seconds / duration})
+        else:
+            missing.append(video)
+    return {"videos": observed, "missing": missing,
+            "complete": bool(observed) and not missing}
 
 
 def _wall(rows: list[dict], timings: dict | None, runs: list[dict] | None, max_s: float) -> dict:
@@ -324,7 +351,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
     and ``runs.json`` wall-clock records).
 
-    Without ``timings`` or run records speed is unverified (R11). ``config`` defaults to
+    Without complete observed per-video timing speed cannot PASS. ``config`` defaults to
     ``config/evaluation.yaml``.
     """
     real, truth = real_rows(rows), truth_rows(rows)
@@ -335,6 +362,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     speed = NAN, NAN
     worst_video_ratio = NAN
     n_speed = n_vlm = 0
+    videos = []
     if timings is not None:
         videos, _ = _speed_videos(rows, timings, cfg.speed_max_video_s)
         if videos:
@@ -345,6 +373,16 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     wall_metrics = _wall(rows, timings, runs, cfg.speed_max_video_s)
     wall = wall_metrics["ratio"]
     basis = "sum-based per-video estimate" if math.isfinite(worst_video_ratio) else "unverified"
+    observation = _observed_speed(rows, timings, cfg.speed_max_video_s)
+    if observation["videos"]:
+        observed_worst = max(v["ratio"] for v in observation["videos"])
+        if observation["complete"]:
+            worst_video_ratio, basis = observed_worst, "observed per-video wall"
+        else:
+            # Preserve known stage-only violations while coverage remains incomplete.
+            worst_video_ratio = max([observed_worst, *[
+                v["total_ratio"] for v in videos if v["video"] in observation["missing"]]])
+            basis = "partial observed per-video wall"
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level)
     return Metrics(
         finish_accuracy_unflagged=u["estimate"],
@@ -360,6 +398,8 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         n_air_truth=len(air),
         n_speed_videos=n_speed,
         n_vlm_videos=n_vlm,
+        n_observed_videos=len(observation["videos"]),
+        n_required_speed_videos=len(observation["videos"]) + len(observation["missing"]),
         speed_ratio_core=speed[1],
         speed_ratio_sum=speed[0],
         speed_ratio_wall=wall,
@@ -393,8 +433,7 @@ def passes(m: Metrics, config: EvalConfig | None = None) -> dict[str, bool]:
         evidence = (m.finish_accuracy_unflagged_low if cfg.targets[name][0] == "min"
                     else m.finish_accuracy_unflagged_high)
     result[name] = _meets(evidence, cfg.targets[name])
-    # No pooled wall ratio or sum-based point estimate proves each video's actual wall
-    # deadline. Current run records do not contain observed per-video elapsed evidence.
+    # Only complete same-invocation per-video observation coverage can PASS.
     result["speed_ratio"] = (m.speed_basis == "observed per-video wall"
                              and _meets(m.speed_ratio, cfg.targets["speed_ratio"]))
     return result
@@ -404,6 +443,9 @@ def speed_verdict(m: Metrics, config: EvalConfig) -> str:
     """Separate a known estimate violation from absent observed per-video compliance."""
     if m.speed_basis == "observed per-video wall":
         return _verdict(m.speed_ratio, _meets(m.speed_ratio, config.targets["speed_ratio"]))
+    if (m.speed_basis == "partial observed per-video wall" and math.isfinite(m.speed_ratio)
+            and not _meets(m.speed_ratio, config.targets["speed_ratio"])):
+        return "FAIL (deadline violation; incomplete observed coverage)"
     if (m.speed_basis == "sum-based per-video estimate" and math.isfinite(m.speed_ratio)
             and not _meets(m.speed_ratio, config.targets["speed_ratio"])):
         return "FAIL (sum-based deadline violation)"
@@ -507,6 +549,7 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
     pass_rate = _ratio(sum(v["total_ratio"] <= limit for v in videos), len(videos))
     speed = {"per_video_pass_rate": pass_rate, "per_video_basis": "sum-based stage time",
              "n_eligible": len(videos),
+             "observed": _observed_speed(rows, timings, config.speed_max_video_s),
              "throughput_ratio": wall["ratio"],
              "throughput_basis": wall["basis"],
              "throughput_pass": wall["ratio"] <= limit if math.isfinite(wall["ratio"]) else None}
@@ -885,13 +928,24 @@ _TIMING_NOTE = (
     "Timing definitions: **core** = `processing_s` per video (judge, trajectories and result "
     "export; excludes the one-time detector/model init and the scan/probe of the batch; "
     "includes first-inference warm-up). **VLM** = `vlm_s`, the separate VLM phase (frame "
-    "decoding + requests; absent = no VLM phase for that video). **End-to-end** = core + VLM "
-    "per video (sum-based). **Batch wall-clock** = runs.json `wall_s` of each `bxjudge run` "
+    "decoding + requests; absent = no VLM phase for that video). **Stage sum** = core + VLM "
+    "per video (sum-based diagnostic). **Observed per-video wall** = videos.json "
+    "`pipeline_wall` with scope `core_to_final_output`: elapsed perf_counter time from "
+    "the beginning of that video's core processing until its final core exports or "
+    "applicable VLM notes and stage timing finish in the SAME invocation. Includes "
+    "intervening batch work, queue/wait, detector release and preflight; excludes shared "
+    "initialization/probe before core, the observation's own JSON write and shared VLM "
+    "session cleanup. Null seconds means pending/invalidated. Standalone VLM invalidates "
+    "affected observations and cannot extend an earlier invocation. **Batch wall-clock** = "
+    "runs.json `wall_s` of each `bxjudge run` "
     "from start to end (config + model init, probe, every video, its VLM phase once) plus "
     "standalone `bxjudge vlm` phases, over the playback duration of the videos judged (R61). "
     "Formal speed acceptance retains each video's deadline: a per-video sum-based "
-    "violation fails; a nonviolating stage sum or pooled batch wall ratio leaves observed "
-    "per-video wall compliance unverified. Batch throughput and core-only timing are "
+    "violation fails; observed individual violations also fail despite missing coverage. "
+    "PASS requires valid observations for every eligible video, each within its own "
+    "deadline. Missing historical observations, nonviolating stage sums or pooled batch "
+    "wall ratios leave per-video wall compliance unverified. Batch throughput and core-only "
+    "timing are "
     "diagnostics. Per-video Speed Pass Rate is the fraction of "
     "eligible videos whose own core+VLM stage sum meets its deadline, not a measurement "
     "of per-video wall latency. Repeated independent executions are listed separately; "
@@ -954,6 +1008,7 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
          _frac(m.review_ratio, _count(m.review_ratio, m.n_rounds), m.n_rounds)),
         ("處理速度比 speed_ratio", "speed_ratio",
          (f"{_f(m.speed_ratio)} [{m.speed_basis}; worst eligible video]; "
+          f"observed coverage {m.n_observed_videos}/{m.n_required_speed_videos}; "
           f"batch throughput diagnostic {_f(m.speed_ratio_wall)}, "
           f"sum-based median (core+VLM) {_f(m.speed_ratio_sum)} over {m.n_speed_videos} "
           f"video(s), core-only {_f(m.speed_ratio_core)}")),
@@ -997,7 +1052,7 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
          f"rows answered {_frac(fv['answered_share'], fv['answered'], fv['n_flagged'])}, "
          f"unavailable {_frac(fv['unavailable_share'], fv['unavailable'], fv['n_flagged'])} "
          "| — | — |"),
-        (f"| 端到端延遲 End-to-End Latency | sum-based per video (core+VLM) "
+        (f"| 階段加總延遲 Stage Sum Latency | sum-based per video (core+VLM) "
          f"{_lat(x.total_s, pct)}; ratio {_lat(x.total_ratio, pct, '')}; {w['basis']} "
          f"{_f(w['wall_s'], 2)} s over {_f(w['duration_s'], 2)} s of video = ratio "
          f"{_f(w['ratio'])} ({w['n_runs']} run record(s), VLM phase {_f(w['vlm_wall_s'], 2)} s "
@@ -1065,9 +1120,18 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         out += [("No videos.json: per-video stage/latency metrics are unverified. "
                 "Recorded runs.json batch wall throughput remains a separate diagnostic; "
                 "formal per-video wall-deadline compliance is unverified."), ""]
+    observation = t["speed"]["observed"]
+    out += [(f"Observed wall coverage: {m.n_observed_videos}/{m.n_required_speed_videos}; "
+            f"missing/invalid: {', '.join(observation['missing']) or 'none'}."), ""]
+    if observation["videos"]:
+        out += ["| Observed video | core_to_final_output s | Observed / duration |",
+                "|---|---|---|"]
+        out += [f"| {v['video']} | {_f(v['seconds'])} | {_f(v['ratio'])} |"
+                for v in observation["videos"]]
+        out.append("")
     if x.videos:
-        out += [("| video | duration s | core s | VLM s | end-to-end s | core ratio | "
-                 "end-to-end ratio |"), "|---|---|---|---|---|---|---|"]
+        out += [("| video | duration s | core s | VLM s | stage sum s | core ratio | "
+                 "stage sum ratio |"), "|---|---|---|---|---|---|---|"]
         out += [f"| {v['video']} | {v['duration_s']:.2f} | {v['core_s']:.2f} | "
                 f"{v['vlm_s']:.2f}{'' if v['has_vlm'] else ' (no VLM phase)'} | "
                 f"{v['total_s']:.2f} | {v['core_ratio']:.3f} | {v['total_ratio']:.3f} |"

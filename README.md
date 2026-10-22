@@ -286,8 +286,17 @@ uv run bxjudge eval results/20261001-try2 --truth results/20261001
   樣本未覆核完、來源不完整或真值不足都顯示 unverified。只覆核被標記回合不能驗證自動判定。
   reviewed output agreement 是覆核輸出對覆核真值的一致性，不能當作原始裁判準確率。
 - 逐影片速度要求保留「處理時間 ≤ 影片長度」；目前核心 + VLM stage sum 的最差逐片比值
-  超標會 FAIL，符合估計值仍為 UNVERIFIED，正式 PASS 需要實測逐影片 wall 證據，目前管線
-  尚未記錄。batch wall throughput 與中位數僅是獨立診斷，不能取代逐影片要求。
+  超標會 FAIL。正式 PASS 需要每支符合評估範圍的影片都有有效實測 wall 證據，並逐片符合期限；
+  任何已知逐片超時，即使其他影片證據缺漏仍為 FAIL。stage sum 與 batch throughput 不能取代實測。
+  `videos.json` 的 `pipeline_wall: {scope: "core_to_final_output", seconds: ...}` 記錄同一次
+  run 從該片 core 開始，直到該片最終結果／適用的 VLM note 與 stage timing 寫完的實際經過秒數。
+  包含中間其他影片 core、排隊等待、detector 釋放與 VLM preflight；未使用 VLM 的影片於 core
+  輸出完成時結束。逐片區間不含 core 前的共同初始化／probe、觀測值本身的 JSON 寫入與共同
+  VLM session 清理；這些共同工作仍計入 batch wall。detector 仍在全部 core 後、VLM 前釋放。
+  新工作先使舊觀測失效（seconds: null）；中斷／失敗不會沿用舊數值。Ollama 不可用時，
+  寫完 unavailable note 才結束該片觀測。之後獨立 `bxjudge vlm` 會使處理影片的舊 pipeline
+  觀測失效，僅累計分開命名的 VLM stage／batch 成本，不跨 invocation 相加成實測 latency。
+  舊結果缺少觀測時保持 UNVERIFIED，不遷移／補造。eval CLI 與報告列出依據、覆蓋數與觀測區間。
   核心 stage 不含一次性模型載入與 scan / probe；批次 wall 含初始化與 VLM。
   影片長度用 videos.json 的播放秒數，慢動作不換算。
 - 目標值、容許誤差與百分位都在 `config/evaluation.yaml`。

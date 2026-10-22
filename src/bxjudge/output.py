@@ -251,9 +251,28 @@ def record_video_timing(
 ) -> None:
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
-    rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
+    rows[video] = {"duration_s": duration_s, "processing_s": processing_s,
+                   "pipeline_wall": {"scope": "core_to_final_output", "seconds": None}}
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
+    _write_json(path, rows)
+
+
+def record_pipeline_timing(out_dir: Path, video: str, seconds: float | None) -> None:
+    """Persist a same-invocation core-to-final-output span; None invalidates old evidence.
+
+    Call before new core/advisory work and complete only after this video's exports,
+    notes and stage timing are finished. Never add a later standalone VLM duration.
+    The observation's own JSON write and shared phase cleanup are outside the span.
+    """
+    if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                                or not math.isfinite(seconds) or seconds < 0):
+        raise ValueError(f"invalid observed pipeline seconds: {seconds!r}")
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    rows.setdefault(video, {})["pipeline_wall"] = {
+        "scope": "core_to_final_output", "seconds": seconds,
+    }
     _write_json(path, rows)
 
 

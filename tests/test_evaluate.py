@@ -703,7 +703,7 @@ def test_cli_eval_report_starts_with_r60_summary_table(tmp_path):
     text = report.read_text(encoding="utf-8")
     summary = text.split("\n## ", 1)[0]  # the table precedes every other section
     for label in ("核心判定延遲 Core Latency", "VLM 單次請求延遲 VLM Latency",
-                  "VLM 觸發率 VLM Trigger Rate", "端到端延遲 End-to-End Latency",
+                  "VLM 觸發率 VLM Trigger Rate", "階段加總延遲 Stage Sum Latency",
                   "速度達標率 Speed Pass Rate", "裁判正確率 Referee Accuracy",
                   "finish_accuracy_unflagged", "speed_ratio"):
         assert label in summary

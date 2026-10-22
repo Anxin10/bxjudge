@@ -34,8 +34,11 @@ from .finish import (
 from .launch_check import analyze_launch
 from .manifest import VideoInfo, mark_processed, scan
 from .output import (
+    read_rounds,
+    record_pipeline_timing,
     record_run_timing,
     record_video_timing,
+    row_to_result,
     write_results,
     write_trajectory,
 )
@@ -45,7 +48,7 @@ from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
 from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames
-from .vlm import load_vlm_config, review_results_dir
+from .vlm import load_vlm_config, needs_vlm, review_results_dir
 
 log = logging.getLogger(__name__)
 
@@ -426,8 +429,17 @@ def run_batch(
     entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
     if limit is not None:
         entries = entries[:limit]
+    # Invalidate the entire scheduled set before any core/output work can fail.
+    for path, _ in entries:
+        record_pipeline_timing(out_dir, path.name, None)
+    starts: dict[str, float] = {}
+
+    def complete(video: str) -> None:
+        record_pipeline_timing(out_dir, video, time.perf_counter() - starts[video])
+
     for path, info in entries:
         began = time.perf_counter()
+        starts[path.name] = began
         if info is None:
             results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
         else:
@@ -465,6 +477,14 @@ def run_batch(
             processing,
             info.duration if info else 0.0,
         )
+        # The writer may preserve reviewed/audited rows instead of fresh results.
+        # Match the advisory phase's persisted snapshot before deciding to wait.
+        pending_vlm = vlm is not None and any(
+            needs_vlm(row_to_result(row))
+            for row in read_rounds(out_dir) if row["video"] == path.name
+        )
+        if not pending_vlm:
+            complete(path.name)
     vlm_wall_s = None
     if vlm is not None and entries:
         # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
@@ -478,6 +498,7 @@ def run_batch(
             rules=rules,
             config=vlm,
             videos={path.name for path, _ in entries},
+            on_video_complete=complete,
         )
         vlm_wall_s = time.perf_counter() - vlm_began
     if entries:  # nothing judged = no judgment wall-clock to report

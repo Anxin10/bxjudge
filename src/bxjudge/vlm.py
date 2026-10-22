@@ -33,7 +33,12 @@ import yaml
 from .calibration import ZONES, find_calibration, scale_calibration
 from .config import Thresholds
 from .manifest import probe
-from .output import record_vlm_timing, row_to_result, write_results
+from .output import (
+    record_pipeline_timing,
+    record_vlm_timing,
+    row_to_result,
+    write_results,
+)
 from .rules import Rules, is_not_a_round
 from .types import Calibration, RoundResult
 from .video import iter_frames
@@ -699,12 +704,15 @@ def review_results_dir(
     rules: Rules,
     config: VlmConfig | None = None,
     videos: set[str] | None = None,
+    on_video_complete: Callable[[str], None] | None = None,
 ) -> dict:
     """Ask the VLM about every ``needs_vlm`` round in a results directory.
 
     Source media come only from the absolute ``source_video`` in ``videos.json``. Each
     video's notes are persisted through ``write_results`` as a complete snapshot and its
-    VLM time is recorded as ``vlm_s`` beside the core ``processing_s``.
+    VLM time is recorded as ``vlm_s`` beside the core ``processing_s``. Only the
+    pipeline's same-invocation completion callback can record core-to-output wall time;
+    standalone work invalidates the previous observation before changing notes.
     """
     session = VlmSession(config if config is not None else load_vlm_config())
     out_dir = Path(out_dir)
@@ -718,10 +726,13 @@ def review_results_dir(
     timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     summary = {"asked": 0, "answered": 0, "unavailable": 0}
     calibrations: dict = {}
+    candidates = {v: rs for v, rs in sorted(by_video.items())
+                  if (videos is None or v in videos) and any(map(needs_vlm, rs))}
     try:
-        for video, results in sorted(by_video.items()):
-            if (videos is not None and video not in videos) or not any(map(needs_vlm, results)):
-                continue
+        # Invalidate all pending videos even if the phase stops before visiting them.
+        for video in candidates:
+            record_pipeline_timing(out_dir, video, None)
+        for video, results in candidates.items():
             began = time.perf_counter()
             source = recorded_source(timing.get(video))
 
@@ -747,6 +758,8 @@ def review_results_dir(
                 summary["asked"] += 1
                 summary["unavailable" if note.startswith(UNAVAILABLE_PREFIX) else "answered"] += 1
             log.info("%s: VLM %.1fs for %d round(s)", video, time.perf_counter() - began, len(asked))
+            if on_video_complete is not None:
+                on_video_complete(video)
     finally:
         session.close()
     summary["models"] = dict(session.models)
