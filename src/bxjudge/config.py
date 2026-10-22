@@ -18,6 +18,7 @@ class Thresholds:
     shake_px: float
     impact_coincide_frames: int
     air_collision_frames: int
+    air_evidence_max_missing_fraction: float
     abrupt_angle_deg: float
     abrupt_speed_ratio: float
     abrupt_min_speed_px: float

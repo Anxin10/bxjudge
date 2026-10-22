@@ -119,6 +119,51 @@ def test_air_jitter_is_not_both_abrupt_and_gaps_are_not_motion_evidence(th):
     assert detect_air_collision(a, b, 40, 42, th) == 'maybe'
 
 
+def _separated_tracks(a_frames, b_frames):
+    a = make_track(1, 'bey', {f: (100 + f, 100) for f in a_frames})
+    b = make_track(2, 'bey', {f: (500 + f, 100) for f in b_frames})
+    return a, b
+
+
+def test_air_no_requires_observation_coverage_of_airborne_interval(th):
+    # X is unobserved for half of the airborne period [0, 42): absence of
+    # evidence must not become a confident "no" (R31).
+    a, b = _separated_tracks(range(21), range(42))
+    assert detect_air_collision(a, b, 42, 42, th) == 'maybe'
+    # A leading gap is equally missing evidence.
+    a, b = _separated_tracks(range(21, 42), range(42))
+    assert detect_air_collision(a, b, 42, 42, th) == 'maybe'
+    # Without any landing cutoff the interval is the span of observations.
+    a, b = _separated_tracks(range(20), range(60))
+    assert detect_air_collision(a, b, None, None, th) == 'maybe'
+
+
+def test_air_small_unobserved_stretch_within_tolerance_is_still_no(th):
+    a, b = _separated_tracks(range(40), range(42))  # 2 of 42 frames missing
+    assert detect_air_collision(a, b, 42, 42, th) == 'no'
+    # The tolerance is configuration, not a code constant.
+    strict = replace(th, air_evidence_max_missing_fraction=0.0)
+    assert detect_air_collision(a, b, 42, 42, strict) == 'maybe'
+    lenient = replace(th, air_evidence_max_missing_fraction=0.6)
+    a, b = _separated_tracks(range(21), range(42))
+    assert detect_air_collision(a, b, 42, 42, lenient) == 'no'
+
+
+def test_check_launch_air_gap_is_maybe_with_note_not_confident_no(th):
+    # X falls and is observed for frames 0-20, lost for 21-42, re-detected at rest
+    # from 43; B lands at 42. Any collision in X's gap is invisible.
+    x = {f: (150 + 100 * f / 40, -100 + 290 * f / 40) for f in range(21)}
+    x.update({f: (250, 190) for f in range(43, 100)})
+    b = {f: (500 - 150 * f / 41, -100 + 290 * f / 41) for f in range(42)}
+    b.update({f: (350, 190) for f in range(42, 100)})
+    lc, _ = check_launch([make_track(1, 'bey', x), make_track(2, 'bey', b)], [],
+                         {f: 0.0 for f in range(200)}, make_calibration(), th, 60)
+    assert lc.landing_frame == {'X': 44, 'B': 42}
+    assert lc.air_collision == 'maybe'
+    assert 'air_evidence_incomplete@X' in lc.notes
+    assert 'air_evidence_incomplete@B' not in lc.notes
+
+
 def test_landing_zone_recorded(th):
     tracks = pair()
     tracks[1] = make_track(2, 'bey', fall_then_rest(32, (560, 60), (500, -200)))

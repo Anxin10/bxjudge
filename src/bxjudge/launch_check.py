@@ -163,14 +163,38 @@ def detect_touch(disp: dict[int, float], launchers: list[Track], sides_of_launch
     return touch, notes
 
 
-def _air_collision_evidence(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> tuple[AirState, int | None]:
-    """Box contact plus both observed turns within the configured temporal radius."""
+def _air_coverage_notes(a: dict[int, Box], b: dict[int, Box], cutoff: float, th: Thresholds) -> list[str]:
+    """Notes for each bey whose airborne observation coverage is too thin to prove "no".
+
+    The airborne interval runs from the first observed frame of either bey to the
+    earlier landing (or the last observed frame when no landing bounds it). Frames
+    where a bey is not observed -- leading, trailing or internal -- are missing
+    evidence; more than the configured fraction of the interval is incomplete.
+    """
+    seen = a.keys() | b.keys()
+    if not seen:
+        return []
+    lo = min(seen)
+    hi = cutoff if math.isfinite(cutoff) else max(seen) + 1
+    span = hi - lo
+    return [f'air_evidence_incomplete@{side}'
+            for side, obs in zip(_SIDES, (a, b))
+            if span - sum(1 for f in obs if lo <= f < hi) > th.air_evidence_max_missing_fraction * span]
+
+
+def _air_collision_evidence(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> tuple[AirState, int | None, list[str]]:
+    """Box contact plus both observed turns within the configured temporal radius.
+
+    Returns ``(state, collision_frame, notes)``. An unobserved stretch of the airborne
+    period is missing evidence: it can never produce a confident "no" (R31).
+    """
     cutoff = min((f for f in (land_x, land_b) if f is not None), default=math.inf)
     a = {d.frame: d.box for d in tx.dets if d.frame < cutoff}
     b = {d.frame: d.box for d in tb.dets if d.frame < cutoff}
+    incomplete = _air_coverage_notes(a, b, cutoff, th)
     common = a.keys() & b.keys()
     if not common:
-        return 'maybe', None
+        return 'maybe', None, incomplete
     # Restrict the turn's complete three-frame support to the airborne period.
     changes_a = {f for f in _abrupt_frames(tx, th) if f + 1 < cutoff}
     changes_b = {f for f in _abrupt_frames(tb, th) if f + 1 < cutoff}
@@ -180,10 +204,10 @@ def _air_collision_evidence(tx: Track, tb: Track, land_x: int | None, land_b: in
         turns = (any(abs(f - g) <= th.air_collision_frames for g in changes_a)
                  and any(abs(f - g) <= th.air_collision_frames for g in changes_b))
         if overlap and turns:
-            return 'yes', f
+            return 'yes', f, []
         possible |= overlap or turns
     missing = len(common) != max(common) - min(common) + 1
-    return ('maybe' if possible or missing else 'no'), None
+    return ('maybe' if possible or missing or incomplete else 'no'), None, incomplete
 
 def detect_air_collision(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> AirState:
     return _air_collision_evidence(tx, tb, land_x, land_b, th)[0]
@@ -251,9 +275,11 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
     touch, touch_notes = detect_touch(disp, launchers, launcher_sides, impacts, (start, end), c, th)
     notes.extend(touch_notes)
     if all(len(tracks) == 1 for tracks in by_side.values()):
-        air, air_frame = _air_collision_evidence(by_side['X'][0], by_side['B'][0],
-                                   physical_floor[by_side['X'][0].track_id],
-                                   physical_floor[by_side['B'][0].track_id], th)
+        air, air_frame, air_notes = _air_collision_evidence(
+            by_side['X'][0], by_side['B'][0],
+            physical_floor[by_side['X'][0].track_id],
+            physical_floor[by_side['B'][0].track_id], th)
+        notes.extend(air_notes)
     else:
         air, air_frame = 'maybe', None
         for side in _SIDES:
