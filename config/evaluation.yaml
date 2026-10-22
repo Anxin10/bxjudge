@@ -4,11 +4,18 @@
 # Spec section 11 success criteria (initial values). min = at least, max = at most.
 # A metric whose denominator is empty is "unverified" and never passes.
 targets:
-  finish_accuracy_unflagged: {min: 0.95}  # unflagged reviewed rounds: finish AND winner right
+  finish_accuracy_unflagged: {min: 0.95}  # census proportion or completed-audit Wilson lower bound
   touch_recall: {min: 0.90}               # true touches detected or flagged for review
   air_recall: {min: 0.90}                 # true air collisions detected or flagged
   review_ratio: {max: 0.30}               # share of real rounds flagged needs_review
-  speed_ratio: {max: 1.0}                 # median (core + VLM) / playback duration (R59)
+  speed_ratio: {max: 1.0}                 # each video's deadline; pooled throughput cannot prove this
+
+# R62: freeze one random UNFLAGGED audit draw (`bxjudge audit-sample`) and review every
+# selected row. Partial completion is provisional/unverified and cannot pass. A completed
+# sample reports its point estimate + Wilson interval at this level; acceptance uses the
+# lower confidence bound. Reviewing the entire unflagged batch gives its exact proportion
+# (finite batch only, not evidence for future generalization).
+audit_confidence_level: 0.95
 
 # Spec section 11 speed criterion covers videos up to 5 minutes of playback.
 speed_max_video_s: 300

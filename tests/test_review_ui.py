@@ -56,8 +56,11 @@ def test_filters_and_counts():
         row(round=3, needs_review=False),
         row(round=4, review_reasons=["recalibrate"]),
     ]
-    assert review_ui.FILTERS == ("全部", "需覆核", "已覆核")
+    assert review_ui.FILTERS == ("全部", "需覆核", "已覆核", "抽樣稽核")
     assert review_ui.filter_rows(rows, "全部") == rows
+    assert review_ui.filter_rows(rows, "抽樣稽核") == []
+    rows[2]["audit_sample"] = True  # R62: random audit sample of unflagged rounds
+    assert review_ui.filter_rows(rows, "抽樣稽核") == [rows[2]]
     assert review_ui.filter_rows(rows, "需覆核") == [rows[0], rows[3]]
     assert review_ui.filter_rows(rows, "已覆核") == [rows[1]]
     assert review_ui.counts(rows) == {"回合": 3, "待覆核": 1, "已覆核": 1, "分析診斷": 1}
@@ -232,6 +235,16 @@ def test_app_diagnostic_row_offers_repair_not_judgment(batch):
     assert "儲存修正" not in labels and "確認無誤" not in labels
     assert not [s for s in at.selectbox if s.label == "獲勝方"]
     assert not (batch / "corrections.jsonl").exists()
+
+
+def test_app_audit_sample_filter_lists_only_sampled_rounds(batch, rules):
+    from bxjudge.corrections import mark_audit_sample
+
+    assert mark_audit_sample(batch, 1, seed=0, rules=rules) == [("b.mp4", 1)]
+    at = app().run()
+    widget(at.sidebar.radio, "篩選").set_value("抽樣稽核").run()
+    assert not at.exception, at.exception
+    assert widget(at.sidebar.selectbox, "回合").options == ["b.mp4 · 第 1 回合 · 未標記 · 抽樣稽核"]
 
 
 def test_app_missing_media_and_trajectory_do_not_crash(batch):

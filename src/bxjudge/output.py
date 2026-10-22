@@ -84,6 +84,8 @@ def _result_row(r: RoundResult) -> dict:
     row["air_collision"] = launch["air_collision"] if launch else "maybe"
     if not row["match_start"]:
         del row["match_start"]  # sparse: absent means automatic grouping (R52)
+    if not row["audit_sample"]:
+        del row["audit_sample"]  # sparse: absent means not in the audit sample (R62)
     return row
 
 
@@ -122,9 +124,13 @@ def row_to_result(row: dict) -> RoundResult:
     match_start = row.get("match_start", False)
     if type(match_start) is not bool:
         raise ValueError(f"match_start must be a bool, got {match_start!r}")
+    audit_sample = row.get("audit_sample", False)
+    if type(audit_sample) is not bool:
+        raise ValueError(f"audit_sample must be a bool, got {audit_sample!r}")
     return RoundResult(
         **values,
         match_start=match_start,
+        audit_sample=audit_sample,
         launch=launch,
         spin_dir={s: row[f"{s.lower()}_spin_dir"] for s in ("X", "B")}
         if row["spin_dir_present"]
@@ -148,7 +154,11 @@ def _csv(path: Path, fields: list[str], rows: list[dict]) -> None:
 
 
 def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
-    """Replace complete affected-video analyses, preserving all reviewed rows."""
+    """Replace affected-video analyses, preserving reviewed rows.
+
+    Once an audit is selected, the entire batch's original analyses are frozen.
+    Advisory VLM notes may refresh; reanalysis/additions need a fresh results directory.
+    """
     incoming = {}
     for r in new:
         key = (r.video, r.round)
@@ -157,14 +167,30 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
         incoming[key] = _result_row(r)
     out_dir = Path(out_dir)
     affected = {r.video for r in new}
+    existing = read_rounds(out_dir)
+    audited = (out_dir / "audit_sample.json").is_file()
+    if audited:
+        frozen = {(r["video"], r["round"]): r for r in existing if r["video"] in affected}
+
+        def decision(row):
+            return {k: v for k, v in row.items() if k != "vlm_note"}
+
+        if (set(incoming) != set(frozen)
+                or any(decision(r) != decision(frozen[k]) for k, r in incoming.items())):
+            raise ValueError("audit batch is frozen; reanalysis or new rows require a fresh results directory")
     rows = {}
     seen = set()
-    for row in read_rounds(out_dir):
+    for row in existing:
         key = (row["video"], row["round"])
         if key in seen:
             raise ValueError(f"duplicate persisted result key: {key}")
         seen.add(key)
-        if row["video"] not in affected or row["reviewed"]:
+        if audited or row.get("audit_sample") is True:
+            row = dict(row)
+            if key in incoming and incoming[key].get("vlm_note") is not None:
+                row["vlm_note"] = incoming[key]["vlm_note"]
+            rows[key] = row
+        elif row["video"] not in affected or row["reviewed"]:
             rows[key] = row
     for key, row in incoming.items():
         rows.setdefault(key, row)
@@ -268,6 +294,48 @@ def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[di
     entry["vlm_s"] = entry.get("vlm_s", 0.0) + vlm_s
     entry["vlm_requests"] = [*entry.get("vlm_requests", []), *(dict(q) for q in requests)]
     _write_json(path, rows)
+
+
+RUN_KINDS = ("run", "vlm")
+
+
+def record_run_timing(
+    out_dir: Path,
+    *,
+    kind: str,
+    started_at: str,
+    wall_s: float,
+    vlm_wall_s: float | None,
+    videos: dict[str, float],
+) -> None:
+    """Append one batch wall-clock record to ``runs.json`` (R61).
+
+    ``kind="run"``: one ``bxjudge run`` from start to end, including config/model init,
+    scan/probe and its VLM phase (``vlm_wall_s`` is a breakdown INSIDE ``wall_s``, never
+    extra time); ``videos`` maps each video judged in that run to its playback duration.
+    ``kind="vlm"``: a standalone ``bxjudge vlm`` phase (``videos`` empty: it adds waiting
+    time but no new video).
+    """
+
+    def seconds(v) -> bool:
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v >= 0)
+
+    ok = (
+        kind in RUN_KINDS
+        and isinstance(started_at, str)
+        and seconds(wall_s)
+        and (vlm_wall_s is None or (seconds(vlm_wall_s) and vlm_wall_s <= wall_s))
+        and isinstance(videos, dict)
+        and all(isinstance(k, str) and seconds(v) for k, v in videos.items())
+    )
+    if not ok:
+        raise ValueError(f"invalid run timing record: {kind!r} {wall_s!r} {vlm_wall_s!r} {videos!r}")
+    path = Path(out_dir) / "runs.json"
+    runs = _read_json(path, [])
+    runs.append({"kind": kind, "started_at": started_at, "wall_s": wall_s,
+                 "vlm_wall_s": vlm_wall_s, "videos": dict(videos)})
+    _write_json(path, runs)
 
 
 def trajectory_png(out_dir: Path, video: str, round: int) -> Path:

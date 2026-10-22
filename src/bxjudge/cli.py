@@ -167,13 +167,18 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
     import json
     import logging
     import sys
+    import time
+    from datetime import datetime
 
     from bxjudge import vlm
     from bxjudge.config import load_thresholds
+    from bxjudge.output import record_run_timing
     from bxjudge.rules import load_rules
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     results = Path(args.results).expanduser()
+    began = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     try:
         if not results.is_dir():
             raise ValueError(f"{results}: expected a results directory")
@@ -184,6 +189,10 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
             rules=load_rules(Path(args.rules).expanduser()),
             config=vlm.load_vlm_config(Path(args.config).expanduser()),
         )
+        if summary.get("asked"):
+            wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
+            record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
+                              vlm_wall_s=wall, videos={})
     except (ValueError, OSError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -245,13 +254,13 @@ def _eval_inputs(args: argparse.Namespace):
 
     cfg = ev.load_eval_config(Path(args.config).expanduser())
     results = Path(args.results).expanduser()
-    rows, timings = ev.read_results(results)
+    rows, timings, runs = ev.read_results(results)
     truth = None
     if args.truth:
-        truth_rows, _ = ev.read_results(Path(args.truth).expanduser())
+        truth_rows, _, _ = ev.read_results(Path(args.truth).expanduser())
         truth = ev.match_truth(rows, truth_rows, cfg.truth_t_launch_tolerance_s)
         rows = truth.rows
-    return cfg, results, rows, timings, truth
+    return cfg, results, rows, timings, runs, truth
 
 
 def _report_path(args: argparse.Namespace, kind: str) -> tuple[Path, str]:
@@ -276,11 +285,11 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from bxjudge.rules import load_rules
 
     try:
-        cfg, results, rows, timings, truth = _eval_inputs(args)
+        cfg, results, rows, timings, runs, truth = _eval_inputs(args)
         rules = load_rules(Path(args.rules).expanduser())
-        metrics = ev.evaluate(rows, timings, config=cfg)
+        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs)
         ok = ev.passes(metrics, cfg)
-        extra = ev.report_metrics(rows, timings, cfg, rules=rules)
+        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs)
         path, today = _report_path(args, "eval")
         _write_report(path, ev.render_eval_report(
             results, rows, timings, metrics, ok, extra, cfg, truth=truth,
@@ -292,7 +301,10 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         value = getattr(metrics, name)
         return f"{value:.3f}" if math.isfinite(value) else "unverified"
 
-    summary = ", ".join(f"{name}={shown(name)} {'PASS' if ok[name] else 'FAIL'}"
+    def verdict(name: str) -> str:
+        return ev.speed_verdict(metrics, cfg) if name == "speed_ratio" else "PASS" if ok[name] else "FAIL"
+
+    summary = ", ".join(f"{name}={shown(name)} {verdict(name)}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
     if ev.is_synthetic(rows):
@@ -319,7 +331,7 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     from bxjudge.config import load_thresholds
 
     try:
-        cfg, results, rows, _, truth = _eval_inputs(args)
+        cfg, results, rows, _, _, truth = _eval_inputs(args)
         th_path = Path(args.thresholds).expanduser()
         th = load_thresholds(th_path)
         samples = ev.shake_samples(rows, th.impact_coincide_frames)
@@ -351,8 +363,37 @@ def _add_tune(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_tune)
 
 
+def _cmd_audit_sample(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge.corrections import CorrectionError, mark_audit_sample
+    from bxjudge.rules import load_rules
+
+    try:
+        picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
+                                   rules=load_rules(Path(args.rules).expanduser()))
+    except (CorrectionError, ValueError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    for video, number in picked:
+        print(f"{video}\t{number}")
+    print(f"{len(picked)} unflagged round(s) in the audit sample (seed {args.seed}); review "
+          "them all with the 抽樣稽核 filter in `bxjudge review`")
+    return 0
+
+
+def _add_audit_sample(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("audit-sample",
+                       help="mark a seeded random sample of unflagged rounds for audit review")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--n", type=int, required=True, help="sample size")
+    p.add_argument("--seed", type=int, required=True, help="random seed (reproducible)")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.set_defaults(func=_cmd_audit_sample)
+
+
 _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
-               _add_vlm, _add_review, _add_eval, _add_tune]
+               _add_vlm, _add_review, _add_eval, _add_tune, _add_audit_sample]
 
 
 def build_parser() -> argparse.ArgumentParser:
