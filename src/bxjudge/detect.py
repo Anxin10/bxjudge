@@ -51,10 +51,12 @@ class RFDETRDetector:
         disable_uploads()
         from rfdetr import RFDETRNano
 
+        # The positional grid is built at the inference size (RF-DETR interpolates a
+        # checkpoint's grid once at load), independent of any training policy block.
         self.model = RFDETRNano(
             pretrain_weights=str(Path(weights).resolve()),
             device=cfg["device"],
-            **cfg["training"]["rfdetr"]["model"],
+            resolution=self.inference_long_edge,
         )
         if tuple(self.model.class_names) != CLASSES:
             raise ValueError(f"RF-DETR checkpoint class names must be {CLASSES}")

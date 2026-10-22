@@ -11,9 +11,9 @@ import yaml
 
 @pytest.mark.parametrize("threshold_source", ["path", "object"])
 @pytest.mark.parametrize("kind", ["rfdetr", "yolo26"])
-@pytest.mark.parametrize("inference_edge,training_edge", [(1280, 384), (960, 640)])
+@pytest.mark.parametrize("inference_edge", [1280, 960])
 def test_adapter_color_axes_classes_source_frame(
-    monkeypatch, tmp_path, kind, inference_edge, training_edge, threshold_source
+    monkeypatch, tmp_path, kind, inference_edge, threshold_source
 ):
     from bxjudge.detect import load_detector
 
@@ -26,7 +26,7 @@ def test_adapter_color_axes_classes_source_frame(
         class_names: ClassVar[list[str]] = ["bey", "bey_part", "launcher"]
 
         def __init__(self, **kwargs):
-            pass
+            seen["init"] = kwargs
 
         def predict(self, pixels, **kwargs):
             seen["pixels"] = pixels
@@ -57,11 +57,8 @@ def test_adapter_color_axes_classes_source_frame(
     )
     weights = tmp_path / "weights.pt"
     weights.touch()
-    cfg = yaml.safe_load(Path("config/detection.yaml").read_text())
-    cfg["training"]["rfdetr"]["model"]["resolution"] = training_edge
-    cfg["training"]["yolo26"]["fit"]["imgsz"] = training_edge
-    config = tmp_path / "detection.yaml"
-    config.write_text(yaml.safe_dump(cfg))
+    # The training policy (production or smoke) never drives inference size.
+    config = Path("config/detection.yaml")
     thresholds = yaml.safe_load(Path("config/thresholds.yaml").read_text())
     thresholds["infer_long_edge"] = inference_edge
     thresholds_path = tmp_path / "thresholds.yaml"
@@ -77,6 +74,8 @@ def test_adapter_color_axes_classes_source_frame(
     result = detector(image, 137)
     if kind == "rfdetr":
         assert seen["kwargs"]["shape"] == (inference_edge, inference_edge)
+        # Positional grid built at the inference size, not from a training block.
+        assert seen["init"]["resolution"] == inference_edge
     else:
         assert seen["kwargs"]["imgsz"] == inference_edge
     assert len(result) == 1

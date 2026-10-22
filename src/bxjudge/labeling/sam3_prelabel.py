@@ -101,6 +101,15 @@ def _build_predictor(config):
         compile=False,
         async_loading_frames=False,
     )
+    # The pinned builder hardcodes batched_grounding_batch_size=16 (no builder kwarg);
+    # the model's public constructor attribute is read per propagation (R47).
+    model = predictor.model
+    if type(getattr(model, "batched_grounding_batch_size", None)) is not int:
+        raise RuntimeError(
+            "SAM SDK no longer exposes model.batched_grounding_batch_size; "
+            "re-verify the pinned SDK batch policy"
+        )
+    model.batched_grounding_batch_size = config["batched_grounding_batch_size"]
     proof = verify_checkpoint_keys(predictor.model, checkpoint)
     print("SAM final checkpoint contract: " + json.dumps(proof), flush=True)
     return predictor

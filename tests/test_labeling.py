@@ -1,8 +1,10 @@
 """Labeling contracts: real sampling/export, exact pinned SAM direct API fake."""
 
 import json
+import sys
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -337,6 +339,75 @@ def test_config_rejects_unbounded_or_bad_policy(tmp_path):
     path.write_text(yaml.safe_dump(cfg))
     with pytest.raises(ValueError, match="window_frames"):
         load_config(path)
+
+
+@pytest.mark.parametrize("value", [0, -4, 2.0, "4", True, None])
+def test_config_rejects_bad_grounding_batch_size(tmp_path, value):
+    import yaml
+
+    from bxjudge.labeling.config import load_config
+
+    cfg = load_config()
+    # R47 measured value: 120-frame 1080p window peaked 12381 MiB at 4 vs ~24 GiB at 16.
+    assert cfg["batched_grounding_batch_size"] == 4 and cfg["window_frames"] == 120
+    cfg["batched_grounding_batch_size"] = value
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(ValueError, match="batched_grounding_batch_size"):
+        load_config(path)
+
+
+def _fake_sam_builder(monkeypatch, tmp_path, model):
+    from types import ModuleType
+
+    from bxjudge.labeling import sam3_prelabel as sam
+
+    calls = []
+
+    class Predictor:
+        def __init__(self):
+            self.model = model
+
+    def build_sam3_predictor(**kwargs):
+        calls.append(kwargs)
+        return Predictor()
+
+    builder = ModuleType("sam3.model_builder")
+    builder.build_sam3_predictor = build_sam3_predictor
+    monkeypatch.setitem(sys.modules, "sam3", ModuleType("sam3"))
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", builder)
+    monkeypatch.setattr(sam, "verify_checkpoint_keys", lambda m, c: {"ok": True})
+    checkpoint = tmp_path / "sam.pt"
+    checkpoint.touch()
+    return sam, calls, checkpoint
+
+
+def test_predictor_factory_applies_configured_grounding_batch(tmp_path, monkeypatch):
+    from bxjudge.labeling.config import load_config
+
+    # Pinned SDK builder hardcodes both batches to 16 on the public model attributes.
+    model = SimpleNamespace(batched_grounding_batch_size=16, postprocess_batch_size=16)
+    sam, calls, checkpoint = _fake_sam_builder(monkeypatch, tmp_path, model)
+    cfg = {**load_config(), "checkpoint": str(checkpoint)}
+    predictor = sam._build_predictor(cfg)
+    assert predictor.model is model
+    assert model.batched_grounding_batch_size == cfg["batched_grounding_batch_size"] == 4
+    assert model.postprocess_batch_size == 16  # R47: postprocess batch unchanged
+    assert len(calls) == 1 and "batched_grounding_batch_size" not in calls[0]
+    cfg["batched_grounding_batch_size"] = 2
+    sam._build_predictor(cfg)
+    assert model.batched_grounding_batch_size == 2
+
+
+def test_predictor_factory_fails_closed_if_sdk_attribute_changes(
+    tmp_path, monkeypatch
+):
+    from bxjudge.labeling.config import load_config
+
+    model = SimpleNamespace(postprocess_batch_size=16)
+    sam, _, checkpoint = _fake_sam_builder(monkeypatch, tmp_path, model)
+    with pytest.raises(RuntimeError, match="batched_grounding_batch_size"):
+        sam._build_predictor({**load_config(), "checkpoint": str(checkpoint)})
 
 
 def test_checkpoint_contract_rejects_missing_or_extra_model_tensors(tmp_path):

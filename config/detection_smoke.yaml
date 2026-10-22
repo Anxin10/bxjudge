@@ -1,0 +1,50 @@
+# Synthetic wiring smoke ONLY (Task 12 harness tests/smoke_task12.py). Never a default:
+# select explicitly with `bxjudge train --training-policy config/detection_smoke.yaml`.
+# train() rejects this policy unless the dataset provenance is synthetic (R44 isolation).
+# Small fixed size, one epoch, every augmentation off: proves wiring, not accuracy.
+training:
+  policy: smoke
+  image_size: 384
+  epochs: 1
+  rfdetr:
+    model: {}
+    fit:
+      batch_size: 2
+      grad_accum_steps: 1
+      num_workers: 2
+      amp_dtype: bf16
+      multi_scale: false
+      expanded_scales: false
+      scale_jitter: false
+      use_ema: true
+      tensorboard: false
+      wandb: false
+      mlflow: false
+      clearml: false
+      run_test: false
+      log_per_class_metrics: true
+      save_dataset_grids: false
+  yolo26:
+    model: runs/pretrained/yolo26n.pt
+    fit:
+      batch: 2
+      workers: 2
+      amp: true
+      seed: 42
+      deterministic: true
+      plots: false
+      save: true
+      val: true
+      pretrained: true
+      patience: 100
+      mosaic: 0.0
+      close_mosaic: 0
+      mixup: 0.0
+      fliplr: 0.0
+      hsv_h: 0.0
+      hsv_s: 0.0
+      hsv_v: 0.0
+      translate: 0.0
+      scale: 0.0
+      auto_augment: null
+      erasing: 0.0

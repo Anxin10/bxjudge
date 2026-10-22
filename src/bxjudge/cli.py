@@ -76,7 +76,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
     from bxjudge.train import train
 
     print(train(args.kind, Path(args.dataset), Path(args.out), args.epochs,
-                config=args.config))
+                config=args.config, training_policy=args.training_policy,
+                thresholds=args.thresholds))
     return 0
 
 
@@ -86,7 +87,13 @@ def _add_train(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dataset", required=True)
     p.add_argument("--out", required=True, help="new isolated run directory")
     p.add_argument("--epochs", type=int, help="defaults to config training.epochs")
-    p.add_argument("--config", default="config/detection.yaml")
+    p.add_argument("--config", default="config/detection.yaml",
+                   help="detector config; its training block is the production policy")
+    p.add_argument("--training-policy",
+                   help="explicit training policy file instead of the production policy, "
+                        "e.g. config/detection_smoke.yaml (synthetic datasets only)")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="infer_long_edge source for the production training size")
     p.set_defaults(func=_cmd_train)
 
 

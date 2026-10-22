@@ -8,6 +8,10 @@ min_gap_s: 0.1
 launcher_max_aspect: 4.0
 val_ratio: 0.2
 window_frames: 120
+# SAM 3.1 batched-grounding frames per detector pass (R47/R57). The pinned SDK builder
+# hardcodes 16, which peaked ~24 GiB on a real 120-frame 1080p window; 4 measured a
+# 12381 MiB total-card peak on the same window. postprocess_batch_size stays SDK 16.
+batched_grounding_batch_size: 4
 checkpoint: weights/sam3.1/sam3.1_multiplex.pt
 prompts:
   bey: spinning top

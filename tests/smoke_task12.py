@@ -1,6 +1,8 @@
 """Manual GPU wiring evidence; run via uv run python tests/smoke_task12.py ROOT.
 
 ROOT must be a fresh WSL ext4 directory under runs/. Produces only synthetic evidence.
+Training explicitly selects the smoke policy (1 epoch, 384, no augmentation);
+comparison runs at the production inference size from config/thresholds.yaml.
 """
 
 import json
@@ -13,6 +15,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+SMOKE_POLICY = str(Path("config/detection_smoke.yaml").resolve())
 
 
 def main() -> None:
@@ -120,8 +124,8 @@ def main() -> None:
             str(dataset),
             "--out",
             str(root / "rfdetr"),
-            "--epochs",
-            "1",
+            "--training-policy",
+            SMOKE_POLICY,
         ],
         [
             "bxjudge",
@@ -132,8 +136,8 @@ def main() -> None:
             str(dataset),
             "--out",
             str(root / "yolo26"),
-            "--epochs",
-            "1",
+            "--training-policy",
+            SMOKE_POLICY,
         ],
         [
             "bxjudge",

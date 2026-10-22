@@ -19,12 +19,18 @@ def load_config(path: str | Path = "config/labeling.yaml") -> dict:
         "launcher_max_aspect",
         "val_ratio",
         "window_frames",
+        "batched_grounding_batch_size",
         "checkpoint",
         "prompts",
     }
     if not isinstance(cfg, dict) or set(cfg) != required:
         raise ValueError("labeling config has missing or unknown keys")
-    for key in ["per_video", "energy_long_edge", "window_frames"]:
+    for key in [
+        "per_video",
+        "energy_long_edge",
+        "window_frames",
+        "batched_grounding_batch_size",
+    ]:
         if type(cfg[key]) is not int or cfg[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
     for key in ["uniform_ratio", "min_gap_s", "launcher_max_aspect", "val_ratio"]:

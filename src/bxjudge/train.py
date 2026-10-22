@@ -16,7 +16,14 @@ from pycocotools.cocoeval import COCOeval
 
 from .config import load_thresholds
 from .detect import load_detector
-from .detector_config import CLASSES, KINDS, disable_uploads, load_policy
+from .detector_config import (
+    CLASSES,
+    KINDS,
+    disable_uploads,
+    load_policy,
+    load_training_policy,
+    resolve_training,
+)
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -156,14 +163,31 @@ def train(
     epochs: int | None = None,
     *,
     config: Path | str = "config/detection.yaml",
+    training_policy: Path | str | None = None,
+    thresholds: Path | str = "config/thresholds.yaml",
 ) -> Path:
+    """Train one detector; the production policy of ``config`` unless a training
+    policy file (e.g. config/detection_smoke.yaml) is explicitly selected."""
     cfg = load_policy(config)
     if kind not in KINDS:
         raise ValueError(f"unknown detector kind: {kind}")
-    epochs = cfg["training"]["epochs"] if epochs is None else epochs
+    source = Path(config if training_policy is None else training_policy)
+    training = (
+        cfg["training"]
+        if training_policy is None
+        else load_training_policy(training_policy)
+    )
+    infer_long_edge = load_thresholds(thresholds).infer_long_edge
+    resolved = resolve_training(training, infer_long_edge)
+    epochs = resolved["epochs"] if epochs is None else epochs
     if type(epochs) is not int or epochs <= 0:
         raise ValueError("epochs must be a positive integer")
     _, metadata = _read_dataset(Path(dataset))
+    if (
+        resolved["policy"] == "smoke"
+        and metadata["provenance"].get("synthetic") is not True
+    ):
+        raise ValueError("the smoke training policy is for synthetic datasets only")
     out = Path(out).resolve()
     _check_synthetic_output(metadata, out)
     if out.exists() and any(out.iterdir()):
@@ -178,7 +202,7 @@ def train(
     if kind == "rfdetr":
         from rfdetr import RFDETRNano
 
-        model = RFDETRNano(device=cfg["device"], **cfg["training"][kind]["model"])
+        model = RFDETRNano(device=cfg["device"], **resolved[kind]["model"])
         model.train(
             dataset_dir=str(prepared),
             dataset_file="roboflow",
@@ -186,20 +210,20 @@ def train(
             epochs=epochs,
             class_names=list(CLASSES),
             device=cfg["device"],
-            **cfg["training"][kind]["fit"],
+            **resolved[kind]["fit"],
         )
         best = out / "fit/checkpoint_best_total.pth"
     else:
         from ultralytics import YOLO
 
-        model = YOLO(cfg["training"][kind]["model"])
+        model = YOLO(resolved[kind]["model"])
         model.train(
             data=str(prepared),
             project=str(out),
             name="fit",
             epochs=epochs,
             device=cfg["device"],
-            **cfg["training"][kind]["fit"],
+            **resolved[kind]["fit"],
         )
         best = out / "fit/weights/best.pt"
     if not best.is_file():
@@ -211,7 +235,15 @@ def train(
             "weights": str(best),
             "epochs": epochs,
             "dataset": metadata,
-            "policy": cfg,
+            "policy": {**cfg, "training": training},
+            "training_policy": {
+                "source": str(source.resolve()),
+                "policy": resolved["policy"],
+                "image_size": resolved["image_size"][kind],
+                "infer_long_edge": infer_long_edge,
+                "thresholds": str(Path(thresholds).resolve()),
+                "framework_kwargs": resolved[kind],
+            },
             "elapsed_s": time.perf_counter() - started,
             "torch_peak_allocated_bytes": torch.cuda.max_memory_allocated(
                 cfg["device"]
@@ -223,7 +255,7 @@ def train(
     gc.collect()
     torch.cuda.empty_cache()
     # Reloading verifies trained checkpoint names/head slots before publishing its path.
-    checked = load_detector(kind, best, config=config)
+    checked = load_detector(kind, best, config=config, thresholds=thresholds)
     del checked
     gc.collect()
     torch.cuda.empty_cache()
