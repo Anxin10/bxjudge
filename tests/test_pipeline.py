@@ -819,6 +819,71 @@ def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     assert kw["calib_dir"] == tmp_path and kw["config"].model == "qwen3.8:27b"
 
 
+def test_detector_freed_then_gpu_cache_released_before_first_vlm_work(
+    tmp_path, monkeypatch
+):
+    import weakref
+
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "a.mp4", seconds=0.1)
+    events = []
+
+    class Detector:
+        def __call__(self, image, frame):
+            return []
+
+    def load(*a, **k):
+        d = Detector()
+        weakref.finalize(d, events.append, "detector_freed")
+        return d
+
+    def judge(info, calib_dir, detector, *a, **k):
+        detector(np.zeros((4, 4, 3), np.uint8), 0)  # used, then dropped by the callee
+        return [rr("spin", "X", video="a.mp4")]
+
+    real_release = pipeline._release_gpu_memory
+    monkeypatch.setattr(pipeline, "load_detector", load)
+    monkeypatch.setattr(pipeline, "judge_video", judge)
+    monkeypatch.setattr(
+        pipeline,
+        "_release_gpu_memory",
+        lambda: (events.append("gpu_release"), real_release()),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "review_results_dir",
+        lambda out_dir, **kw: events.append("vlm_phase") or {},
+    )
+    pipeline.run_batch(
+        folder,
+        tmp_path,
+        tmp_path / "out",
+        selection=_synthetic_selection(tmp_path),
+        vlm_config=_vlm_config(tmp_path),
+    )
+    assert events == ["detector_freed", "gpu_release", "vlm_phase"]
+
+
+def test_release_gpu_memory_collects_then_empties_torch_cache(monkeypatch):
+    import sys
+    import types
+
+    events = []
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True, empty_cache=lambda: events.append("empty_cache")
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(pipeline.gc, "collect", lambda: events.append("gc") or 0)
+    pipeline._release_gpu_memory()
+    assert events == ["gc", "empty_cache"]
+    # never imports torch just to release (CPU-only / injected runs)
+    events.clear()
+    monkeypatch.delitem(sys.modules, "torch")
+    pipeline._release_gpu_memory()
+    assert events == ["gc"] and "torch" not in sys.modules
+
+
 def test_vlm_phase_is_opt_in_and_config_guarded(tmp_path, monkeypatch, rules, th):
     make_video(tmp_path / "a.mp4", seconds=0.1)
     monkeypatch.setattr(

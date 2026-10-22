@@ -523,6 +523,125 @@ def test_release_failure_does_not_mask_results(monkeypatch):
     assert "a" in out.vlm_note
 
 
+# --------------------------------------------------------------------------- fix round 1
+
+
+def _chat_models(calls):
+    return [model for path, model in calls if path == "/api/chat"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        VlmError("HTTP 500: model requires more system memory (cuda OOM)"),
+        VlmError("HTTP 404: model 'qwen3.8:27b' not found"),
+        VlmError("request to http://127.0.0.1:11435/api/chat failed: timed out"),
+        VlmError("server error: out of memory"),
+    ],
+)
+def test_service_failure_makes_fallback_sticky_for_the_batch(monkeypatch, failure):
+    calls = []
+
+    def fake(host, payload, path="/api/chat", **_):
+        calls.append((path, payload["model"]))
+        if path == "/api/generate":
+            return {"model": payload["model"], "done": True, "done_reason": "unload"}
+        if payload["model"] == PRIMARY:
+            raise failure
+        return reply('{"answer":"a","reason":"r"}')
+
+    monkeypatch.setattr(vlm, "_post", fake)
+    rows = [res("a.mp4", n, needs_review=True) for n in range(1, 6)]
+    out = review_low_confidence(rows, lambda r: [blank()])
+    assert _chat_models(calls) == [PRIMARY] + [FALLBACK] * 5
+    assert all(o.vlm_note.startswith(f"[{FALLBACK}]") for o in out)
+    # the release at phase end still covers both models
+    assert calls[-2:] == [("/api/generate", PRIMARY), ("/api/generate", FALLBACK)]
+
+
+def test_sticky_fallback_spans_videos_in_one_results_dir_phase(tmp_path, monkeypatch, rules, th):
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"")
+    out = _results(tmp_path, rules, source.resolve())
+    record = json.loads((out / "videos.json").read_text())
+    record["b.mp4"]["source_video"] = str(source.resolve())
+    (out / "videos.json").write_text(json.dumps(record))
+    calls = []
+
+    def fake(host, payload, path="/api/chat", **_):
+        calls.append((path, payload["model"]))
+        if path == "/api/chat" and payload["model"] == PRIMARY:
+            raise VlmError("HTTP 500: cuda OOM")
+        return reply('{"answer":"a","reason":"r"}')
+
+    monkeypatch.setattr(vlm, "_post", fake)
+    monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
+    summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    assert _chat_models(calls) == [PRIMARY, FALLBACK, FALLBACK, FALLBACK]
+    assert summary["models"] == {FALLBACK: 3}
+
+
+def test_single_bad_reply_does_not_make_fallback_sticky(monkeypatch):
+    calls = []
+    replies = iter([reply("", done_reason="length")])
+
+    def fake(host, payload, path="/api/chat", **_):
+        calls.append((path, payload["model"]))
+        if path == "/api/chat" and payload["model"] == PRIMARY:
+            return next(replies, reply('{"answer":"p","reason":"r"}'))
+        return reply('{"answer":"f","reason":"r"}')
+
+    monkeypatch.setattr(vlm, "_post", fake)
+    rows = [res("a.mp4", n, needs_review=True) for n in (1, 2, 3)]
+    out = review_low_confidence(rows, lambda r: [blank()])
+    assert _chat_models(calls) == [PRIMARY, FALLBACK, PRIMARY, PRIMARY]
+    assert [o.vlm_note.split("]")[0] for o in out] == [f"[{FALLBACK}", f"[{PRIMARY}", f"[{PRIMARY}"]
+
+
+def test_sticky_session_with_failing_fallback_notes_each_row(monkeypatch):
+    calls = []
+
+    def fake(host, payload, path="/api/chat", **_):
+        calls.append((path, payload["model"]))
+        raise VlmError("request failed: connection refused")
+
+    monkeypatch.setattr(vlm, "_post", fake)
+    rows = [res("a.mp4", n, needs_review=True) for n in (1, 2, 3)]
+    out = review_low_confidence(rows, lambda r: [blank()])
+    assert _chat_models(calls) == [PRIMARY, FALLBACK, FALLBACK, FALLBACK]
+    assert all(o.vlm_note.startswith(vlm.UNAVAILABLE_PREFIX) for o in out)
+    assert PRIMARY in out[1].vlm_note  # notes still say why the primary is skipped
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.zeros((8, 8, 3), np.float32),
+        np.zeros((0, 0, 3), np.uint8),
+        np.zeros((2, 8, 8, 3), np.uint8),
+        None,
+        "frame.png",
+    ],
+    ids=["float32", "empty", "4d", "none", "str"],
+)
+def test_unencodable_frame_is_a_row_note_not_a_batch_abort(monkeypatch, bad):
+    calls = []
+    monkeypatch.setattr(
+        vlm, "_post", lambda host, payload, **k: calls.append(payload["model"]) or reply('{"answer":"a","reason":"r"}')
+    )
+    rows = [res("a.mp4", n, needs_review=True) for n in (1, 2)]
+    out = review_low_confidence(rows, lambda r: [blank(), bad] if r.round == 1 else [blank()])
+    assert out[0].vlm_note.startswith(vlm.UNAVAILABLE_PREFIX + "frames: ")
+    assert out[1].vlm_note.startswith(f"[{PRIMARY}]")
+    assert calls == [PRIMARY, PRIMARY, FALLBACK]  # row 2 only, then the two releases
+
+
+def test_ask_vlm_rejects_unencodable_frame_before_any_request(monkeypatch):
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: pytest.fail("request with a bad frame"))
+    with pytest.raises(vlm.VlmFramesError):
+        ask_vlm([np.zeros((4, 4), np.float64)], "q")
+
+
 # --------------------------------------------------------------------------- frames
 
 

@@ -68,6 +68,10 @@ class VlmError(RuntimeError):
     """A VLM request failed or returned an incomplete / invalid reply."""
 
 
+class VlmReplyError(VlmError):
+    """One reply was truncated, empty or malformed (the service itself answered)."""
+
+
 class VlmConfigError(ValueError):
     """The VLM configuration would send frames off this machine or is invalid."""
 
@@ -237,36 +241,52 @@ def _post(host: str, payload: dict, *, path: str = "/api/chat", timeout: float) 
 
 
 def _encode(image: np.ndarray) -> str:
-    if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim not in (2, 3):
-        raise ValueError("VLM images must be uint8 grayscale or BGR arrays")
-    ok, png = cv2.imencode(".png", image)
+    """PNG/base64 of one frame; anything unencodable is a frames problem of that row."""
+    if (
+        not isinstance(image, np.ndarray)
+        or image.dtype != np.uint8
+        or image.ndim not in (2, 3)
+        or image.size == 0
+    ):
+        raise VlmFramesError(
+            "frame is not a non-empty uint8 grayscale/BGR array: "
+            + (f"{image.dtype} {image.shape}" if isinstance(image, np.ndarray) else type(image).__name__)
+        )
+    try:
+        ok, png = cv2.imencode(".png", image)
+    except cv2.error as error:
+        raise VlmFramesError(f"cannot encode frame {image.shape} as PNG: {_short(error)}") from None
     if not ok:
-        raise ValueError("cannot encode image as PNG")
+        raise VlmFramesError(f"cannot encode frame {image.shape} as PNG")
     return base64.b64encode(png.tobytes()).decode("ascii")
 
 
 def _parse(data, model: str) -> VlmAnswer:
-    """Accept only a completed (done/stop) reply with a non-empty schema answer."""
+    """Accept only a completed (done/stop) reply with a non-empty schema answer.
+
+    A server-reported ``error`` is a service failure (``VlmError``); every other defect is
+    a defect of this one reply (``VlmReplyError``).
+    """
     if not isinstance(data, dict):
-        raise VlmError(f"unexpected response type {type(data).__name__}")
+        raise VlmReplyError(f"unexpected response type {type(data).__name__}")
     if "error" in data:
         raise VlmError(f"server error: {_short(data['error'])}")
     if data.get("done") is not True or data.get("done_reason") != "stop":
-        raise VlmError(
+        raise VlmReplyError(
             f"incomplete reply (done={data.get('done')!r}, done_reason={data.get('done_reason')!r})"
         )
     message = data.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str) or not content.strip():
-        raise VlmError("empty reply content")
+        raise VlmReplyError("empty reply content")
     try:
         parsed = json.loads(content)
     except ValueError:
-        raise VlmError(f"reply is not JSON: {_short(content)}") from None
+        raise VlmReplyError(f"reply is not JSON: {_short(content)}") from None
     answer = parsed.get("answer") if isinstance(parsed, dict) else None
     reason = parsed.get("reason") if isinstance(parsed, dict) else None
     if not (isinstance(answer, str) and answer.strip() and isinstance(reason, str) and reason.strip()):
-        raise VlmError(f"reply lacks a non-empty answer/reason: {_short(content)}")
+        raise VlmReplyError(f"reply lacks a non-empty answer/reason: {_short(content)}")
     return VlmAnswer(answer.strip(), reason.strip(), model)
 
 
@@ -296,48 +316,99 @@ def ask_vlm(
         models.append(second)
     if not images:
         raise ValueError("ask_vlm needs at least one image")
-    encoded = [_encode(image) for image in images]
+    return _first_answer(base, models, [_encode(image) for image in images], question, cfg)
+
+
+def _attempt(base: str, name: str, encoded: list[str], question: str, cfg: VlmConfig) -> VlmAnswer:
+    payload = {
+        "model": name,
+        "messages": [
+            {
+                "role": "user",
+                "content": _PROMPT.format(window=cfg.event_window_s, question=question),
+                "images": encoded,
+            }
+        ],
+        "stream": False,
+        "think": cfg.think,
+        "format": _SCHEMA,
+        "keep_alive": cfg.keep_alive,
+        "options": {"num_ctx": cfg.num_ctx, "num_predict": cfg.num_predict}
+        | ({} if cfg.temperature is None else {"temperature": cfg.temperature}),
+    }
+    began = time.perf_counter()
+    try:
+        answer = _parse(_post(base, payload, timeout=cfg.timeout_s), name)
+    except VlmError as error:
+        log.warning("VLM %s failed after %.1fs: %s", name, time.perf_counter() - began, error)
+        raise
+    log.info("VLM %s answered in %.1fs (%d images)", name, time.perf_counter() - began, len(encoded))
+    return answer
+
+
+def _first_answer(
+    base: str,
+    models: list[str],
+    encoded: list[str],
+    question: str,
+    cfg: VlmConfig,
+    on_failure: Callable[[str, VlmError], None] | None = None,
+) -> VlmAnswer:
     failures = []
     for name in models:
-        payload = {
-            "model": name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _PROMPT.format(window=cfg.event_window_s, question=question),
-                    "images": encoded,
-                }
-            ],
-            "stream": False,
-            "think": cfg.think,
-            "format": _SCHEMA,
-            "keep_alive": cfg.keep_alive,
-            "options": {"num_ctx": cfg.num_ctx, "num_predict": cfg.num_predict}
-            | ({} if cfg.temperature is None else {"temperature": cfg.temperature}),
-        }
-        began = time.perf_counter()
         try:
-            answer = _parse(_post(base, payload, timeout=cfg.timeout_s), name)
+            return _attempt(base, name, encoded, question, cfg)
         except VlmError as error:
-            log.warning("VLM %s failed after %.1fs: %s", name, time.perf_counter() - began, error)
             failures.append(f"{name}: {error}")
-            continue
-        log.info("VLM %s answered in %.1fs (%d images)", name, time.perf_counter() - began, len(encoded))
-        return answer
+            if on_failure is not None:
+                on_failure(name, error)
     raise VlmError("; ".join(failures))
 
 
 class VlmSession:
-    """Shares loaded models across rows and releases them at phase end or error."""
+    """One VLM phase: shares loaded models across rows, releases them at the end.
+
+    Fallback is sticky for the session once the primary fails as a *service* (HTTP error
+    such as OOM or a missing tag, transport error, timeout, server-reported error): every
+    retry would cost another model load/eviction and up to ``timeout_s``. A defect of one
+    reply (``VlmReplyError``: truncated, empty, malformed) is about that answer, not the
+    service, so the next row still asks the primary.
+    """
 
     def __init__(self, config: VlmConfig):
         self.config = _validated(config)
         self.used = False
         self.models: Counter[str] = Counter()
+        self.primary_down: str | None = None
+
+    def _mark(self, name: str, error: VlmError) -> None:
+        if name == self.config.model and not isinstance(error, VlmReplyError):
+            self.primary_down = _short(error)
+            log.warning(
+                "VLM primary %s unavailable (%s); using %s for the rest of this phase",
+                name,
+                self.primary_down,
+                self.config.fallback,
+            )
 
     def ask(self, images: Sequence[np.ndarray], question: str) -> VlmAnswer:
+        cfg = self.config
+        if not images:
+            raise ValueError("VLM needs at least one image")
+        encoded = [_encode(image) for image in images]  # VlmFramesError before any request
         self.used = True
-        answer = ask_vlm(images, question, config=self.config)
+        models = list(dict.fromkeys((cfg.model, cfg.fallback)))
+        skipped = self.primary_down is not None and len(models) == 2
+        if skipped:
+            models = models[1:]
+        try:
+            answer = _first_answer(cfg.host, models, encoded, question, cfg, self._mark)
+        except VlmError as error:
+            if skipped:
+                raise VlmError(
+                    f"{cfg.model}: skipped after earlier failure ({self.primary_down}); {error}"
+                ) from None
+            raise
         self.models[answer.model] += 1
         return answer
 
@@ -426,6 +497,9 @@ def _note(r: RoundResult, get_frames, session: VlmSession) -> str:
         return f"{UNAVAILABLE_PREFIX}frames: none decoded near the event"
     try:
         answer = session.ask(images, question)
+    except VlmFramesError as error:  # e.g. a non-uint8 / empty / unencodable frame
+        log.warning("unusable frames for %s round %s: %s", r.video, r.round, _describe(error))
+        return f"{UNAVAILABLE_PREFIX}frames: {_describe(error)}"
     except VlmError as error:
         return f"{UNAVAILABLE_PREFIX}{_short(error)}"
     return f"[{answer.model}] 問：{question} 答：{answer.answer}（理由：{answer.reason}）"
