@@ -117,7 +117,42 @@ def _add_compare(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_compare)
 
 
-_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare]
+def _cmd_run(args: argparse.Namespace) -> int:
+    import logging
+    import sys
+
+    from bxjudge.pipeline import run_batch
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    folder = Path(args.folder).expanduser()
+    try:
+        run_batch(folder, Path(args.calib).expanduser(),
+                  Path(args.out).expanduser() if args.out else Path("results") / folder.name,
+                  selection=Path(args.selection).expanduser(),
+                  thresholds=Path(args.thresholds).expanduser(),
+                  rules_path=Path(args.rules).expanduser(),
+                  detection_config=Path(args.config).expanduser(), limit=args.limit)
+    except (ValueError, OSError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _add_run(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("run", help="judge new/changed videos into a result-local batch")
+    p.add_argument("folder")
+    p.add_argument("--calib", default="calib")
+    p.add_argument("--out", help="defaults to results/<folder name>")
+    p.add_argument("--selection", default="weights/selected.json",
+                   help="explicit selected detector manifest; synthetic output requires review")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--config", default="config/detection.yaml")
+    p.add_argument("--limit", type=int, help="maximum new/changed videos")
+    p.set_defaults(func=_cmd_run)
+
+
+_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run]
 
 
 def build_parser() -> argparse.ArgumentParser:

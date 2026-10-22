@@ -1,0 +1,364 @@
+"""Single-pass pipeline, uncertainty gates and batch isolation."""
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from bxjudge import pipeline
+from bxjudge.finish import FinishResult
+from bxjudge.manifest import VideoInfo
+from tests.helpers import (
+    cal_with,
+    make_calibration,
+    make_ref_img,
+    make_track,
+    make_video,
+    rr,
+)
+
+
+def info(path=Path("a.mp4")):
+    return VideoInfo(path, 1, 1, 4, 30, 1280, 720, "h264", False, None)
+
+
+def calibrated(monkeypatch, tmp_path, *, tracks=None):
+    c = cal_with(make_ref_img(), tmp_path)
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    calls = []
+
+    def frames(*args, **kwargs):
+        calls.append(kwargs)
+        for f in range(120):
+            yield f, frame
+
+    monkeypatch.setattr(pipeline, "iter_frames", frames)
+    monkeypatch.setattr(pipeline, "find_calibration", lambda frame, *a: c)
+
+    def measured(frames, scaled, ref):
+        assert scaled.frame_size == (1280, 720)
+        assert scaled.battle_area == [(240, 120), (1040, 120), (1040, 560), (240, 560)]
+        for f, image in frames:
+            yield f, image, 0.0 if f != 2 else float("nan")
+
+    monkeypatch.setattr(pipeline, "iter_stadium_displacement", measured)
+    if tracks is not None:
+
+        def tracker(frames, detector, fps, **kwargs):
+            for f, image in frames:
+                detector(image, f)
+            return tracks
+
+        monkeypatch.setattr(pipeline, "track_frames", tracker)
+    return calls
+
+
+def test_recalibrate_closes_single_decode(monkeypatch, th, rules):
+    closed = []
+
+    def frames(*a, **k):
+        try:
+            for f in range(120):
+                yield f, np.zeros((16, 32, 3), np.uint8)
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(pipeline, "iter_frames", frames)
+    monkeypatch.setattr(pipeline, "find_calibration", lambda *a: None)
+    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th)
+    assert r.review_reasons == ["recalibrate"] and r.needs_review
+    assert closed == [True]
+
+
+def test_no_round_one_decode_and_resolution_alignment(monkeypatch, tmp_path, th, rules):
+    calls = calibrated(monkeypatch, tmp_path)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    assert r.review_reasons == ["no_round"]
+    assert len(calls) == 1 and calls[0]["long_edge"] == th.infer_long_edge
+
+
+@pytest.mark.parametrize("reason,review", [("still", False), ("reversed", True)])
+def test_stop_reasons_gating_motion_provenance(
+    monkeypatch, tmp_path, th, rules, reason, review
+):
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(120)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(120)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    from bxjudge.launch_check import LaunchAnalysis
+    from bxjudge.types import LaunchCheck
+
+    launch = LaunchCheck(
+        {"X": "no", "B": "no"},
+        {"X": True, "B": True},
+        {"X": 5, "B": 6},
+        {"X": "battle_area", "B": "battle_area"},
+        "no",
+        ["shake_by_bey_impact@5"],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "analyze_launch",
+        lambda *a: LaunchAnalysis(launch, {1: "X", 2: "B"}, (0, 21), {5, 6}),
+    )
+    monkeypatch.setattr(pipeline, "orbit_direction", lambda *a: "right")
+    monkeypatch.setattr(pipeline, "stop_frame", lambda *a: (70, reason))
+    monkeypatch.setattr(
+        pipeline, "detect_finish", lambda *a: FinishResult("spin", "B", 70, 0.95, [])
+    )
+    [r] = pipeline.judge_video(
+        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out"
+    )
+    assert r.needs_review == review and f"X_stop_{reason}" in r.review_reasons
+    assert (
+        r.t_end == 70 / 30
+        and r.points == rules.finish_points["spin"]
+        and r.winner == "X"
+    )
+    assert r.motion_evidence["window"] == [0, 21]
+    assert r.motion_evidence["displacements"]["2"] is None
+    assert r.motion_evidence["impact_frames"] == [5, 6]
+    assert (tmp_path / "out/trajectories/a_r1.png").exists()
+
+
+def test_missing_side_and_synthetic_always_review(monkeypatch, tmp_path, th, rules):
+    calibrated(
+        monkeypatch,
+        tmp_path,
+        tracks=[make_track(1, "bey", {f: (360, 360) for f in range(120)})],
+    )
+    provenance = {"dataset": {"provenance": {"synthetic": True}}}
+    [r] = pipeline.judge_video(
+        info(), tmp_path, lambda *a: [], rules, th, provenance=provenance
+    )
+    assert r.needs_review and "synthetic_detector" in r.review_reasons
+    assert any("track_evidence_missing" in note for note in r.review_reasons)
+    assert r.detector_provenance == provenance
+
+
+def test_launch_metadata_uses_same_analysis(th):
+    from bxjudge.launch_check import analyze_launch, check_launch
+
+    c = make_calibration()
+    tracks = [
+        make_track(1, "bey", {f: (180, 180) for f in range(120)}),
+        make_track(2, "bey", {f: (450, 180) for f in range(120)}),
+    ]
+    disp = dict.fromkeys(range(120), 0.0)
+    analysis = analyze_launch(tracks, [], disp, c, th, 30)
+    assert check_launch(tracks, [], disp, c, th, 30) == (analysis.check, analysis.sides)
+    assert analysis.window[0] == 0 and analysis.window[1] > 0
+
+
+def test_batch_bad_probe_continues_and_cache_is_local(tmp_path, monkeypatch):
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "ok.mp4", seconds=0.1)
+    (folder / "bad.mp4").write_bytes(b"bad")
+    monkeypatch.setattr(pipeline, "load_detector", lambda *a, **k: lambda *a: [])
+    selection = tmp_path / "selection.json"
+    weights = tmp_path / "model.pt"
+    weights.touch()
+    selection.write_text(
+        json.dumps(
+            {
+                "kind": "yolo26",
+                "weights": str(weights),
+                "dataset": {"provenance": {"synthetic": True}},
+                "inference": {"long_edge": 1280},
+            }
+        )
+    )
+    for name in ("out1", "out2"):
+        out = tmp_path / name
+        pipeline.run_batch(folder, tmp_path / "no-calib", out, selection=selection)
+        rows = json.loads((out / "rounds.json").read_text())
+        assert {r["video"] for r in rows} == {"bad.mp4", "ok.mp4"}
+        assert (
+            rows[0]["detector_provenance"]["runtime"]["thresholds"]["infer_long_edge"]
+            == 1280
+        )
+        assert rows[0]["detector_provenance"]["runtime"]["confidence"] == 0.3
+        assert (
+            "decode_error"
+            in next(r for r in rows if r["video"] == "bad.mp4")["review_reasons"]
+        )
+        assert "source_video" in json.loads((out / "videos.json").read_text())["ok.mp4"]
+        assert (out / "processed_videos.json").exists()
+
+
+def test_invalid_global_selection_fails_without_output(tmp_path):
+    with pytest.raises((ValueError, FileNotFoundError)):
+        pipeline.run_batch(
+            tmp_path, tmp_path, tmp_path / "out", selection=tmp_path / "absent.json"
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_duplicate_basenames_rejected_before_model_or_outputs(tmp_path):
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "same.mp4").touch()
+    with pytest.raises(ValueError, match="basename"):
+        pipeline.run_batch(tmp_path, tmp_path / "calib", tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_run_cli_paths_limit_and_startup_error(tmp_path, monkeypatch, capsys):
+    from bxjudge.cli import main
+
+    calls = []
+    monkeypatch.setattr(pipeline, "run_batch", lambda *a, **kw: calls.append((a, kw)))
+    assert (
+        main(
+            [
+                "run",
+                str(tmp_path),
+                "--calib",
+                "calib",
+                "--out",
+                "result",
+                "--selection",
+                "smoke/selected.json",
+                "--thresholds",
+                "config/thresholds.yaml",
+                "--limit",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert calls[0][0] == (tmp_path, Path("calib"), Path("result"))
+    assert calls[0][1]["limit"] == 3 and calls[0][1]["selection"] == Path(
+        "smoke/selected.json"
+    )
+
+    def fail(*a, **kw):
+        raise ValueError("invalid selection")
+
+    monkeypatch.setattr(pipeline, "run_batch", fail)
+    assert main(["run", str(tmp_path)]) == 2
+    assert "invalid selection" in capsys.readouterr().err
+
+
+def test_air_collision_marker_comes_from_canonical_launch_analysis(th):
+    from bxjudge.launch_check import analyze_launch
+
+    c = make_calibration()
+    # Contact plus simultaneous sharp turns; exact event frame must survive.
+    x = make_track(1, "bey", {0: (100, 20), 1: (200, 30), 2: (300, 40), 3: (200, 30)})
+    b = make_track(2, "bey", {0: (500, 20), 1: (400, 30), 2: (300, 40), 3: (400, 30)})
+    analysis = analyze_launch([x, b], [], dict.fromkeys(range(100), 0.0), c, th, 30)
+    assert analysis.check.air_collision == "yes"
+    assert analysis.air_collision_frame == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"infer_long_edge": 0}, {"shake_px": float("nan")}, {"review_confidence": 2}],
+)
+def test_invalid_numeric_config_fails_before_model_and_outputs(
+    tmp_path, monkeypatch, change
+):
+    from dataclasses import asdict
+
+    import yaml
+
+    from bxjudge.config import load_thresholds
+
+    raw = {**asdict(load_thresholds()), **change}
+    thresholds = tmp_path / "thresholds.yaml"
+    thresholds.write_text(yaml.safe_dump(raw))
+
+    def forbidden(*a, **k):
+        pytest.fail("model must not load for invalid global configuration")
+
+    monkeypatch.setattr(pipeline, "load_detector", forbidden)
+    with pytest.raises(ValueError, match="threshold"):
+        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out", thresholds=thresholds)
+    assert not (tmp_path / "out").exists()
+
+
+def test_run_batch_injected_dependencies_require_no_selection(
+    tmp_path, monkeypatch, rules, th
+):
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+    monkeypatch.setattr(
+        pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")]
+    )
+    out = tmp_path / "out"
+    pipeline.run_batch(
+        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+    )
+    assert json.loads((out / "rounds.json").read_text())[0]["finish"] == "spin"
+
+
+def test_streamed_crop_seed_and_all_source_frames(monkeypatch, tmp_path, th, rules):
+    from bxjudge.types import Detection
+
+    calibrated(monkeypatch, tmp_path)
+    observed = []
+
+    def detector(image, f):
+        observed.append(f)
+        return [
+            Detection(f, "bey", (350.0, 350.0, 370.0, 370.0), 0.99),
+            Detection(f, "bey", (890.0, 350.0, 910.0, 370.0), 0.99),
+        ]
+
+    crop_frames = []
+
+    def activity(crops):
+        crop_frames.append(set(crops))
+        assert all(c.shape == (64, 64) and c.ndim == 2 for c in crops.values())
+        return {}
+
+    monkeypatch.setattr(pipeline, "spin_activity", activity)
+    monkeypatch.setattr(pipeline, "rotation_rate", lambda crops: {})
+    pipeline.judge_video(info(), tmp_path, detector, rules, th)
+    assert observed == list(range(120))
+    assert crop_frames == [set(range(120)), set(range(120))]
+
+
+def test_decode_failure_returns_review_artifact(monkeypatch, th, rules):
+    from bxjudge.video import VideoDecodeError
+
+    def broken(*a, **kw):
+        raise VideoDecodeError("corrupt")
+        yield
+
+    monkeypatch.setattr(pipeline, "iter_frames", broken)
+    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th)
+    assert r.review_reasons == ["decode_error"] and r.needs_review
+
+
+@pytest.mark.parametrize("marker", ["absent", False, True, "yes", None])
+def test_selection_accepts_current_export_provenance(tmp_path, th, marker):
+    provenance = {
+        "source_export": "/data/reviewed.json",
+        "split": "whole video, sorted video_sha256",
+        "val_ratio": 0.2,
+        "images": [],
+    }
+    if marker != "absent":
+        provenance["synthetic"] = marker
+    weights = tmp_path / "model.pt"
+    weights.touch()
+    path = tmp_path / "selection.json"
+    data = {
+        "kind": "yolo26",
+        "weights": str(weights),
+        "dataset": {"provenance": provenance},
+        "inference": {"long_edge": th.infer_long_edge},
+    }
+    path.write_text(json.dumps(data))
+    if marker in ("yes", None):
+        with pytest.raises(ValueError, match="provenance"):
+            pipeline._load_selection(path, th)
+    else:
+        selected = pipeline._load_selection(path, th)
+        [result] = pipeline._provenance([rr("spin", "X")], selected)
+        assert ("synthetic_detector" in result.review_reasons) == (marker is True)
+        assert result.needs_review == (marker is True)

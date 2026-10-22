@@ -5,9 +5,10 @@ represent the body only; ripcord/string tracks never provide touch evidence.
 """
 from __future__ import annotations
 
-from collections import Counter
-from itertools import combinations
 import math
+from collections import Counter
+from dataclasses import dataclass
+from itertools import combinations
 
 import cv2
 import numpy as np
@@ -15,8 +16,16 @@ import numpy as np
 from bxjudge.config import Thresholds
 from bxjudge.geometry import boxes_touch, is_abrupt_change, point_in_polygon, velocities
 from bxjudge.landing import find_settles
-from bxjudge.types import AirState, Box, Calibration, LaunchCheck, Point, Side, TouchState, Track
-
+from bxjudge.types import (
+    AirState,
+    Box,
+    Calibration,
+    LaunchCheck,
+    Point,
+    Side,
+    TouchState,
+    Track,
+)
 
 _SIDES: tuple[Side, Side] = ('X', 'B')
 
@@ -154,30 +163,42 @@ def detect_touch(disp: dict[int, float], launchers: list[Track], sides_of_launch
     return touch, notes
 
 
-def detect_air_collision(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> AirState:
+def _air_collision_evidence(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> tuple[AirState, int | None]:
     """Box contact plus both observed turns within the configured temporal radius."""
     cutoff = min((f for f in (land_x, land_b) if f is not None), default=math.inf)
     a = {d.frame: d.box for d in tx.dets if d.frame < cutoff}
     b = {d.frame: d.box for d in tb.dets if d.frame < cutoff}
     common = a.keys() & b.keys()
     if not common:
-        return 'maybe'
+        return 'maybe', None
     # Restrict the turn's complete three-frame support to the airborne period.
     changes_a = {f for f in _abrupt_frames(tx, th) if f + 1 < cutoff}
     changes_b = {f for f in _abrupt_frames(tb, th) if f + 1 < cutoff}
     possible = False
-    for f in common:
+    for f in sorted(common):
         overlap = boxes_touch(a[f], b[f])
         turns = (any(abs(f - g) <= th.air_collision_frames for g in changes_a)
                  and any(abs(f - g) <= th.air_collision_frames for g in changes_b))
         if overlap and turns:
-            return 'yes'
+            return 'yes', f
         possible |= overlap or turns
     missing = len(common) != max(common) - min(common) + 1
-    return 'maybe' if possible or missing else 'no'
+    return ('maybe' if possible or missing else 'no'), None
+
+def detect_air_collision(tx: Track, tb: Track, land_x: int | None, land_b: int | None, th: Thresholds) -> AirState:
+    return _air_collision_evidence(tx, tb, land_x, land_b, th)[0]
 
 
-def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float) -> tuple[LaunchCheck, dict[int, Side]]:
+@dataclass
+class LaunchAnalysis:
+    check: LaunchCheck
+    sides: dict[int, Side]
+    window: tuple[int, int]
+    impacts: set[int]
+    air_collision_frame: int | None = None
+
+
+def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float) -> LaunchAnalysis:
     """Combine launch evidence without choosing between missing/duplicate side tracks.
 
     The missing-landing cap bounds the search for battle-area settling. Within that
@@ -230,12 +251,17 @@ def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int
     touch, touch_notes = detect_touch(disp, launchers, launcher_sides, impacts, (start, end), c, th)
     notes.extend(touch_notes)
     if all(len(tracks) == 1 for tracks in by_side.values()):
-        air = detect_air_collision(by_side['X'][0], by_side['B'][0],
+        air, air_frame = _air_collision_evidence(by_side['X'][0], by_side['B'][0],
                                    physical_floor[by_side['X'][0].track_id],
                                    physical_floor[by_side['B'][0].track_id], th)
     else:
-        air = 'maybe'
+        air, air_frame = 'maybe', None
         for side in _SIDES:
             if touch[side] != 'yes':
                 touch[side] = 'unknown'
-    return LaunchCheck(touch, landed, landing_frame, landing_zone, air, notes), sides
+    return LaunchAnalysis(LaunchCheck(touch, landed, landing_frame, landing_zone, air, notes), sides, (start, end), impacts, air_frame)
+
+def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float) -> tuple[LaunchCheck, dict[int, Side]]:
+    """Public launch verdict, sharing the exact analysis used by motion exports."""
+    analysis = analyze_launch(bey_tracks, launchers, disp, c, th, fps)
+    return analysis.check, analysis.sides

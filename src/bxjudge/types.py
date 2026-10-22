@@ -102,3 +102,6 @@ class RoundResult:
     reviewed: bool = False
     reviewer_fix: dict | None = None
     spin_dir: dict[Side, SpinDir] | None = None
+
+    motion_evidence: dict | None = None
+    detector_provenance: dict | None = None

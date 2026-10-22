@@ -8,7 +8,7 @@ spinning tops inside the battle area cannot disturb it.
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from collections.abc import Iterable, Iterator
 
 import cv2
 import numpy as np
@@ -54,11 +54,11 @@ class _Template:
         return np.ascontiguousarray(g[self.crop].astype(np.float32))
 
 
-def stadium_displacement(
+def iter_stadium_displacement(
     frames: Iterable[tuple[int, np.ndarray]],
     c: Calibration,
     ref: np.ndarray,
-) -> dict[int, float]:
+) -> Iterator[tuple[int, np.ndarray, float]]:
     """Translation of the stadium rim relative to ``ref``, in pixels, per frame index.
 
     Region: ``stadium`` minus ``battle_area`` (``geometry.rim_mask``; the rim and lid edge
@@ -70,7 +70,6 @@ def stadium_displacement(
     of the frame as given, not of ``c.frame_size``. ECC runs on a copy downscaled to at most
     ``WORK_WIDTH`` px wide for speed. When ECC does not converge the frame gets ``nan``.
     """
-    out: dict[int, float] = {}
     templates: dict[tuple[int, int], _Template] = {}
     criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, _ECC_ITERATIONS, _ECC_EPS)
     for idx, frame in frames:
@@ -79,7 +78,7 @@ def stadium_displacement(
         if tpl is None:
             tpl = templates[key] = _Template(c, ref, key)
         if tpl.empty:
-            out[idx] = math.nan
+            yield idx, frame, math.nan
             continue
         warp = np.eye(2, 3, dtype=np.float32)
         try:
@@ -89,5 +88,9 @@ def stadium_displacement(
             d = math.hypot(float(warp[0, 2]), float(warp[1, 2])) * tpl.scale
         except cv2.error:
             d = math.nan
-        out[idx] = d if math.isfinite(d) else math.nan
-    return out
+        yield idx, frame, d if math.isfinite(d) else math.nan
+
+
+def stadium_displacement(frames: Iterable[tuple[int, np.ndarray]], c: Calibration, ref: np.ndarray) -> dict[int, float]:
+    """Collect displacement measurements; the pipeline consumes the streaming API."""
+    return {idx: displacement for idx, _, displacement in iter_stadium_displacement(frames, c, ref)}

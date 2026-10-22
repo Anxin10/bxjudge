@@ -24,7 +24,7 @@ _DRAW_ACTIONS = ("redo",)
 _PENALTY_MISSES = 2  # "2nd miss" in opponent_1pt_on_2nd_miss
 _PENALTY_POINTS = 1  # "1pt" in opponent_1pt_on_2nd_miss
 # Rounds with these review reasons are pipeline artefacts, not real rounds (Ruling R3).
-_NOT_A_ROUND = frozenset({"recalibrate", "no_round", "decode_error"})
+_NOT_A_ROUND = frozenset({"recalibrate", "no_round", "decode_error", "analysis_error"})
 
 
 @dataclass
