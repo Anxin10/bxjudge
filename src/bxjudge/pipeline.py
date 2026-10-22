@@ -11,6 +11,7 @@ import time
 from collections import Counter
 from contextlib import closing
 from dataclasses import asdict
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 
@@ -32,7 +33,12 @@ from .finish import (
 )
 from .launch_check import analyze_launch
 from .manifest import VideoInfo, mark_processed, scan
-from .output import record_video_timing, write_results, write_trajectory
+from .output import (
+    record_run_timing,
+    record_video_timing,
+    write_results,
+    write_trajectory,
+)
 from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
@@ -360,6 +366,9 @@ def run_batch(
     th: Thresholds | None = None,
     vlm_config: Path | None = None,
 ) -> None:
+    # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
+    run_began = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     folder, out_dir = Path(folder).expanduser(), Path(out_dir).expanduser()
     if not folder.is_dir():
         raise ValueError(f"{folder}: expected video folder")
@@ -456,8 +465,10 @@ def run_batch(
             processing,
             info.duration if info else 0.0,
         )
+    vlm_wall_s = None
     if vlm is not None and entries:
         # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
+        vlm_began = time.perf_counter()
         del detector
         _release_gpu_memory()
         review_results_dir(
@@ -467,6 +478,16 @@ def run_batch(
             rules=rules,
             config=vlm,
             videos={path.name for path, _ in entries},
+        )
+        vlm_wall_s = time.perf_counter() - vlm_began
+    if entries:  # nothing judged = no judgment wall-clock to report
+        record_run_timing(
+            out_dir,
+            kind="run",
+            started_at=started_at,
+            wall_s=time.perf_counter() - run_began,
+            vlm_wall_s=vlm_wall_s,
+            videos={path.name: info.duration if info else 0.0 for path, info in entries},
         )
 
 

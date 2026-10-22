@@ -236,6 +236,8 @@ def test_default_targets_are_spec_section_11():
     lambda d: d["targets"].update(touch_recall={"min": "high"}),
     lambda d: d.update(shake_overlap_percentile=101),
     lambda d: d.update(truth_t_launch_tolerance_s=-1),
+    lambda d: d.update(audit_confidence_level=1.0),
+    lambda d: d.pop("audit_confidence_level"),
 ])
 def test_eval_config_rejects_invalid(tmp_path, mutate):
     raw = yaml.safe_load(EVAL_CONFIG.read_text(encoding="utf-8"))
@@ -661,7 +663,11 @@ def test_referee_accuracy_overall_with_flagged_breakdown():
     assert a["all"] == {"n": 5, "correct": 2, "accuracy": pytest.approx(0.4)}
     assert a["unflagged"] == {"n": 2, "correct": 1, "accuracy": 0.5}
     assert a["flagged"] == {"n": 3, "correct": 1, "accuracy": pytest.approx(1 / 3)}
-    assert evaluate(rows).finish_accuracy_unflagged == a["unflagged"]["accuracy"]
+    # Referee "unflagged" is descriptive over the reviewed rows (here 1/2); the spec
+    # metric needs a random sample or full review: round 6 is unflagged and unreviewed
+    # and there is no audit sample, so it is unverified (R62).
+    assert math.isnan(evaluate(rows).finish_accuracy_unflagged)
+    assert evaluate(rows[:5]).finish_accuracy_unflagged == a["unflagged"]["accuracy"]
     assert math.isnan(report_metrics([], None, _cfg()).referee["all"]["accuracy"])
 
 
@@ -694,3 +700,290 @@ def test_cli_eval_report_starts_with_r60_summary_table(tmp_path):
         assert label in summary
     assert "FAIL" in summary  # speed: (4 + 8) / 10 > 1.0
     assert "model init" in text and "probe" in text
+
+
+# ---- R61 batch wall-clock ------------------------------------------------------
+
+
+def _run(wall, videos, *, kind="run", vlm=None):
+    return {"kind": kind, "started_at": "2026-10-23T10:00:00+08:00", "wall_s": wall,
+            "vlm_wall_s": vlm, "videos": videos}
+
+
+def test_speed_uses_wall_clock_when_recorded_and_never_double_counts_vlm():
+    rows = _rows_of_videos("a.mp4")
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 40.0,
+                         "vlm_requests": []}}
+    # the run took 100 s wall-clock INCLUDING its 40 s VLM phase
+    runs = [_run(100.0, {"a.mp4": 100.0}, vlm=40.0)]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "wall-clock"
+    assert m.speed_ratio == pytest.approx(1.0)  # 100 / 100, not (100 + 40) / 100
+    assert m.speed_ratio_wall == pytest.approx(1.0)
+    assert m.speed_ratio_sum == pytest.approx(0.9)  # (50 + 40) / 100, VLM once per video
+    assert passes(m)["speed_ratio"] is True
+    w = report_metrics(rows, timings, _cfg(), runs=runs).wall
+    assert (w["wall_s"], w["vlm_wall_s"], w["duration_s"]) == (100.0, 40.0, 100.0)
+
+
+def test_separate_vlm_command_wall_time_adds_without_adding_video_duration():
+    rows = _rows_of_videos("a.mp4")
+    runs = [_run(60.0, {"a.mp4": 100.0}), _run(30.0, {}, kind="vlm", vlm=30.0)]
+    m = evaluate(rows, {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0}}, runs=runs)
+    assert m.speed_ratio_wall == pytest.approx(0.9) and m.speed_basis == "wall-clock"
+
+
+def test_sum_exceeding_wall_clock_is_reported_not_hidden():
+    rows = _rows_of_videos("a.mp4", "b.mp4")
+    timings = {v: {"duration_s": 100.0, "processing_s": 90.0, "vlm_s": 0.0, "vlm_requests": []}
+               for v in ("a.mp4", "b.mp4")}
+    runs = [_run(120.0, {"a.mp4": 100.0, "b.mp4": 100.0})]  # e.g. future parallel videos
+    w = report_metrics(rows, timings, _cfg(), runs=runs).wall
+    assert w["sum_s"] == 180.0 and w["wall_s"] == 120.0 and w["sum_exceeds_wall"] is True
+    assert w["ratio"] == pytest.approx(0.6) and w["sum_ratio"] == pytest.approx(0.9)
+
+
+def test_speed_without_run_records_is_labelled_sum_based():
+    m = evaluate(_rows_of_videos("a.mp4"), {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0}})
+    assert m.speed_basis == "sum-based" and m.speed_ratio == m.speed_ratio_sum == 0.5
+    assert math.isnan(m.speed_ratio_wall)
+    assert evaluate(_rows_of_videos("a.mp4")).speed_basis == "unverified"
+
+
+def test_wall_clock_ignores_runs_without_real_rounds():
+    rows = [rev(video="g.mp4", finish=None, winner=None, review_reasons=["recalibrate"])]
+    m = evaluate(rows, {}, runs=[_run(1.0, {"g.mp4": 100.0})])
+    assert math.isnan(m.speed_ratio_wall) and m.speed_basis == "unverified"
+
+
+# ---- R62 audit-sampled unflagged accuracy ---------------------------------------
+
+
+def _unflagged(n, *, sampled=(), reviewed=(), wrong=()):
+    rows = []
+    for i in range(1, n + 1):
+        r = rev(round=i, reviewed=i in reviewed, fix={"finish": "over"} if i in wrong else {})
+        if i in sampled:
+            r["audit_sample"] = True
+        rows.append(r)
+    return rows
+
+
+def _wilson(k, n, level):
+    from statistics import NormalDist
+
+    z = NormalDist().inv_cdf(1 - (1 - level) / 2)
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return centre - half, centre + half
+
+
+def test_unflagged_accuracy_from_reviewed_audit_sample_with_wilson_interval():
+    rows = _unflagged(20, sampled={1, 2, 3, 4, 5, 6}, reviewed={1, 2, 3, 4, 5, 15, 16, 17},
+                      wrong={2})
+    u = report_metrics(rows, None, _cfg()).unflagged
+    assert u["method"] == "audit_sample" and u["n_sampled"] == 6 and u["n_used"] == 5
+    assert u["estimate"] == pytest.approx(0.8)
+    lo, hi = _wilson(4, 5, _cfg().audit_confidence_level)
+    assert (u["low"], u["high"]) == (pytest.approx(lo), pytest.approx(hi))
+    # reviewed but not randomly sampled: reported separately as biased
+    assert u["biased"] == {"n": 3, "correct": 3, "accuracy": 1.0}
+    m = evaluate(rows)
+    assert m.finish_accuracy_unflagged == pytest.approx(0.8)
+    assert m.finish_accuracy_unflagged_method == "audit_sample"
+
+
+def test_unflagged_accuracy_is_exact_when_every_unflagged_round_is_reviewed():
+    rows = _unflagged(4, reviewed={1, 2, 3, 4}, wrong={1})
+    u = report_metrics(rows, None, _cfg()).unflagged
+    assert u["method"] == "exact" and u["estimate"] == u["low"] == u["high"] == 0.75
+
+
+def test_unflagged_accuracy_without_random_sample_is_unverified_selection_bias():
+    rows = _unflagged(5, reviewed={1, 2})
+    u = report_metrics(rows, None, _cfg()).unflagged
+    assert u["method"] == "unverified" and u["reason"] == "selection bias / no random sample"
+    assert math.isnan(u["estimate"]) and u["biased"]["n"] == 2
+    assert math.isnan(evaluate(rows).finish_accuracy_unflagged)
+    assert passes(evaluate(rows))["finish_accuracy_unflagged"] is False
+
+
+def test_no_human_truth_leaves_every_accuracy_unverified():
+    rows = _unflagged(3) + [rev(round=9, needs_review=True, reviewed=False)]
+    r = report_metrics(rows, None, _cfg())
+    assert math.isnan(r.unflagged["estimate"])
+    assert math.isnan(r.referee["all"]["accuracy"])
+    assert math.isnan(r.tradeoff["auto_accuracy"]["estimate"])
+    assert math.isnan(r.tradeoff["final_accuracy"]["estimate"])
+    m = evaluate(rows)
+    assert all(math.isnan(v) for v in (m.finish_accuracy_unflagged, m.touch_recall, m.air_recall))
+
+
+# ---- R63 joint trade-off --------------------------------------------------------
+
+
+def test_tradeoff_block_side_by_side_without_a_weighted_score():
+    rows = _unflagged(10, reviewed=set(range(1, 11)), wrong={1, 2})
+    rows += [rev(round=11, needs_review=True, fix={}),  # flagged, original right
+             rev(round=12, needs_review=True, fix={"winner": "B"}),  # flagged, original wrong
+             *(rev(round=i, needs_review=True, reviewed=False) for i in (13, 14, 15))]
+    t = report_metrics(rows, None, _cfg()).tradeoff
+    assert t["automation_rate"] == pytest.approx(10 / 15)
+    assert t["auto_accuracy"]["estimate"] == pytest.approx((10 * 0.8 + 1) / 15)
+    assert t["final_accuracy"]["estimate"] == pytest.approx((10 + 2) / 15)
+    assert t["flagged_reviewed"] == (2, 5) and t["unflagged_method"] == "exact"
+    assert set(t) == {"automation_rate", "auto_accuracy", "final_accuracy", "flagged_reviewed",
+                      "unflagged_method", "speed"}
+
+
+def test_tradeoff_intervals_propagate_the_audit_interval():
+    rows = _unflagged(20, sampled={1, 2, 3, 4, 5}, reviewed={1, 2, 3, 4, 5}, wrong={2})
+    r = report_metrics(rows, None, _cfg())
+    a = r.tradeoff["auto_accuracy"]
+    assert a["estimate"] == pytest.approx(0.8)
+    assert (a["low"], a["high"]) == (pytest.approx(r.unflagged["low"]),
+                                     pytest.approx(r.unflagged["high"]))
+    f = r.tradeoff["final_accuracy"]  # 5 reviewed now right, 15 unreviewed at the estimate
+    assert f["estimate"] == pytest.approx((15 * 0.8 + 5) / 20)
+
+
+def test_tradeoff_speed_uses_wall_clock_basis_when_present():
+    rows = _rows_of_videos("a.mp4")
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0}}
+    sum_based = report_metrics(rows, timings, _cfg()).tradeoff["speed"]
+    assert sum_based == {"basis": "sum-based", "ratio": 1.5, "pass_rate": 0.0}
+    wall = report_metrics(rows, timings, _cfg(), runs=[_run(80.0, {"a.mp4": 100.0})])
+    assert wall.tradeoff["speed"] == {"basis": "wall-clock", "ratio": 0.8, "pass_rate": 1.0}
+
+
+def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):
+    rows = _unflagged(3, sampled={1}, reviewed={1})
+    res = _results(tmp_path / "res", rows, {"v1.mp4": {"duration_s": 10.0, "processing_s": 4.0}})
+    (res / "runs.json").write_text(json.dumps([_run(6.0, {"v1.mp4": 10.0})]), encoding="utf-8")
+    report = tmp_path / "eval.md"
+    assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
+    summary = report.read_text(encoding="utf-8").split("\n## ", 1)[0]
+    for text in ("wall-clock", "sum-based", "Wilson", "audit_sample", "自動化率 Automation Rate",
+                 "自動判定估計正確率", "覆核後估計正確率", "no weighted score"):
+        assert text in summary, text
+
+
+def test_tradeoff_without_any_human_truth_is_unverified_even_if_all_flagged():
+    rows = [rev(round=i, needs_review=True, reviewed=False) for i in (1, 2, 3)]
+    t = report_metrics(rows, None, _cfg()).tradeoff
+    assert t["automation_rate"] == 0.0
+    assert math.isnan(t["auto_accuracy"]["estimate"])  # not a measured 0.0
+    assert math.isnan(t["final_accuracy"]["estimate"])
+
+
+# ---- fix round 1: I1 wall-clock eligible denominator ----------------------------
+
+
+def test_wall_clock_excludes_gate_video_duration_probe():
+    # review probe2: 100 s video with 150 s core + a 200 s recalibrate gate that took 1 s
+    rows = _rows_of_videos("a.mp4") + [
+        rev(video="g.mp4", finish=None, winner=None, review_reasons=["recalibrate"])]
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
+               "g.mp4": {"duration_s": 200.0, "processing_s": 1.0}}
+    runs = [_run(151.0, {"a.mp4": 100.0, "g.mp4": 200.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "wall-clock"
+    assert m.speed_ratio == pytest.approx(1.5)  # gate work and duration both left out
+    assert passes(m)["speed_ratio"] is False  # was 0.503 PASS before the fix
+    w = report_metrics(rows, timings, _cfg(), runs=runs).wall
+    assert w["duration_s"] == 100.0 and w["excluded"] == ["g.mp4"]
+
+
+def test_wall_clock_excludes_over_limit_video_work_and_duration():
+    rows = _rows_of_videos("a.mp4", "long.mp4")
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
+               "long.mp4": {"duration_s": 900.0, "processing_s": 400.0, "vlm_s": 10.0}}
+    runs = [_run(560.0, {"a.mp4": 100.0, "long.mp4": 900.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_ratio == pytest.approx(1.5)  # (560 - 410) / 100, not 560 / 1000
+    assert m.speed_basis == "wall-clock"
+
+
+def test_wall_clock_counts_a_retried_gate_video_once():
+    rows = _rows_of_videos("a.mp4", "g.mp4")  # g was gated in run 1, judged in run 2
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0},
+               "g.mp4": {"duration_s": 200.0, "processing_s": 90.0}}
+    runs = [_run(52.0, {"a.mp4": 100.0, "g.mp4": 200.0}), _run(95.0, {"g.mp4": 200.0})]
+    w = report_metrics(rows, timings, _cfg(), runs=runs).wall
+    assert w["duration_s"] == 300.0  # not 500
+    assert w["ratio"] == pytest.approx(147.0 / 300.0)
+
+
+def test_wall_clock_without_eligible_video_falls_back_to_sum_based_with_reason():
+    rows = _rows_of_videos("long.mp4")
+    timings = {"long.mp4": {"duration_s": 900.0, "processing_s": 400.0}}
+    runs = [_run(400.0, {"long.mp4": 900.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio_wall)
+    w = report_metrics(rows, timings, _cfg(), runs=runs).wall
+    assert w["reason"] == "no eligible video in run records"
+
+
+# ---- fix round 1: I2 match agreement only over fully reviewed matches -------------
+
+
+def _match_rows(reviewed):
+    # xtreme (3) + spin (1): X wins one 4-0 match over two rounds
+    return [rev(round=i, t_launch=float(i), finish="xtreme" if i == 1 else "spin", winner="X",
+                reviewed=i in reviewed) for i in (1, 2)]
+
+
+def test_match_agreement_without_reviewed_rounds_is_unverified(rules):
+    m = report_metrics(_match_rows(set()), None, _cfg(), rules=rules).match_agreement
+    assert (m["n_matches"], m["agree"], m["n_partial"]) == (0, 0, 1)
+    assert math.isnan(m["ratio"])
+
+
+def test_match_agreement_skips_partly_reviewed_matches(rules):
+    m = report_metrics(_match_rows({1}), None, _cfg(), rules=rules).match_agreement
+    assert m["n_matches"] == 0 and m["n_partial"] == 1 and math.isnan(m["ratio"])
+    m = report_metrics(_match_rows({1, 2}), None, _cfg(), rules=rules).match_agreement
+    assert (m["n_matches"], m["agree"], m["ratio"], m["n_partial"]) == (1, 1, 1.0, 0)
+
+
+def test_cli_report_shows_match_agreement_unverified_without_truth(tmp_path):
+    rows = _match_rows(set())
+    res = _results(tmp_path / "res", rows, None)
+    report = tmp_path / "eval.md"
+    assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
+    text = report.read_text(encoding="utf-8")
+    assert "match score agreement unverified (0/0" in text
+
+
+# ---- fix round 1: m1 YAML confidence level, m4 partial audit coverage --------------
+
+
+def test_audit_confidence_level_comes_from_yaml(tmp_path):
+    rows = _unflagged(20, sampled={1, 2, 3, 4, 5}, reviewed={1, 2, 3, 4, 5}, wrong={2})
+    raw = yaml.safe_load(EVAL_CONFIG.read_text(encoding="utf-8"))
+    raw["audit_confidence_level"] = 0.80
+    path = tmp_path / "evaluation.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    cfg = load_eval_config(path)
+    u = report_metrics(rows, None, cfg).unflagged
+    lo, hi = _wilson(4, 5, 0.80)
+    assert u["level"] == 0.80
+    assert (u["low"], u["high"]) == (pytest.approx(lo), pytest.approx(hi))
+    lo95, hi95 = _wilson(4, 5, 0.95)
+    assert u["low"] > lo95 + 0.01 and u["high"] < hi95  # narrower than the 0.95 default
+    m = evaluate(rows, config=cfg)
+    assert m.finish_accuracy_unflagged == pytest.approx(0.8)
+
+
+def test_partly_reviewed_audit_sample_reports_coverage_and_warns(tmp_path):
+    rows = _unflagged(20, sampled={1, 2, 3}, reviewed={1})
+    u = report_metrics(rows, None, _cfg()).unflagged
+    assert u["method"] == "audit_sample" and u["coverage"] == pytest.approx(1 / 3)
+    res = _results(tmp_path / "res", rows, None)
+    report = tmp_path / "eval.md"
+    assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
+    text = report.read_text(encoding="utf-8")
+    assert "WARNING: audit sample only partly reviewed (1/3" in text
+    full = _unflagged(20, sampled={1, 2}, reviewed={1, 2})
+    assert report_metrics(full, None, _cfg()).unflagged["coverage"] == 1.0

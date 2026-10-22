@@ -776,6 +776,41 @@ def _vlm_config(tmp_path, **change):
     return path
 
 
+def test_run_records_batch_wall_clock_with_vlm_phase_inside(tmp_path, monkeypatch):
+    import time
+
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "a.mp4", seconds=0.1)
+
+    def load(*a, **k):
+        time.sleep(0.05)  # model init counts toward the batch wall-clock
+        return lambda image, frame: []
+
+    def review(out_dir, **kw):
+        time.sleep(0.05)
+        return {}
+
+    monkeypatch.setattr(pipeline, "load_detector", load)
+    monkeypatch.setattr(pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")])
+    monkeypatch.setattr(pipeline, "review_results_dir", review)
+    out = tmp_path / "out"
+    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+                       vlm_config=_vlm_config(tmp_path))
+    [run] = json.loads((out / "runs.json").read_text())
+    videos = json.loads((out / "videos.json").read_text())
+    assert run["kind"] == "run" and set(run["videos"]) == {"a.mp4"}
+    assert run["videos"]["a.mp4"] == pytest.approx(videos["a.mp4"]["duration_s"])
+    assert run["vlm_wall_s"] >= 0.05
+    # wall-clock covers init + core + VLM once: at least core + VLM phase, never their sum twice
+    assert run["wall_s"] >= 0.1 + videos["a.mp4"]["processing_s"]
+    assert run["wall_s"] >= run["vlm_wall_s"] + videos["a.mp4"]["processing_s"]
+    # nothing new to judge: no record (init alone is not judgment wall-clock)
+    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+                       vlm_config=_vlm_config(tmp_path))
+    assert len(json.loads((out / "runs.json").read_text())) == 1
+
+
 def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     import weakref
 

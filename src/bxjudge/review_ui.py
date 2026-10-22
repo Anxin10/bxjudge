@@ -21,7 +21,7 @@ from .types import Calibration
 from .video import VideoDecodeError, iter_frames
 from .vlm import VlmFramesError, overlay_zones, recorded_source, select_calibration
 
-FILTERS = ("全部", "需覆核", "已覆核")
+FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核")  # 抽樣稽核 = R62 random audit sample
 
 _TOUCH = {"yes": "有碰觸", "no": "沒有碰觸", "unknown": "不確定"}
 _LANDED = {True: "是", False: "否"}
@@ -85,6 +85,8 @@ def filter_rows(rows: list[dict], choice: str) -> list[dict]:
         return [r for r in rows if status(r) in ("待覆核", "分析診斷")]
     if choice == "已覆核":
         return [r for r in rows if status(r) == "已覆核"]
+    if choice == "抽樣稽核":
+        return [r for r in rows if r.get("audit_sample") is True]
     return list(rows)
 
 

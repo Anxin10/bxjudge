@@ -847,6 +847,10 @@ def test_vlm_cli_runs_results_dir_and_reports_errors(tmp_path, monkeypatch, caps
     assert out == tmp_path and kw["calib_dir"] == Path("calib")
     assert kw["config"].host == "http://127.0.0.1:11435"
     assert "answered" in capsys.readouterr().out
+    # R61: the standalone VLM phase records its own wall-clock (no video durations)
+    [run] = json.loads((tmp_path / "runs.json").read_text())
+    assert run["kind"] == "vlm" and run["videos"] == {}
+    assert run["wall_s"] >= 0 and run["vlm_wall_s"] == run["wall_s"]
 
     def fail(out, **kw):
         raise VlmConfigError("non-loopback host")

@@ -247,7 +247,9 @@ def main() -> None:
         st.info(f"沒有「{choice}」的回合。")
         return
     labels = {
-        _row_key(r): f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}" for r in shown
+        _row_key(r): f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}"
+        + (" · 抽樣稽核" if r.get("audit_sample") is True else "")
+        for r in shown
     }
     # The labels carry each row's status; a fresh widget per label set keeps them
     # current after a save, while the selection itself lives in session state.

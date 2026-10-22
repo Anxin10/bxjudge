@@ -107,3 +107,5 @@ class RoundResult:
     detector_provenance: dict | None = None
     # Human-set "this round starts a new match" boundary (R52); False = automatic.
     match_start: bool = False
+    # Member of the seeded random audit sample of unflagged rounds (R62); metadata only.
+    audit_sample: bool = False

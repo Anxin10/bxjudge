@@ -189,6 +189,56 @@ def confirm_reviewed(
     return True
 
 
+AUDIT_META = "audit_sample.json"
+
+
+def mark_audit_sample(
+    out_dir: Path, n: int, *, seed: int, rules: Rules | None = None
+) -> list[tuple[str, int]]:
+    """Mark a seeded random sample of ``n`` UNFLAGGED real rounds ``audit_sample`` (R62).
+
+    The population is every real round (not ``is_not_a_round``) whose ORIGINAL
+    ``needs_review`` is False, reviewed or not, in (video, round) order; the sample is
+    ``random.Random(seed).sample``. Only the sparse ``audit_sample`` flag is written: no
+    judgment, review state or fix changes. The same seed on the same population is a
+    no-op; an existing different sample, ``n`` < 1 or ``n`` > population raise
+    :class:`CorrectionError` before any write. Returns the sampled keys.
+    """
+    import random
+
+    out_dir = Path(out_dir)
+    rows = read_rounds(out_dir)
+    population = sorted(
+        (row["video"], row["round"])
+        for row in rows
+        if not is_not_a_round(row.get("review_reasons") or []) and row["needs_review"] is False
+    )
+    if n < 1 or n > len(population):
+        raise CorrectionError(
+            f"audit sample size {n}: only {len(population)} unflagged real rounds available"
+        )
+    picked = sorted(random.Random(seed).sample(population, n))
+    marked = sorted((r["video"], r["round"]) for r in rows if r.get("audit_sample") is True)
+    if marked == picked:
+        return picked
+    if marked:
+        raise CorrectionError(
+            f"an audit sample of {len(marked)} round(s) already exists; a different sample "
+            "would no longer be one random draw"
+        )
+    chosen = set(picked)
+    for row in rows:
+        if (row["video"], row["round"]) in chosen:
+            row["audit_sample"] = True
+    save_rounds(rows, out_dir, rules if rules is not None else load_rules())
+    (out_dir / AUDIT_META).write_text(
+        json.dumps({"seed": seed, "n": n, "population": len(population),
+                    "keys": [list(k) for k in picked], "at": now()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return picked
+
+
 def load_corrections(out_dir: Path) -> list[Correction]:
     """Every logged correction, oldest first."""
     path = Path(out_dir) / LOG

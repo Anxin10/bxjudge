@@ -77,6 +77,7 @@ class EvalConfig:
     truth_t_launch_tolerance_s: float
     shake_overlap_percentile: float
     spin_min_samples: int
+    audit_confidence_level: float
 
 
 def _number(v) -> bool:
@@ -95,8 +96,11 @@ def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
         raw = yaml.safe_load(f)
     _keys(path, "top level", raw, (
         "targets", "speed_max_video_s", "latency_percentile", "truth_t_launch_tolerance_s",
-        "shake_overlap_percentile", "spin_min_samples",
+        "shake_overlap_percentile", "spin_min_samples", "audit_confidence_level",
     ))
+    level = raw["audit_confidence_level"]
+    if not _number(level) or not 0 < level < 1:
+        raise ValueError(f"{path}: audit_confidence_level must be in (0, 1)")
     _keys(path, "targets", raw["targets"], METRIC_NAMES)
     targets = {}
     for name in METRIC_NAMES:
@@ -122,6 +126,7 @@ def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
         truth_t_launch_tolerance_s=float(raw["truth_t_launch_tolerance_s"]),
         shake_overlap_percentile=float(raw["shake_overlap_percentile"]),
         spin_min_samples=raw["spin_min_samples"],
+        audit_confidence_level=float(level),
     )
 
 
@@ -130,11 +135,15 @@ def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
 
 @dataclass
 class Metrics:
+    # Unflagged finish+winner accuracy (R62): exact when every unflagged real round is
+    # reviewed, else the reviewed random audit sample's estimate, else unverified (nan).
     finish_accuracy_unflagged: float
     touch_recall: float
     air_recall: float
     review_ratio: float
-    speed_ratio: float  # median (core + VLM) / duration over eligible videos (R59)
+    # Pass/fail basis (R59/R61): batch wall-clock ratio when run records exist, else the
+    # median per-video (core + VLM) / duration ("sum-based"); see speed_basis.
+    speed_ratio: float
     n_reviewed: int
     n_rounds: int = 0
     n_placeholders: int = 0
@@ -144,6 +153,10 @@ class Metrics:
     n_speed_videos: int = 0
     n_vlm_videos: int = 0
     speed_ratio_core: float = NAN  # diagnostic: median core-only ratio
+    speed_ratio_sum: float = NAN  # median per-video (core + VLM) / duration
+    speed_ratio_wall: float = NAN  # batch wall_s / video duration (R61)
+    speed_basis: str = "unverified"  # wall-clock | sum-based | unverified
+    finish_accuracy_unflagged_method: str = "unverified"  # exact | audit_sample | unverified
 
 
 def _ratio(num: int, den: int) -> float:
@@ -205,15 +218,126 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
     return videos, excluded
 
 
-def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
-             config: EvalConfig | None = None) -> Metrics:
-    """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings).
+def _wall(rows: list[dict], timings: dict | None, runs: list[dict] | None,
+          max_s: float) -> dict:
+    """Batch wall-clock basis from ``runs.json`` records (R61).
 
-    Without ``timings`` speed is unverified (R11). ``config`` defaults to
-    ``config/evaluation.yaml`` and is only needed for timings.
+    The denominator is the playback duration of the videos eligible on the same terms as
+    the sum-based basis (``_speed_videos``: a real round, measured, ≤ ``max_s``), each
+    counted ONCE, in the last ``run`` record that lists it (the run that produced its
+    current result; a gated video retried later is not counted twice). A ``run`` record
+    is used when it is that last listing for at least one eligible video. Its ``wall_s``
+    already contains its own VLM phase, so ``vlm_wall_s`` is only a breakdown and never
+    added again; standalone ``vlm`` records add waiting time but no video duration.
+
+    So the numerator stays comparable, the measured core + VLM of ineligible videos
+    (gates, over-limit) whose last listing is a used run is subtracted; any other
+    overhead (init, probe, earlier gate attempts) stays in, which is conservative.
+    ``sum_s`` is the per-video core + VLM sum over the counted videos, reported next to
+    the wall-clock: it can exceed wall-clock (e.g. parallel videos) and is never hidden.
+    """
+    eligible = {v["video"]: v for v in _speed_videos(rows, timings, max_s)[0]}
+    run_records = [r for r in runs or [] if r["kind"] == "run"]
+    last: dict[str, int] = {}
+    for i, r in enumerate(run_records):
+        for video in r["videos"]:
+            last[video] = i
+    counted = sorted(v for v in eligible if v in last)
+    used_ids = {last[v] for v in counted}
+    excluded = sorted(v for v, i in last.items() if i in used_ids and v not in eligible)
+    if not runs:
+        reason = "no run records"
+    elif not counted:
+        reason = "no eligible video in run records"
+    else:
+        reason = None
+    used = [run_records[i] for i in sorted(used_ids)]
+    if used:
+        used += [r for r in runs if r["kind"] == "vlm"]
+    timings = timings or {}
+
+    def work(video: str) -> float:
+        e = timings.get(video)
+        if not isinstance(e, dict) or not _number(e.get("processing_s")):
+            return 0.0
+        vlm = e.get("vlm_s", 0.0)
+        return e["processing_s"] + (vlm if _number(vlm) else 0.0)
+
+    raw_wall = sum(r["wall_s"] for r in used)
+    wall = max(0.0, raw_wall - sum(work(v) for v in excluded))
+    vlm_wall = sum(r["vlm_wall_s"] or 0.0 for r in used)
+    duration = sum(eligible[v]["duration_s"] for v in counted)
+    sum_s = sum(eligible[v]["total_s"] for v in counted) if counted else NAN
+    return {
+        "n_runs": len(used),
+        "n_videos": len(counted),
+        "excluded": excluded,
+        "reason": reason,
+        "wall_s": wall if used else NAN,
+        "raw_wall_s": raw_wall if used else NAN,
+        "vlm_wall_s": vlm_wall if used else NAN,
+        "duration_s": duration if used else NAN,
+        "ratio": wall / duration if used and duration > 0 else NAN,
+        "sum_s": sum_s,
+        "sum_ratio": sum_s / duration if counted and duration > 0 else NAN,
+        "sum_exceeds_wall": bool(used and counted and sum_s > wall),
+    }
+
+
+def _wilson(correct: int, n: int, level: float) -> tuple[float, float]:
+    z = statistics.NormalDist().inv_cdf(1 - (1 - level) / 2)
+    p = correct / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
+    """Unflagged finish+winner accuracy without selection bias (R62).
+
+    ``exact`` when every unflagged real round is reviewed; else ``audit_sample``: the
+    reviewed members of the seeded random audit sample, with a Wilson interval at
+    ``level`` (config default); else unverified. Reviewed unflagged rounds outside the
+    sample were chosen by people, so they are reported separately as ``biased``.
+    """
+    unflagged = [r for r in real_rows(rows) if r["needs_review"] is False]
+    reviewed = [r for r in unflagged if r.get("reviewed") is True]
+    sampled = [r for r in unflagged if r.get("audit_sample") is True]
+    sampled_reviewed = [r for r in sampled if r.get("reviewed") is True]
+    biased = [r for r in reviewed if r.get("audit_sample") is not True]
+    out = {"n_unflagged": len(unflagged), "n_reviewed": len(reviewed),
+           "n_sampled": len(sampled), "biased": _accuracy(biased), "reason": None,
+           "level": None,
+           # share of the audit sample already reviewed (< 1 = warn in the report)
+           "coverage": _ratio(len(sampled_reviewed), len(sampled))}
+    if unflagged and len(reviewed) == len(unflagged):
+        k = sum(map(_finish_right, reviewed))
+        p = k / len(reviewed)
+        return {**out, "method": "exact", "n_used": len(reviewed), "correct": k,
+                "estimate": p, "low": p, "high": p}
+    if sampled_reviewed:
+        level = load_eval_config().audit_confidence_level if level is None else level
+        k = sum(map(_finish_right, sampled_reviewed))
+        lo, hi = _wilson(k, len(sampled_reviewed), level)
+        return {**out, "method": "audit_sample", "n_used": len(sampled_reviewed),
+                "correct": k, "estimate": k / len(sampled_reviewed), "low": lo, "high": hi,
+                "level": level}
+    reason = ("no unflagged rounds" if not unflagged
+              else "audit sample not reviewed yet" if sampled
+              else "selection bias / no random sample")
+    return {**out, "method": "unverified", "n_used": 0, "correct": 0, "estimate": NAN,
+            "low": NAN, "high": NAN, "reason": reason}
+
+
+def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
+             config: EvalConfig | None = None, runs: list[dict] | None = None) -> Metrics:
+    """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
+    and ``runs.json`` wall-clock records).
+
+    Without ``timings`` or run records speed is unverified (R11). ``config`` defaults to
+    ``config/evaluation.yaml``.
     """
     real, truth = real_rows(rows), truth_rows(rows)
-    unflagged = [r for r in truth if r["needs_review"] is False]
     touch = [_caught(r, "touch", s) for r in truth for s in SIDES]
     touch = [c for positive, c in touch if positive]
     air = [c for positive, c in (_caught(r, "air") for r in truth) if positive]
@@ -226,21 +350,31 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
             speed = (statistics.median(v["total_ratio"] for v in videos),
                      statistics.median(v["core_ratio"] for v in videos))
         n_speed, n_vlm = len(videos), sum(v["has_vlm"] for v in videos)
+        wall = _wall(rows, timings, runs, cfg.speed_max_video_s)["ratio"]
+    else:
+        wall = NAN  # no videos.json: no eligible videos, so no wall-clock denominator
+    basis = ("wall-clock" if math.isfinite(wall)
+             else "sum-based" if math.isfinite(speed[0]) else "unverified")
+    u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level)
     return Metrics(
-        finish_accuracy_unflagged=_ratio(sum(map(_finish_right, unflagged)), len(unflagged)),
+        finish_accuracy_unflagged=u["estimate"],
         touch_recall=_ratio(sum(touch), len(touch)),
         air_recall=_ratio(sum(air), len(air)),
         review_ratio=_ratio(sum(r["needs_review"] is True for r in real), len(real)),
-        speed_ratio=speed[0],
+        speed_ratio=wall if basis == "wall-clock" else speed[0],
         n_reviewed=len(truth),
         n_rounds=len(real),
         n_placeholders=len(rows) - len(real),
-        n_unflagged_reviewed=len(unflagged),
+        n_unflagged_reviewed=u["n_used"],
         n_touch_truth=len(touch),
         n_air_truth=len(air),
         n_speed_videos=n_speed,
         n_vlm_videos=n_vlm,
         speed_ratio_core=speed[1],
+        speed_ratio_sum=speed[0],
+        speed_ratio_wall=wall,
+        speed_basis=basis,
+        finish_accuracy_unflagged_method=u["method"],
     )
 
 
@@ -278,6 +412,9 @@ class ReportMetrics:
     flagged_vlm: dict
     referee: dict
     match_agreement: dict | None
+    wall: dict  # R61 batch wall-clock basis
+    unflagged: dict  # R62 unbiased unflagged accuracy
+    tradeoff: dict  # R63 joint block
 
 
 def _stat(values: list[float], percentile: float) -> dict:
@@ -319,7 +456,8 @@ def _vlm_requests(rows, timings, percentile):
 
 
 def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: EvalConfig,
-                   *, rules: Rules | None = None) -> ReportMetrics:
+                   *, rules: Rules | None = None,
+                   runs: list[dict] | None = None) -> ReportMetrics:
     """Latency, VLM and referee-accuracy metrics for the eval report (R60).
 
     Core = ``processing_s`` (excludes one-time model init and scan/probe), end-to-end =
@@ -340,11 +478,29 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
     if rules is not None:
         original = group_matches([row_to_result(r) for r in rows], rules)
         final = matches_for(rows, rules)
+        # Unreviewed rounds agree with themselves trivially: only matches whose rounds
+        # are ALL reviewed are truth; none = unverified (fix round 1, I2).
+        reviewed = {(r["video"], r["round"]) for r in truth}
+        full = [(i, m) for i, m in enumerate(final)
+                if all((rr.video, rr.round) in reviewed for rr, _ in m.rounds)]
         agree = sum(
             i < len(original) and (original[i].score, original[i].winner) == (m.score, m.winner)
-            for i, m in enumerate(final)
+            for i, m in full
         )
-        agreement = {"n_matches": len(final), "agree": agree, "ratio": _ratio(agree, len(final))}
+        agreement = {"n_matches": len(full), "agree": agree, "ratio": _ratio(agree, len(full)),
+                     "n_partial": len(final) - len(full)}
+    wall = _wall(rows, timings, runs, config.speed_max_video_s)
+    u =unflagged_accuracy(rows, config.audit_confidence_level)
+    pass_rate = _ratio(sum(v["total_ratio"] <= limit for v in videos), len(videos))
+    if math.isfinite(wall["ratio"]):
+        speed = {"basis": "wall-clock", "ratio": wall["ratio"],
+                 "pass_rate": 1.0 if wall["ratio"] <= limit else 0.0}
+    elif videos:
+        speed = {"basis": "sum-based",
+                 "ratio": float(statistics.median(v["total_ratio"] for v in videos)),
+                 "pass_rate": pass_rate}
+    else:
+        speed = {"basis": "unverified", "ratio": NAN, "pass_rate": NAN}
     return ReportMetrics(
         latency_percentile=pct,
         videos=videos,
@@ -353,7 +509,7 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
         core_ratio=_stat([v["core_ratio"] for v in videos], pct),
         total_s=_stat([v["total_s"] for v in videos], pct),
         total_ratio=_stat([v["total_ratio"] for v in videos], pct),
-        speed_pass_rate=_ratio(sum(v["total_ratio"] <= limit for v in videos), len(videos)),
+        speed_pass_rate=pass_rate,
         core_pass_rate=_ratio(sum(v["core_ratio"] <= limit for v in videos), len(videos)),
         vlm_request_s=requests,
         vlm_unrecorded_videos=unrecorded,
@@ -371,7 +527,46 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
             "flagged": _accuracy([r for r in truth if r["needs_review"] is True]),
         },
         match_agreement=agreement,
+        wall=wall,
+        unflagged=u,
+        tradeoff=_tradeoff(real, u, speed),
     )
+
+
+def _tradeoff(real: list[dict], u: dict, speed: dict) -> dict:
+    """R63 joint block, side by side (no weighted score).
+
+    auto accuracy = what the judge gets right on its own over ALL real rounds: unflagged
+    rounds at the unflagged estimate, flagged rounds by their reviewed original accuracy
+    with unreviewed flagged rounds counted as errors. final accuracy = after the human
+    review done so far: reviewed rounds are right, unreviewed unflagged rounds at the
+    estimate, unreviewed flagged rounds still pending (counted as errors).
+    """
+    n = len(real)
+    unflagged = [r for r in real if r["needs_review"] is False]
+    flagged = [r for r in real if r["needs_review"] is True]
+    flagged_reviewed = [r for r in flagged if r.get("reviewed") is True]
+    n_u, n_u_rev = len(unflagged), sum(r.get("reviewed") is True for r in unflagged)
+    correct_flagged = sum(map(_finish_right, flagged_reviewed))
+
+    def mix(weight: int, fixed: int) -> dict:
+        # No human truth at all = unverified, never a "measured" 0.0 from counting
+        # every pending flagged round as an error.
+        no_truth = not any(r.get("reviewed") is True for r in real)
+        if not n or no_truth or (weight and not math.isfinite(u["estimate"])):
+            return {"estimate": NAN, "low": NAN, "high": NAN}
+        p = (u["estimate"], u["low"], u["high"]) if weight else (0.0, 0.0, 0.0)
+        est, lo, hi = ((weight * v + fixed) / n for v in p)
+        return {"estimate": est, "low": lo, "high": hi}
+
+    return {
+        "automation_rate": _ratio(n_u, n),
+        "auto_accuracy": mix(n_u, correct_flagged),
+        "final_accuracy": mix(n_u - n_u_rev, n_u_rev + len(flagged_reviewed)),
+        "flagged_reviewed": (len(flagged_reviewed), len(flagged)),
+        "unflagged_method": u["method"],
+        "speed": speed,
+    }
 
 
 # --------------------------------------------------------------------------- errors
@@ -636,8 +831,9 @@ def reversed_finish_check(rows: list[dict]) -> dict:
 # --------------------------------------------------------------------------- reports
 
 
-def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None]:
-    """Flat rows and timings of a results directory (read-only; timings None if absent)."""
+def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None, list | None]:
+    """Rows, per-video timings and batch run records of a results directory (read-only;
+    absent ``videos.json`` / ``runs.json`` give None)."""
     results_dir = Path(results_dir)
     rounds = results_dir / "rounds.json"
     if not rounds.is_file():
@@ -645,7 +841,9 @@ def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None]:
     rows = json.loads(rounds.read_text(encoding="utf-8"))
     videos = results_dir / "videos.json"
     timings = json.loads(videos.read_text(encoding="utf-8")) if videos.is_file() else None
-    return rows, timings
+    runs_path = results_dir / "runs.json"
+    runs = json.loads(runs_path.read_text(encoding="utf-8")) if runs_path.is_file() else None
+    return rows, timings, runs
 
 
 def is_synthetic(rows: list[dict]) -> bool:
@@ -684,8 +882,14 @@ _TIMING_NOTE = (
     "Timing definitions: **core** = `processing_s` per video (judge, trajectories and result "
     "export; excludes the one-time detector/model init and the scan/probe of the batch; "
     "includes first-inference warm-up). **VLM** = `vlm_s`, the separate VLM phase (frame "
-    "decoding + requests; absent = no VLM phase for that video). **End-to-end** = core + VLM; "
-    "speed pass/fail uses end-to-end (R59), core-only is a diagnostic. VLM request latency "
+    "decoding + requests; absent = no VLM phase for that video). **End-to-end** = core + VLM "
+    "per video (sum-based). **Batch wall-clock** = runs.json `wall_s` of each `bxjudge run` "
+    "from start to end (config + model init, probe, every video, its VLM phase once) plus "
+    "standalone `bxjudge vlm` phases, minus the measured work of ineligible videos, over "
+    "the playback duration of the speed-eligible videos (real round, measured, "
+    "≤ speed_max_video_s; each once, in its last run) (R61). "
+    "Speed pass/fail uses wall-clock when recorded, else the sum-based median, labelled "
+    "(R59/R61); core-only is a diagnostic. VLM request latency "
     "is per request actually sent (`vlm_requests`); *cold* = first answer by that model in "
     "the phase (models are unloaded at phase end). Durations are the playback seconds "
     "recorded in videos.json; slow-motion capture is NOT rescaled."
@@ -713,19 +917,34 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     out = [f"# bxjudge 評估報告 eval-{today}", "", source, ""]
     if is_synthetic(rows):
         out += [_SMOKE, ""]
+    u, w, t = x.unflagged, x.wall, x.tradeoff
+    if u["method"] == "audit_sample":
+        how = (f"audit_sample: {u['correct']}/{u['n_used']} reviewed of {u['n_sampled']} "
+               f"sampled, {u['n_unflagged']} unflagged; Wilson {u['level']:.0%} "
+               f"{_f(u['low'])}–{_f(u['high'])}")
+        if u["coverage"] < 1:
+            how += (f"; WARNING: audit sample only partly reviewed ({u['n_used']}/"
+                    f"{u['n_sampled']} sampled rounds, coverage {_f(u['coverage'])}): "
+                    "review the rest with the 抽樣稽核 filter")
+    elif u["method"] == "exact":
+        how = f"exact: all {u['n_unflagged']} unflagged rounds reviewed"
+    else:
+        how = f"unverified: {u['reason']}"
+    biased = u["biased"]
     spec_rows = [
         ("未標覆核回合判定正確率 finish_accuracy_unflagged", "finish_accuracy_unflagged",
-         _frac(m.finish_accuracy_unflagged,
-               _count(m.finish_accuracy_unflagged, m.n_unflagged_reviewed), m.n_unflagged_reviewed)),
+         (f"{_f(m.finish_accuracy_unflagged)} [{how}]; reviewed outside the random sample "
+          f"(biased, not used) {_frac(biased['accuracy'], biased['correct'], biased['n'])}")),
         ("觸碰召回率 touch_recall", "touch_recall",
          _frac(m.touch_recall, _count(m.touch_recall, m.n_touch_truth), m.n_touch_truth)),
         ("空碰召回率 air_recall", "air_recall",
          _frac(m.air_recall, _count(m.air_recall, m.n_air_truth), m.n_air_truth)),
         ("需覆核比例 review_ratio", "review_ratio",
          _frac(m.review_ratio, _count(m.review_ratio, m.n_rounds), m.n_rounds)),
-        ("處理速度比（中位數，核心+VLM）speed_ratio", "speed_ratio",
-         (f"{_f(m.speed_ratio)} over {m.n_speed_videos} video(s); "
-          f"core-only {_f(m.speed_ratio_core)}")),
+        ("處理速度比 speed_ratio", "speed_ratio",
+         (f"{_f(m.speed_ratio)} [{m.speed_basis}]; batch wall-clock {_f(m.speed_ratio_wall)}, "
+          f"sum-based median (core+VLM) {_f(m.speed_ratio_sum)} over {m.n_speed_videos} "
+          f"video(s), core-only {_f(m.speed_ratio_core)}")),
     ]
     out += ["| 指標 Metric | 數值 Value | 目標 Target | 判定 Result |", "|---|---|---|---|"]
     for label, name, value in spec_rows:
@@ -742,9 +961,18 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     match = ""
     if x.match_agreement is not None:
         a = x.match_agreement
-        match = f"; match score agreement {_frac(a['ratio'], a['agree'], a['n_matches'])}"
+        match = (f"; match score agreement {_frac(a['ratio'], a['agree'], a['n_matches'])} "
+                 f"over fully reviewed matches ({a['n_partial']} match(es) not fully "
+                 "reviewed, excluded)")
     e2e_ok = sum(v["total_ratio"] <= limit for v in x.videos)
     core_ok = sum(v["core_ratio"] <= limit for v in x.videos)
+    wall_note = ""
+    if w["sum_exceeds_wall"]:
+        wall_note = (f"; NOTE per-video sum {_f(w['sum_s'], 2)} s exceeds wall-clock "
+                     f"{_f(w['wall_s'], 2)} s (overlapping work)")
+
+    def interval(d: dict) -> str:
+        return f"{_f(d['estimate'])} ({_f(d['low'])}–{_f(d['high'])})"
     acc = {k: _frac(v["accuracy"], v["correct"], v["n"]) for k, v in ref.items()}
     out += [
         (f"| 核心判定延遲 Core Latency | {_lat(x.core_s, pct)}; ratio "
@@ -756,18 +984,40 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
          f"rows answered {_frac(fv['answered_share'], fv['answered'], fv['n_flagged'])}, "
          f"unavailable {_frac(fv['unavailable_share'], fv['unavailable'], fv['n_flagged'])} "
          "| — | — |"),
-        (f"| 端到端延遲 End-to-End Latency | {_lat(x.total_s, pct)}; ratio "
-         f"{_lat(x.total_ratio, pct, '')} | — | — |"),
-        (f"| 速度達標率 Speed Pass Rate | end-to-end "
-         f"{_frac(x.speed_pass_rate, e2e_ok, len(x.videos))}; core-only "
+        (f"| 端到端延遲 End-to-End Latency | sum-based per video (core+VLM) "
+         f"{_lat(x.total_s, pct)}; ratio {_lat(x.total_ratio, pct, '')}; batch wall-clock "
+         f"{_f(w['wall_s'], 2)} s over {_f(w['duration_s'], 2)} s of video = ratio "
+         f"{_f(w['ratio'])} ({w['n_runs']} run record(s), VLM phase {_f(w['vlm_wall_s'], 2)} s "
+         f"inside, counted once; {w['n_videos']} eligible video(s), excluded from both "
+         f"terms: {', '.join(w['excluded']) or 'none'}"
+         f"{'; ' + w['reason'] if w['reason'] else ''}){wall_note} | — | — |"),
+        (f"| 速度達標率 Speed Pass Rate | [{t['speed']['basis']}] {_f(t['speed']['pass_rate'])}; "
+         f"sum-based end-to-end {_frac(x.speed_pass_rate, e2e_ok, len(x.videos))}; core-only "
          f"{_frac(x.core_pass_rate, core_ok, len(x.videos))} (diagnostic) "
-         f"| per video ≤ {limit:g} × duration | — |"),
+         f"| ≤ {limit:g} × duration | — |"),
         (f"| 裁判正確率 Referee Accuracy | all reviewed {acc['all']}; unflagged "
          f"{acc['unflagged']}; flagged {acc['flagged']}{match} | — | — |"),
         "",
         (f"Truth = {m.n_reviewed} reviewed of {m.n_rounds} real rounds; {m.n_placeholders} "
          "diagnostic placeholder row(s) excluded. Unverified = empty denominator; it never "
-         "passes."),
+         "passes. Referee Accuracy is descriptive over the reviewed rows; the unflagged "
+         "spec metric uses only an unbiased basis (R62)."),
+        "",
+        "**取捨 Trade-off (R63)** — side by side, no weighted score:",
+        "",
+        "| 項目 Item | 數值 Value (interval) | 依據 Coverage |",
+        "|---|---|---|",
+        (f"| 自動化率 Automation Rate | {_f(t['automation_rate'])} | 1 − review_ratio over "
+         f"{m.n_rounds} real rounds |"),
+        (f"| 自動判定估計正確率 Auto Accuracy (all real rounds) | {interval(t['auto_accuracy'])} "
+         f"| unflagged at [{t['unflagged_method']}]; flagged by reviewed original accuracy, "
+         f"unreviewed flagged counted as errors ({t['flagged_reviewed'][0]}/"
+         f"{t['flagged_reviewed'][1]} flagged reviewed) |"),
+        (f"| 覆核後估計正確率 Final Accuracy after review | {interval(t['final_accuracy'])} | "
+         "reviewed rounds right; unreviewed unflagged at the estimate; unreviewed flagged "
+         "still pending (errors) |"),
+        (f"| 速度達標 Speed Pass | {_f(t['speed']['pass_rate'])} (ratio "
+         f"{_f(t['speed']['ratio'])}) | {t['speed']['basis']} |"),
         "",
         "## Timing",
         "",
