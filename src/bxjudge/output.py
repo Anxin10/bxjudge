@@ -258,7 +258,9 @@ def record_video_timing(
     _write_json(path, rows)
 
 
-def record_pipeline_timing(out_dir: Path, video: str, seconds: float | None) -> None:
+def record_pipeline_timing(
+    out_dir: Path, video: str, seconds: float | None, *, output_ready_seconds: float | None = None,
+) -> None:
     """Persist a same-invocation core-to-final-output span; None invalidates old evidence.
 
     Call before new core/advisory work and complete only after this video's exports,
@@ -270,9 +272,56 @@ def record_pipeline_timing(out_dir: Path, video: str, seconds: float | None) -> 
         raise ValueError(f"invalid observed pipeline seconds: {seconds!r}")
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
-    rows.setdefault(video, {})["pipeline_wall"] = {
+    entry = rows.setdefault(video, {})
+    if seconds is None:
+        entry.pop("invocation_wall", None)
+        entry.pop("output_ready_wall", None)
+    if output_ready_seconds is not None:
+        if (not _valid_seconds(output_ready_seconds) or seconds is None
+                or output_ready_seconds < seconds):
+            raise ValueError("invalid invocation-to-output-ready seconds")
+        entry["output_ready_wall"] = {
+            "scope": "invocation_to_output_ready", "seconds": output_ready_seconds,
+        }
+    entry["pipeline_wall"] = {
         "scope": "core_to_final_output", "seconds": seconds,
     }
+    _write_json(path, rows)
+
+
+def _valid_seconds(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def invalidate_pipeline_timings(out_dir: Path, videos: list[str]) -> None:
+    """Invalidate existing evidence after a failed attempt, including early init/probe."""
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    affected = set(videos) & rows.keys()
+    if affected:
+        for video in affected:
+            rows[video].pop("invocation_wall", None)
+            rows[video].pop("output_ready_wall", None)
+            rows[video]["pipeline_wall"] = {"scope": "core_to_final_output", "seconds": None}
+        _write_json(path, rows)
+
+
+def record_invocation_timing(out_dir: Path, videos: list[str], seconds: float) -> None:
+    """Certify completed output and cleanup; only self-measurement writes are excluded.
+
+    All actual inputs determine exact vs shared upper bound, regardless of eligibility.
+    Never allocate shared time or derive this from earlier execution records.
+    """
+    if not videos or len(set(videos)) != len(videos) or not _valid_seconds(seconds):
+        raise ValueError("invalid complete invocation timing")
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    kind = "exact" if len(videos) == 1 else "completion_upper_bound"
+    for video in videos:
+        rows[video]["invocation_wall"] = {
+            "scope": "complete_invocation", "kind": kind, "seconds": seconds,
+        }
     _write_json(path, rows)
 
 

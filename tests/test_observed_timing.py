@@ -82,12 +82,12 @@ def test_two_phase_span_includes_other_core_release_preflight_and_wait(tmp_path,
     assert runs[0]["wall_s"] == clock.now == 35
     assert runs[0]["vlm_wall_s"] == 23
     metrics = evaluate(rows, timings, runs=runs)
-    assert metrics.speed_basis == "observed per-video wall"
-    assert metrics.speed_ratio == 0.26 and passes(metrics)["speed_ratio"]
+    assert metrics.speed_basis == "complete invocation deadline evidence"
+    assert metrics.speed_ratio == 0.35 and passes(metrics)["speed_ratio"]
     report = tmp_path / "eval.md"
     main(["eval", str(out), "--report", str(report)])
     assert "core_to_final_output" in report.read_text()
-    assert "observed per-video wall" in report.read_text()
+    assert "complete invocation deadline evidence" in report.read_text()
 
 
 @pytest.mark.parametrize("enabled,candidates", [(False, True), (True, False)])
@@ -125,6 +125,7 @@ def test_failed_phase_never_retains_prior_observation(tmp_path, monkeypatch, th,
     rows, timing, _ = read_results(out)
     assert observed(timing, "a.mp4")["seconds"] is not None
     assert observed(timing, "b.mp4")["seconds"] is None
+    assert all(e.get("invocation_wall") is None for e in timing.values())
     assert not passes(evaluate(rows, timing))["speed_ratio"]
 
 
@@ -144,6 +145,7 @@ def test_standalone_vlm_cannot_extend_or_fabricate_pipeline_span(tmp_path, monke
     vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
     rows, timing, _ = read_results(out)
     assert all(observed(timing, v)["seconds"] is None for v in timing)
+    assert all(e.get("invocation_wall") is None for e in timing.values())
     assert not passes(evaluate(rows, timing))["speed_ratio"]
 
 
@@ -186,6 +188,7 @@ def test_standalone_failed_phase_invalidates_all_scheduled_observations(tmp_path
         vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
     rows, timings, _ = read_results(out)
     assert all(observed(timings, v)["seconds"] is None for v in timings)
+    assert all(e.get("invocation_wall") is None for e in timings.values())
     assert not passes(evaluate(rows, timings))["speed_ratio"]
 
 
@@ -196,11 +199,11 @@ def test_complete_observations_compare_each_video_not_pooled_or_median():
                for v, d, s in (("short.mp4", 10, 20), ("long.mp4", 100, 1))}
     metrics = evaluate(rows, timings)
     assert metrics.speed_ratio == 2
-    assert speed_verdict(metrics, load_eval_config()) == "FAIL"
+    assert speed_verdict(metrics, load_eval_config()) == "FAIL (observed lower-bound deadline violation)"
     assert not passes(metrics)["speed_ratio"]
     del timings["short.mp4"]["pipeline_wall"]
     metrics = evaluate(rows, timings)
-    assert metrics.speed_basis == "partial observed per-video wall"
+    assert metrics.speed_basis == "observed output-availability lower bound"
     assert speed_verdict(metrics, load_eval_config()) == "UNVERIFIED (FAIL)"
 
 
@@ -215,7 +218,11 @@ def test_real_elapsed_lightweight_pipeline_smoke(tmp_path, monkeypatch, th, rule
     pipeline.run_batch(tmp_path, tmp_path, out, detector=lambda *a: [], th=th, rules=rules)
     rows, timings, runs = read_results(out)
     span = observed(timings, path.name)["seconds"]
-    assert runs[0]["wall_s"] >= span >= timings[path.name]["processing_s"] > 0
+    complete = timings[path.name]["invocation_wall"]
+    ready = timings[path.name]["output_ready_wall"]["seconds"]
+    assert complete["kind"] == "exact"
+    assert runs[0]["wall_s"] == complete["seconds"]
+    assert complete["seconds"] >= ready >= span >= timings[path.name]["processing_s"] > 0
     assert passes(evaluate(rows, timings))["speed_ratio"]
 
 
@@ -245,7 +252,8 @@ def test_observed_coverage_excludes_over_limit_and_placeholder_only_videos():
                "long.mp4": {"duration_s": load_eval_config().speed_max_video_s + 1}}
     metrics = evaluate(rows, timings)
     assert metrics.n_observed_videos == metrics.n_required_speed_videos == 1
-    assert passes(metrics)["speed_ratio"]
+    assert not passes(metrics)["speed_ratio"]  # availability alone is incomplete
+    assert metrics.n_deadline_videos == 0
 
 
 @pytest.mark.parametrize("reviewed_videos", [("a.mp4", "b.mp4"), ("a.mp4",)])

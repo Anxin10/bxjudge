@@ -285,20 +285,31 @@ uv run bxjudge eval results/20261001-try2 --truth results/20261001
 - 未標覆核準確率需完整全查，或凍結的隨機 audit 樣本完整覆核後以 Wilson 信賴下界判定；
   樣本未覆核完、來源不完整或真值不足都顯示 unverified。只覆核被標記回合不能驗證自動判定。
   reviewed output agreement 是覆核輸出對覆核真值的一致性，不能當作原始裁判準確率。
-- 逐影片速度要求保留「處理時間 ≤ 影片長度」；目前核心 + VLM stage sum 的最差逐片比值
-  超標會 FAIL。正式 PASS 需要每支符合評估範圍的影片都有有效實測 wall 證據，並逐片符合期限；
-  任何已知逐片超時，即使其他影片證據缺漏仍為 FAIL。stage sum 與 batch throughput 不能取代實測。
-  `videos.json` 的 `pipeline_wall: {scope: "core_to_final_output", seconds: ...}` 記錄同一次
-  run 從該片 core 開始，直到該片最終結果／適用的 VLM note 與 stage timing 寫完的實際經過秒數。
-  包含中間其他影片 core、排隊等待、detector 釋放與 VLM preflight；未使用 VLM 的影片於 core
-  輸出完成時結束。逐片區間不含 core 前的共同初始化／probe、觀測值本身的 JSON 寫入與共同
-  VLM session 清理；這些共同工作仍計入 batch wall。detector 仍在全部 core 後、VLM 前釋放。
-  新工作先使舊觀測失效（seconds: null）；中斷／失敗不會沿用舊數值。Ollama 不可用時，
-  寫完 unavailable note 才結束該片觀測。之後獨立 `bxjudge vlm` 會使處理影片的舊 pipeline
-  觀測失效，僅累計分開命名的 VLM stage／batch 成本，不跨 invocation 相加成實測 latency。
-  舊結果缺少觀測時保持 UNVERIFIED，不遷移／補造。eval CLI 與報告列出依據、覆蓋數與觀測區間。
-  核心 stage 不含一次性模型載入與 scan / probe；批次 wall 含初始化與 VLM。
-  影片長度用 videos.json 的播放秒數，慢動作不換算。
+- 逐影片速度要求保留「處理時間 ≤ 影片長度」。正式 PASS 需要每支符合評估範圍的影片都有
+  目前同次 invocation 的完整證據，且逐片符合自己的期限，不能用平均／中位數或 pooled throughput 取代。
+  `videos.json` 的 `invocation_wall: {scope: "complete_invocation", kind: ..., seconds: ...}`
+  從配置／模型載入前開始，含 scan/probe、全部 core、等待、輸出、VLM 與 session cleanup；
+  只排除記錄自身測量值的 timing metadata 寫入。
+  實際處理一個輸入時 `kind: "exact"` 是該次完整耗時；多個輸入時
+  `kind: "completion_upper_bound"` 是共用的完成時間上界，**不是**每片實際耗時。
+  計數包含 placeholder 與超出評估長度的輸入，不分攤初始化、不扣除其工作。
+  共用上界若在每片自己的預算內可證明 PASS；僅上界超標不能證明個別影片超時，維持 UNVERIFIED。
+- `output_ready_wall: {scope: "invocation_to_output_ready", seconds: ...}` 是從 invocation 開始
+  到該片最終輸出可用的直接觀測下界，含初始化、probe、前序工作／排隊；尚不含後續共同清理。
+  `pipeline_wall: {scope: "core_to_final_output", seconds: ...}` 保留更窄的 core 起點至輸出可用區間，
+  不含 core 前初始化／probe 或共同清理。兩者皆為 availability 診斷，不能單獨授予正式 PASS。
+  已知 exact 或觀測下界超時，即使其他影片證據缺漏仍 FAIL；沒有完整證據時 stage sum 超標
+  明確標為 sum-based violation。CLI／報告列出完整證據覆蓋、exact／upper-bound 類別與各區間。
+  新 core／獨立 VLM 工作使受影響舊證據失效；初始化／probe 失敗時保守撤銷請求輸入的舊證據，
+  中斷不得沿用舊完整證明。不同次 invocation 不相加成觀測 latency，舊資料不遷移／補造。
+  detector 仍在全部 core 後、VLM 前釋放，所有 VLM cleanup 完成才記完整證據。
+- 精確 cold benchmark 可用現有 `--limit 1` 搭配新的輸出目錄，例如
+  `uv run bxjudge run ~/bx/videos/20261001 --calib calib --selection weights/selected.json --out results/cold-one --limit 1`，
+  再執行 `uv run bxjudge eval results/cold-one --report reports/cold-one.md`。
+  掃描／probe 全部候選檔案的時間仍包含在測量內；批次上界不夠緊時，以此取得實測單片證據。
+  核心 stage 不含一次性模型載入與 scan/probe；批次 wall 含初始化與 VLM。影片長度使用
+  videos.json 的播放秒數，慢動作不換算。match score agreement 僅計入每回合皆有人類覆核的
+  final match，列出未完整覆核而排除的場數；無完整真值則 unverified，這不是獨立 final accuracy。
 - 目標值、容許誤差與百分位都在 `config/evaluation.yaml`。
 - `--truth` 只用 (video, round) 唯一、該影片回合數相同、`t_launch` 差在容許內的回合；
   重複、缺少、分段不同、時間不符都列在報告並排除，不猜最近的回合，也不改任何檔案。

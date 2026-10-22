@@ -48,7 +48,7 @@ def test_touch_recall_counts_flagged_as_caught():
 def test_passes_thresholds():
     assert all(passes(Metrics(0.96, 0.92, 0.91, 0.25, 0.8, 50,
                              finish_accuracy_unflagged_method="exact",
-                             speed_basis="observed per-video wall")).values())
+                             speed_evidence_complete=True)).values())
     assert passes(Metrics(0.90, 0.92, 0.91, 0.25, 0.8, 50,
                           finish_accuracy_unflagged_method="exact"))["finish_accuracy_unflagged"] is False
     assert passes(Metrics(0.96, 0.92, 0.91, 0.35, 0.8, 50,
@@ -210,7 +210,7 @@ def test_speed_excludes_placeholder_only_unmeasured_and_overlong_videos():
 def test_passes_boundaries_are_inclusive_and_nan_fails():
     assert all(passes(Metrics(0.95, 0.90, 0.90, 0.30, 1.0, 1,
                              finish_accuracy_unflagged_method="exact",
-                             speed_basis="observed per-video wall")).values())
+                             speed_evidence_complete=True)).values())
     assert passes(Metrics(0.96, 0.92, 0.91, 0.25, math.nan, 1,
                           finish_accuracy_unflagged_method="exact"))["speed_ratio"] is False
 

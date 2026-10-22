@@ -290,9 +290,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     summary = ", ".join(f"{name}={shown(name)} {verdict(name)}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
-    print(f"speed basis: {metrics.speed_basis}; observed coverage "
-          f"{metrics.n_observed_videos}/{metrics.n_required_speed_videos}; "
-          "interval=core_to_final_output (same invocation, including intervening wait)")
+    print(f"speed basis: {metrics.speed_basis}; complete invocation coverage "
+          f"{metrics.n_deadline_videos}/{metrics.n_required_speed_videos}; "
+          "interval=complete_invocation (init/probe/output/cleanup); "
+          "kind=exact or completion_upper_bound, compared to each own budget")
+    for evidence in extra.tradeoff["speed"]["deadline"]["videos"]:
+        print(f"  {evidence['video']}: {evidence['kind']} {evidence['seconds']:.3f}s "
+              f"/ own duration ratio {evidence['ratio']:.3f}")
     if ev.is_synthetic(rows):
         print("SMOKE ONLY: synthetic-detector rounds are not acceptance evidence")
     print(f"report: {path}")

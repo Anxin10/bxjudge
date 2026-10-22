@@ -34,7 +34,9 @@ from .finish import (
 from .launch_check import analyze_launch
 from .manifest import VideoInfo, mark_processed, scan
 from .output import (
+    invalidate_pipeline_timings,
     read_rounds,
+    record_invocation_timing,
     record_pipeline_timing,
     record_run_timing,
     record_video_timing,
@@ -369,7 +371,7 @@ def run_batch(
     th: Thresholds | None = None,
     vlm_config: Path | None = None,
 ) -> None:
-    # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
+    # Invocation starts before config/model init; completion includes output and VLM cleanup.
     run_began = time.perf_counter()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     folder, out_dir = Path(folder).expanduser(), Path(out_dir).expanduser()
@@ -389,127 +391,141 @@ def run_batch(
     calib_dir = Path(calib_dir).expanduser()
     if not calib_dir.is_dir():
         raise ValueError(f"{calib_dir}: expected calibration directory (--calib)")
-    # Configuration and model initialization fail globally, before any result/cache writes.
-    injected_thresholds = th is not None
-    th = load_thresholds(thresholds) if th is None else th
-    rules = load_rules(rules_path) if rules is None else rules
-    _validate_thresholds(th)
-    policy = load_policy(detection_config)
-    # Spec section 8: the optional VLM phase is configured (and its loopback endpoint
-    # validated) up front; None or after_run: false keeps the run Ollama-free.
-    vlm = load_vlm_config(vlm_config) if vlm_config is not None else None
-    if vlm is not None and not vlm.after_run:
-        vlm = None
-    provenance = None
-    if detector is None:
-        provenance = _load_selection(Path(selection).expanduser(), th)
-        provenance["runtime"] = {
-            "detection_config": str(Path(detection_config).resolve()),
-            "thresholds_path": None
-            if injected_thresholds
-            else str(Path(thresholds).resolve()),
-            "rules_path": str(Path(rules_path).resolve()),
-            "confidence": policy["confidence"],
-            "tracking": policy["tracking"],
-            "device": policy["device"],
-            "thresholds": asdict(th),
-            "rules": asdict(rules),
-        }
-        detector = load_detector(
-            provenance["kind"],
-            Path(provenance["weights"]),
-            config=detection_config,
-            thresholds=th,
+    entries = None
+    try:
+        # Configuration and model initialization fail globally, before any result/cache writes.
+        injected_thresholds = th is not None
+        th = load_thresholds(thresholds) if th is None else th
+        rules = load_rules(rules_path) if rules is None else rules
+        _validate_thresholds(th)
+        policy = load_policy(detection_config)
+        # Spec section 8: the optional VLM phase is configured (and its loopback endpoint
+        # validated) up front; None or after_run: false keeps the run Ollama-free.
+        vlm = load_vlm_config(vlm_config) if vlm_config is not None else None
+        if vlm is not None and not vlm.after_run:
+            vlm = None
+        provenance = None
+        if detector is None:
+            provenance = _load_selection(Path(selection).expanduser(), th)
+            provenance["runtime"] = {
+                "detection_config": str(Path(detection_config).resolve()),
+                "thresholds_path": None
+                if injected_thresholds
+                else str(Path(thresholds).resolve()),
+                "rules_path": str(Path(rules_path).resolve()),
+                "confidence": policy["confidence"],
+                "tracking": policy["tracking"],
+                "device": policy["device"],
+                "thresholds": asdict(th),
+                "rules": asdict(rules),
+            }
+            detector = load_detector(
+                provenance["kind"],
+                Path(provenance["weights"]),
+                config=detection_config,
+                thresholds=th,
+            )
+        db = out_dir / "processed_videos.json"
+        failures = []
+        infos = scan(
+            folder, db, on_error=lambda path, error: failures.append((path, error))
         )
-    db = out_dir / "processed_videos.json"
-    failures = []
-    infos = scan(
-        folder, db, on_error=lambda path, error: failures.append((path, error))
-    )
-    entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
-    if limit is not None:
-        entries = entries[:limit]
-    # Invalidate the entire scheduled set before any core/output work can fail.
-    for path, _ in entries:
-        record_pipeline_timing(out_dir, path.name, None)
-    starts: dict[str, float] = {}
+        entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
+        if limit is not None:
+            entries = entries[:limit]
+        # Invalidate the entire scheduled set before any core/output work can fail.
+        invalidate_pipeline_timings(out_dir, [path.name for path, _ in entries])
+        starts: dict[str, float] = {}
 
-    def complete(video: str) -> None:
-        record_pipeline_timing(out_dir, video, time.perf_counter() - starts[video])
+        def complete(video: str) -> None:
+            now = time.perf_counter()
+            record_pipeline_timing(out_dir, video, now - starts[video],
+                                   output_ready_seconds=now - run_began)
 
-    for path, info in entries:
-        began = time.perf_counter()
-        starts[path.name] = began
-        if info is None:
-            results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
-        else:
-            try:
-                results = judge_video(
-                    info,
-                    calib_dir,
-                    detector,
-                    rules,
-                    th,
-                    out_dir=out_dir,
-                    provenance=provenance,
-                    detection_config=detection_config,
-                )
-            except Exception:
-                log.exception("analysis failed for %s; continuing batch", path)
-                results = _provenance(
-                    [_review(path.name, info.duration, "analysis_error")], provenance
-                )
-        write_results(results, out_dir, rules)
-        processing = time.perf_counter() - began
-        record_video_timing(
-            out_dir,
-            path.name,
-            info.duration if info else 0.0,
-            processing,
-            source_video=path.resolve(),
-        )
-        # Placeholder-only videos await corrected input and are retried (R56).
-        if info is not None and not all(is_not_a_round(r.review_reasons) for r in results):
-            mark_processed(info, db)
-        log.info(
-            "%s: processing %.3fs / playback %.3fs",
-            path.name,
-            processing,
-            info.duration if info else 0.0,
-        )
-        # The writer may preserve reviewed/audited rows instead of fresh results.
-        # Match the advisory phase's persisted snapshot before deciding to wait.
-        pending_vlm = vlm is not None and any(
-            needs_vlm(row_to_result(row))
-            for row in read_rounds(out_dir) if row["video"] == path.name
-        )
-        if not pending_vlm:
-            complete(path.name)
-    vlm_wall_s = None
-    if vlm is not None and entries:
-        # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
-        vlm_began = time.perf_counter()
-        del detector
-        _release_gpu_memory()
-        review_results_dir(
-            out_dir,
-            calib_dir=calib_dir,
-            th=th,
-            rules=rules,
-            config=vlm,
-            videos={path.name for path, _ in entries},
-            on_video_complete=complete,
-        )
-        vlm_wall_s = time.perf_counter() - vlm_began
-    if entries:  # nothing judged = no judgment wall-clock to report
-        record_run_timing(
-            out_dir,
-            kind="run",
-            started_at=started_at,
-            wall_s=time.perf_counter() - run_began,
-            vlm_wall_s=vlm_wall_s,
-            videos={path.name: info.duration if info else 0.0 for path, info in entries},
-        )
+        for path, info in entries:
+            began = time.perf_counter()
+            starts[path.name] = began
+            if info is None:
+                results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
+            else:
+                try:
+                    results = judge_video(
+                        info,
+                        calib_dir,
+                        detector,
+                        rules,
+                        th,
+                        out_dir=out_dir,
+                        provenance=provenance,
+                        detection_config=detection_config,
+                    )
+                except Exception:
+                    log.exception("analysis failed for %s; continuing batch", path)
+                    results = _provenance(
+                        [_review(path.name, info.duration, "analysis_error")], provenance
+                    )
+            write_results(results, out_dir, rules)
+            processing = time.perf_counter() - began
+            record_video_timing(
+                out_dir,
+                path.name,
+                info.duration if info else 0.0,
+                processing,
+                source_video=path.resolve(),
+            )
+            # Placeholder-only videos await corrected input and are retried (R56).
+            if info is not None and not all(is_not_a_round(r.review_reasons) for r in results):
+                mark_processed(info, db)
+            log.info(
+                "%s: processing %.3fs / playback %.3fs",
+                path.name,
+                processing,
+                info.duration if info else 0.0,
+            )
+            # The writer may preserve reviewed/audited rows instead of fresh results.
+            # Match the advisory phase's persisted snapshot before deciding to wait.
+            pending_vlm = vlm is not None and any(
+                needs_vlm(row_to_result(row))
+                for row in read_rounds(out_dir) if row["video"] == path.name
+            )
+            if not pending_vlm:
+                complete(path.name)
+        vlm_wall_s = None
+        if vlm is not None and entries:
+            # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
+            vlm_began = time.perf_counter()
+            del detector
+            _release_gpu_memory()
+            review_results_dir(
+                out_dir,
+                calib_dir=calib_dir,
+                th=th,
+                rules=rules,
+                config=vlm,
+                videos={path.name for path, _ in entries},
+                on_video_complete=complete,
+            )
+            vlm_wall_s = time.perf_counter() - vlm_began
+        if vlm is None:
+            del detector  # include owned detector destruction before measuring completion
+        if entries:  # nothing judged = no judgment wall-clock to report
+            wall_s = time.perf_counter() - run_began
+            record_run_timing(
+                out_dir,
+                kind="run",
+                started_at=started_at,
+                wall_s=wall_s,
+                vlm_wall_s=vlm_wall_s,
+                videos={path.name: info.duration if info else 0.0 for path, info in entries},
+            )
+            record_invocation_timing(out_dir, [path.name for path, _ in entries], wall_s)
+
+    except BaseException:
+        # Before scan succeeds the precise scheduled set is unknown. Conservatively
+        # invalidate existing evidence for requested inputs, without creating outputs.
+        if entries is None:
+            invalidate_pipeline_timings(out_dir, [path.name for path in paths])
+        raise
 
 
 def _release_gpu_memory() -> None:
