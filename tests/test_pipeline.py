@@ -183,6 +183,116 @@ def test_post_finish_notes_do_not_trigger_review(
     assert stop_reasons <= set(r.review_reasons)
 
 
+def _gate_round(monkeypatch, tmp_path, th, rules, **change):
+    """Judge one fully confident, known round; ``change`` perturbs one input."""
+    from bxjudge.launch_check import LaunchAnalysis
+    from bxjudge.types import LaunchCheck
+
+    tracks = [
+        make_track(1, "bey", {f: (360, 360) for f in range(120)}),
+        make_track(2, "bey", {f: (900, 360) for f in range(120)}),
+    ]
+    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    launch = LaunchCheck(
+        {"X": "no", "B": "no", **change.get("touch", {})},
+        {"X": True, "B": True},
+        {"X": 5, "B": 6},
+        {"X": "battle_area", "B": "battle_area"},
+        change.get("air", "no"),
+        # Informational evidence notes only (R22).
+        ["shake_by_bey_impact@5", "shake_not_by_launcher_body@6", *change.get("notes", [])],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "analyze_launch",
+        lambda *a: LaunchAnalysis(launch, {1: "X", 2: "B"}, (0, 21), {5, 6}),
+    )
+    monkeypatch.setattr(
+        pipeline, "orbit_direction", lambda *a: change.get("spin_dir", "right")
+    )
+    monkeypatch.setattr(
+        pipeline, "stop_frame", lambda *a: (70, change.get("stop_reason", "still"))
+    )
+    finish = change.get(
+        "finish", FinishResult("spin", "B", 70, change.get("confidence", 0.95), [])
+    )
+    monkeypatch.setattr(pipeline, "detect_finish", lambda *a: finish)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    return r
+
+
+def test_confident_known_round_with_informational_notes_is_not_review(
+    monkeypatch, tmp_path, th, rules
+):
+    r = _gate_round(monkeypatch, tmp_path, th, rules)
+    assert r.finish == "spin" and r.confidence >= th.review_confidence
+    assert "shake_by_bey_impact@5" in r.review_reasons
+    assert "X_stop_still" in r.review_reasons
+    assert r.needs_review is False
+
+
+def test_confidence_at_threshold_is_not_review(monkeypatch, tmp_path, th, rules):
+    r = _gate_round(
+        monkeypatch, tmp_path, th, rules, confidence=th.review_confidence
+    )
+    assert r.needs_review is False
+
+
+def test_after_finish_notes_alone_do_not_trigger_review(
+    monkeypatch, tmp_path, th, rules
+):
+    r = _gate_round(
+        monkeypatch,
+        tmp_path,
+        th,
+        rules,
+        stop_reason="reversed",
+        finish=FinishResult(
+            "xtreme", "B", 30, 0.95, ["after_finish:track_lost@X"]
+        ),
+    )
+    assert {"after_finish:X_stop_reversed", "after_finish:track_lost@X"} <= set(
+        r.review_reasons
+    )
+    assert r.needs_review is False
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param({"confidence": "below"}, id="low-confidence"),
+        pytest.param({"touch": {"X": "unknown"}}, id="touch-unknown"),
+        pytest.param({"air": "maybe"}, id="air-maybe"),
+        pytest.param({"spin_dir": "unknown"}, id="spin-dir-unknown"),
+        pytest.param(
+            {"finish": FinishResult(None, None, None, 0.95, [])}, id="finish-none"
+        ),
+    ],
+)
+def test_binding_review_gate_each_unknown_forces_review(
+    monkeypatch, tmp_path, th, rules, change
+):
+    # Each case alters exactly one input; no uncertainty reason is present, so
+    # only the confidence / unknown / maybe / finish-None gate can flag it.
+    if change.get("confidence") == "below":
+        change = {"confidence": th.review_confidence - 0.01}
+    r = _gate_round(monkeypatch, tmp_path, th, rules, **change)
+    assert not any(
+        note.startswith(("track_evidence", "landing_timing", "id_swap"))
+        for note in r.review_reasons
+    )
+    assert r.needs_review is True
+
+
+def test_uncertainty_note_forces_review_even_when_confident(
+    monkeypatch, tmp_path, th, rules
+):
+    r = _gate_round(
+        monkeypatch, tmp_path, th, rules, notes=["landing_timing_unknown@X:5"]
+    )
+    assert r.needs_review is True
+
+
 def test_missing_side_and_synthetic_always_review(monkeypatch, tmp_path, th, rules):
     calibrated(
         monkeypatch,
@@ -212,12 +322,7 @@ def test_launch_metadata_uses_same_analysis(th):
     assert analysis.window[0] == 0 and analysis.window[1] > 0
 
 
-def test_batch_bad_probe_continues_and_cache_is_local(tmp_path, monkeypatch):
-    folder = tmp_path / "batch"
-    folder.mkdir()
-    make_video(folder / "ok.mp4", seconds=0.1)
-    (folder / "bad.mp4").write_bytes(b"bad")
-    monkeypatch.setattr(pipeline, "load_detector", lambda *a, **k: lambda *a: [])
+def _synthetic_selection(tmp_path):
     selection = tmp_path / "selection.json"
     weights = tmp_path / "model.pt"
     weights.touch()
@@ -231,9 +336,23 @@ def test_batch_bad_probe_continues_and_cache_is_local(tmp_path, monkeypatch):
             }
         )
     )
+    return selection
+
+
+def test_batch_placeholder_only_videos_continue_and_are_never_cached(
+    tmp_path, monkeypatch
+):
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "ok.mp4", seconds=0.1)
+    (folder / "bad.mp4").write_bytes(b"bad")
+    calib = tmp_path / "calib"
+    calib.mkdir()  # exists but holds no matching calibration -> recalibrate (R56)
+    monkeypatch.setattr(pipeline, "load_detector", lambda *a, **k: lambda *a: [])
+    selection = _synthetic_selection(tmp_path)
     for name in ("out1", "out2"):
         out = tmp_path / name
-        pipeline.run_batch(folder, tmp_path / "no-calib", out, selection=selection)
+        pipeline.run_batch(folder, calib, out, selection=selection)
         rows = json.loads((out / "rounds.json").read_text())
         assert {r["video"] for r in rows} == {"bad.mp4", "ok.mp4"}
         assert (
@@ -241,12 +360,96 @@ def test_batch_bad_probe_continues_and_cache_is_local(tmp_path, monkeypatch):
             == 1280
         )
         assert rows[0]["detector_provenance"]["runtime"]["confidence"] == 0.3
-        assert (
-            "decode_error"
-            in next(r for r in rows if r["video"] == "bad.mp4")["review_reasons"]
-        )
+        reasons = {r["video"]: r["review_reasons"] for r in rows}
+        assert "decode_error" in reasons["bad.mp4"]
+        assert "recalibrate" in reasons["ok.mp4"]
         assert "source_video" in json.loads((out / "videos.json").read_text())["ok.mp4"]
-        assert (out / "processed_videos.json").exists()
+        db = out / "processed_videos.json"
+        assert not db.exists() or json.loads(db.read_text()) == {}
+
+
+@pytest.mark.parametrize("reason", ["recalibrate", "no_round", "analysis_error"])
+def test_placeholder_only_video_is_retried_until_real_rounds(
+    tmp_path, monkeypatch, rules, th, reason
+):
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+    out = tmp_path / "out"
+    calls = []
+    outcomes = [[pipeline._review("a.mp4", 0.1, reason)], [rr("spin", "X", video="a.mp4")]]
+
+    def judge(*args, **kwargs):
+        calls.append(1)
+        result = outcomes[min(len(calls), 2) - 1]
+        if reason == "analysis_error" and len(calls) == 1:
+            raise RuntimeError("transient CUDA OOM")
+        return result
+
+    monkeypatch.setattr(pipeline, "judge_video", judge)
+
+    def run():
+        pipeline.run_batch(
+            tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+        )
+
+    run()  # placeholder only: nothing recorded
+    assert json.loads((out / "rounds.json").read_text())[0]["review_reasons"] == [reason]
+    run()  # corrected rerun re-analyses and now yields a real round
+    assert len(calls) == 2
+    assert json.loads((out / "rounds.json").read_text())[0]["finish"] == "spin"
+    run()  # real rounds are recorded: the video is skipped from now on
+    assert len(calls) == 2
+
+
+def test_mixed_real_and_diagnostic_rows_video_is_cached(
+    tmp_path, monkeypatch, rules, th
+):
+    # A mixed result (real round plus a diagnostic row) is not placeholder-only.
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+    diagnostic = pipeline._review("a.mp4", 0.1, "no_round")
+    diagnostic.round = 2
+    monkeypatch.setattr(
+        pipeline,
+        "judge_video",
+        lambda *a, **k: [rr("spin", "X", video="a.mp4"), diagnostic],
+    )
+    out = tmp_path / "out"
+    pipeline.run_batch(
+        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+    )
+    assert "a.mp4" in (out / "processed_videos.json").read_text()
+
+
+def test_missing_calibration_directory_fails_before_any_output(tmp_path, monkeypatch):
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+
+    def forbidden(*a, **k):
+        pytest.fail("global calibration error reached model/analysis")
+
+    monkeypatch.setattr(pipeline, "load_detector", forbidden)
+    monkeypatch.setattr(pipeline, "judge_video", forbidden)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="calib"):
+        pipeline.run_batch(tmp_path, tmp_path / "calbi-typo", out)
+    assert not out.exists()
+    calib_file = tmp_path / "calib.json"
+    calib_file.write_text("{}")
+    with pytest.raises(ValueError, match="calib"):
+        pipeline.run_batch(tmp_path, calib_file, out)
+    assert not out.exists()
+
+
+def test_run_cli_missing_calibration_is_error_line(tmp_path, capsys):
+    from bxjudge.cli import main
+
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+    out = tmp_path / "out"
+    code = main(
+        ["run", str(tmp_path), "--calib", str(tmp_path / "nope"), "--out", str(out)]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "nope" in err
+    assert not out.exists()
 
 
 def test_invalid_global_selection_fails_without_output(tmp_path):

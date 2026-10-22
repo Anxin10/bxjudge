@@ -27,6 +27,11 @@ _PENALTY_POINTS = 1  # "1pt" in opponent_1pt_on_2nd_miss
 _NOT_A_ROUND = frozenset({"recalibrate", "no_round", "decode_error", "analysis_error"})
 
 
+def is_not_a_round(review_reasons: list[str]) -> bool:
+    """True when ``review_reasons`` mark a diagnostic placeholder, not a real round."""
+    return bool(_NOT_A_ROUND.intersection(review_reasons))
+
+
 @dataclass
 class Rules:
     rules_version: str
@@ -175,7 +180,7 @@ def group_matches(results: list[RoundResult], rules: Rules) -> list[Match]:
     are skipped. A match ends when a side reaches ``win_points``; the next round opens
     a new match with fresh miss counters.
     """
-    real = [r for r in results if not _NOT_A_ROUND.intersection(r.review_reasons)]
+    real = [r for r in results if not is_not_a_round(r.review_reasons)]
     real.sort(key=lambda r: (r.video, r.t_launch, r.round))
 
     matches: list[Match] = []

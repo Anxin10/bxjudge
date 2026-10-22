@@ -31,7 +31,7 @@ from .finish import (
 from .launch_check import analyze_launch
 from .manifest import VideoInfo, mark_processed, scan
 from .output import record_video_timing, write_results, write_trajectory
-from .rules import Rules, finish_points, load_rules
+from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
@@ -381,6 +381,10 @@ def run_batch(
     ]
     if duplicates:
         raise ValueError(f"duplicate video basename/artifact(s): {duplicates}")
+    # A wrong calibration directory is global, not a per-video "recalibrate" (R56).
+    calib_dir = Path(calib_dir).expanduser()
+    if not calib_dir.is_dir():
+        raise ValueError(f"{calib_dir}: expected calibration directory (--calib)")
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
@@ -446,7 +450,8 @@ def run_batch(
             processing,
             source_video=path.resolve(),
         )
-        if info is not None:
+        # Placeholder-only videos await corrected input and are retried (R56).
+        if info is not None and not all(is_not_a_round(r.review_reasons) for r in results):
             mark_processed(info, db)
         log.info(
             "%s: processing %.3fs / playback %.3fs",
