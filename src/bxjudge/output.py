@@ -13,7 +13,7 @@ import numpy as np
 
 from .calibration import ZONES
 from .geometry import zone_of
-from .rules import Rules, group_matches
+from .rules import Match, Rules, group_matches
 from .types import Calibration, LaunchCheck, RoundResult, Side, Track
 
 ROUND_FIELDS = [
@@ -56,6 +56,11 @@ def _read_json(path: Path, default):
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
 
+def read_rounds(out_dir: Path) -> list[dict]:
+    """Authoritative flat rows of ``out_dir/rounds.json`` (empty when absent)."""
+    return _read_json(Path(out_dir) / "rounds.json", [])
+
+
 def effective(row: dict) -> dict:
     """Return corrected flat fields without mutating the authoritative prediction."""
     return {**row, **(row.get("reviewer_fix") or {})}
@@ -76,6 +81,8 @@ def _result_row(r: RoundResult) -> dict:
         row[f"{prefix}_land_zone"] = launch["landing_zone"][side] if launch else None
         row[f"{prefix}_spin_dir"] = spin[side] if spin else "unknown"
     row["air_collision"] = launch["air_collision"] if launch else "maybe"
+    if not row["match_start"]:
+        del row["match_start"]  # sparse: absent means automatic grouping (R52)
     return row
 
 
@@ -111,8 +118,12 @@ def row_to_result(row: dict) -> RoundResult:
             "detector_provenance",
         )
     }
+    match_start = row.get("match_start", False)
+    if type(match_start) is not bool:
+        raise ValueError(f"match_start must be a bool, got {match_start!r}")
     return RoundResult(
         **values,
+        match_start=match_start,
         launch=launch,
         spin_dir={s: row[f"{s.lower()}_spin_dir"] for s in ("X", "B")}
         if row["spin_dir_present"]
@@ -147,7 +158,7 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
     affected = {r.video for r in new}
     rows = {}
     seen = set()
-    for row in _read_json(out_dir / "rounds.json", []):
+    for row in read_rounds(out_dir):
         key = (row["video"], row["round"])
         if key in seen:
             raise ValueError(f"duplicate persisted result key: {key}")
@@ -156,10 +167,25 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
             rows[key] = row
     for key, row in incoming.items():
         rows.setdefault(key, row)
-    merged = sorted(rows.values(), key=lambda r: (r["video"], r["round"]))
-    _write_json(out_dir / "rounds.json", merged)
-    _csv(out_dir / "rounds.csv", ROUND_FIELDS, merged)
-    matches = group_matches([row_to_result(effective(row)) for row in merged], rules)
+    save_rounds(list(rows.values()), out_dir, rules)
+
+
+def matches_for(rows: list[dict], rules: Rules) -> list[Match]:
+    """Matches from the effective (reviewer-corrected) flat rows."""
+    return group_matches([row_to_result(effective(row)) for row in rows], rules)
+
+
+def save_rounds(rows: list[dict], out_dir: Path, rules: Rules) -> None:
+    """Persist the COMPLETE flat row set and rebuild ``rounds.csv`` and ``matches.csv``.
+
+    The single export path shared by the judge writer and human corrections.
+    """
+    out_dir = Path(out_dir)
+    keys = [(row["video"], row["round"]) for row in rows]
+    if len(set(keys)) != len(keys):
+        dup = next(k for k in keys if keys.count(k) > 1)
+        raise ValueError(f"duplicate result key: {dup}")
+    merged = sorted(rows, key=lambda r: (r["video"], r["round"]))
     match_rows = [
         {
             "match": i,
@@ -177,8 +203,10 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
                 for r, outcome in m.rounds
             ],
         }
-        for i, m in enumerate(matches, 1)
+        for i, m in enumerate(matches_for(merged, rules), 1)
     ]
+    _write_json(out_dir / "rounds.json", merged)
+    _csv(out_dir / "rounds.csv", ROUND_FIELDS, merged)
     _csv(
         out_dir / "matches.csv",
         ["match", "x_score", "b_score", "winner", "rounds"],
@@ -215,6 +243,12 @@ def record_vlm_timing(out_dir: Path, video: str, vlm_s: float) -> None:
     _write_json(path, rows)
 
 
+def trajectory_png(out_dir: Path, video: str, round: int) -> Path:
+    """Where ``write_trajectory`` puts the round's trajectory image."""
+    stem = f"{Path(video).with_suffix('').as_posix().replace('/', '__')}_r{round}"
+    return Path(out_dir) / "trajectories" / f"{stem}.png"
+
+
 def write_trajectory(
     out_dir: Path,
     r: RoundResult,
@@ -226,10 +260,9 @@ def write_trajectory(
     *,
     unassigned: list[Track] | None = None,
 ) -> tuple[Path, Path]:
-    folder = Path(out_dir) / "trajectories"
-    folder.mkdir(parents=True, exist_ok=True)
-    stem = f"{Path(r.video).with_suffix('').as_posix().replace('/', '__')}_r{r.round}"
-    csv_p, png_p = folder / f"{stem}.csv", folder / f"{stem}.png"
+    png_p = trajectory_png(out_dir, r.video, r.round)
+    csv_p = png_p.with_suffix(".csv")
+    png_p.parent.mkdir(parents=True, exist_ok=True)
     image = cv2.imread(c.ref_frame)
     if image is None:
         raise FileNotFoundError(c.ref_frame)

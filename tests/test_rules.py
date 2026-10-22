@@ -218,3 +218,56 @@ def test_non_mapping_rules_fail(tmp_path):
     p.write_text("- 1\n- 2\n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_rules(p)
+
+
+# ---- R52: manual match boundary ---------------------------------------------
+
+
+def _start(r):
+    r.match_start = True
+    return r
+
+
+def test_manual_boundary_closes_unfinished_match(rules):
+    rs = [rr("spin", "X", round=1), rr("spin", "X", round=2),
+          _start(rr("spin", "B", round=3)), rr("over", "B", round=4)]
+    ms = group_matches(rs, rules)
+    assert [m.score for m in ms] == [{"X": 2, "B": 0}, {"X": 0, "B": 3}]
+    assert ms[0].winner is None and [r.round for r, _ in ms[1].rounds] == [3, 4]
+
+
+def test_removing_manual_boundary_restores_automatic_grouping(rules):
+    rs = [rr("spin", "X", round=1), rr("spin", "X", round=2),
+          rr("spin", "B", round=3), rr("over", "B", round=4)]
+    (m,) = group_matches(rs, rules)
+    assert m.score == {"X": 2, "B": 3}
+
+
+def test_win_points_still_ends_match_before_a_manual_boundary(rules):
+    # X reaches 4 in round 2; a boundary on round 3 changes nothing, and a boundary
+    # can never merge round 3 back into the completed match.
+    rs = [rr("xtreme", "X", round=1), rr("spin", "X", round=2),
+          _start(rr("spin", "B", round=3)), rr("spin", "B", round=4)]
+    ms = group_matches(rs, rules)
+    assert [m.score for m in ms] == [{"X": 4, "B": 0}, {"X": 0, "B": 2}]
+    assert ms[0].winner == "X"
+    rs[2].match_start = False
+    assert [m.score for m in group_matches(rs, rules)] == [{"X": 4, "B": 0}, {"X": 0, "B": 2}]
+
+
+def test_manual_boundary_resets_both_miss_counters(rules):
+    rules.launch_check["repeat_miss_penalty"] = "opponent_1pt_on_2nd_miss"
+    miss_x = {"touch": {"X": "yes"}}
+    miss_b = {"touch": {"B": "yes"}}
+    rs = [rr("spin", "B", **miss_x, round=1), rr("spin", "X", **miss_b, round=2),
+          _start(rr("spin", "B", **miss_x, round=3)), rr("spin", "X", **miss_b, round=4)]
+    ms = group_matches(rs, rules)
+    assert len(ms) == 2
+    # without the reset both second misses would award a penalty point
+    assert [o.action for _, o in ms[1].rounds] == ["redo", "redo"]
+    assert ms[1].score == {"X": 0, "B": 0}
+
+
+def test_manual_boundary_on_first_round_is_harmless(rules):
+    (m,) = group_matches([_start(rr("spin", "X", round=1)), rr("spin", "X", round=2)], rules)
+    assert m.score == {"X": 2, "B": 0}

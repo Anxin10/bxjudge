@@ -541,7 +541,7 @@ def _label(image: np.ndarray, text: str, point, color) -> None:
     cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
 
-def _overlay(frame: np.ndarray, c: Calibration, t: float) -> np.ndarray:
+def overlay_zones(frame: np.ndarray, c: Calibration, t: float) -> np.ndarray:
     image = np.array(frame, dtype=np.uint8, copy=True)
     for name, _, _ in ZONES:
         pts = np.rint(getattr(c, name)).astype(np.int32)
@@ -551,7 +551,7 @@ def _overlay(frame: np.ndarray, c: Calibration, t: float) -> np.ndarray:
     return image
 
 
-def _select_calibration(source: Path, fps: float, calib_dir: Path, th: Thresholds) -> Calibration:
+def select_calibration(source: Path, fps: float, calib_dir: Path, th: Thresholds) -> Calibration:
     """The same calibration choice as the judge: first-second frame at inference size."""
     last = None
     with closing(iter_frames(source, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel)) as frames:
@@ -586,7 +586,7 @@ def event_frames(
     if calibrations is not None and source in calibrations:
         c = calibrations[source]
     else:
-        c = _select_calibration(source, info.fps, calib_dir, th)
+        c = select_calibration(source, info.fps, calib_dir, th)
         if calibrations is not None:
             calibrations[source] = c
     lo = max(0.0, t - config.event_window_s)
@@ -611,13 +611,13 @@ def event_frames(
         raise VlmFramesError(f"{source}: no frames decoded in [{lo:.2f}, {hi:.2f}] s")
     first = next(iter(picked.values()))
     scaled = scale_calibration(c, (first.shape[1], first.shape[0]))
-    return [_overlay(frame, scaled, idx / info.fps) for idx, frame in sorted(picked.items())]
+    return [overlay_zones(frame, scaled, idx / info.fps) for idx, frame in sorted(picked.items())]
 
 
 # --------------------------------------------------------------------------- results directory
 
 
-def _source(entry) -> Path | str:
+def recorded_source(entry) -> Path | str:
     """Absolute recorded source path, or the reason it cannot be used."""
     value = entry.get("source_video") if isinstance(entry, dict) else None
     if not value:
@@ -678,7 +678,7 @@ def review_results_dir(
             if (videos is not None and video not in videos) or not any(map(needs_vlm, results)):
                 continue
             began = time.perf_counter()
-            source = _source(timing.get(video))
+            source = recorded_source(timing.get(video))
 
             def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
                 if isinstance(source, str):

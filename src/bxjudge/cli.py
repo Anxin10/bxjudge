@@ -201,8 +201,46 @@ def _add_vlm(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_vlm)
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    import os
+    import subprocess
+    import sys
+
+    results = Path(args.results).expanduser().resolve()
+    if not (results / "rounds.json").is_file():
+        print(f"error: {results} has no rounds.json (run `bxjudge run` first)", file=sys.stderr)
+        return 2
+    app = Path(__file__).with_name("review_app.py")
+    argv = [
+        sys.executable, "-m", "streamlit", "run", str(app),
+        "--server.address", "127.0.0.1",  # loopback only: never reachable from the LAN
+        "--server.port", str(args.port),
+        "--server.headless", "true",
+        "--browser.gatherUsageStats", "false",
+        "--",
+        str(results),
+        "--calib", str(Path(args.calib).expanduser().resolve()),
+        "--rules", str(Path(args.rules).expanduser().resolve()),
+        "--thresholds", str(Path(args.thresholds).expanduser().resolve()),
+    ]
+    env = {**os.environ, "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false"}
+    print(f"review UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)", file=sys.stderr)
+    return subprocess.call(argv, env=env)
+
+
+def _add_review(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("review", help="local web UI to review and correct judged rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--port", type=int, default=8501, help="loopback port (default 8501)")
+    p.add_argument("--calib", default="calib",
+                   help="calibration directory used by the run (for the zone overlay)")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.set_defaults(func=_cmd_review)
+
+
 _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
-               _add_vlm]
+               _add_vlm, _add_review]
 
 
 def build_parser() -> argparse.ArgumentParser:

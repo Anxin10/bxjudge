@@ -105,3 +105,5 @@ class RoundResult:
 
     motion_evidence: dict | None = None
     detector_provenance: dict | None = None
+    # Human-set "this round starts a new match" boundary (R52); False = automatic.
+    match_start: bool = False

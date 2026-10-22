@@ -197,3 +197,40 @@ def test_vlm_timing_is_separate_and_accumulates(tmp_path):
     # A fresh core analysis replaces the rounds, so earlier VLM time no longer applies.
     output.record_video_timing(tmp_path, "a.mp4", 10, 3)
     assert "vlm_s" not in json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+
+
+def test_match_start_is_sparse_typed_metadata(tmp_path, rules):
+    import pytest
+
+    output.write_results([rr("spin", "X")], tmp_path, rules)
+    row = json.loads((tmp_path / "rounds.json").read_text())[0]
+    assert "match_start" not in row  # absent = automatic grouping
+    assert output.row_to_result(row).match_start is False
+    row["reviewer_fix"] = {"match_start": True}
+    assert output.row_to_result(output.effective(row)).match_start is True
+    row["reviewer_fix"] = {"match_start": "yes"}
+    with pytest.raises(ValueError, match="match_start"):
+        output.row_to_result(output.effective(row))
+
+
+def test_read_rounds_and_save_rounds_rebuild_exports(tmp_path, rules):
+    import pytest
+
+    assert output.read_rounds(tmp_path) == []
+    output.write_results([rr("spin", "X"), rr("spin", "B", video="v2.mp4")], tmp_path, rules)
+    rows = output.read_rounds(tmp_path)
+    rows[1]["reviewer_fix"] = {"winner": "X", "points": 1}
+    rows[1]["reviewed"] = True
+    output.save_rounds(rows, tmp_path, rules)
+    matches = list(csv.DictReader((tmp_path / "matches.csv").open()))
+    assert matches[0]["x_score"] == "2"
+    assert output.read_rounds(tmp_path) == rows
+    with pytest.raises(ValueError, match="duplicate"):
+        output.save_rounds([rows[0], rows[0]], tmp_path, rules)
+
+
+def test_trajectory_png_path_matches_writer(tmp_path):
+    r = rr("spin", "X", video="nested/a.mp4", round=2)
+    assert output.trajectory_png(tmp_path, r.video, r.round) == (
+        tmp_path / "trajectories" / "nested__a_r2.png"
+    )

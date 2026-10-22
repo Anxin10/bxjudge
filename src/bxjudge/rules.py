@@ -178,7 +178,9 @@ def group_matches(results: list[RoundResult], rules: Rules) -> list[Match]:
     video (the sort is stable, so equal keys keep input order). Rounds whose
     ``review_reasons`` mark them as non-rounds (recalibrate / no_round / decode_error)
     are skipped. A match ends when a side reaches ``win_points``; the next round opens
-    a new match with fresh miss counters.
+    a new match with fresh miss counters. A reviewer-set ``match_start`` (R52) closes
+    an unfinished match early so that round opens a new one; it cannot merge rounds
+    across a match that already ended by reaching ``win_points``.
     """
     real = [r for r in results if not is_not_a_round(r.review_reasons)]
     real.sort(key=lambda r: (r.video, r.t_launch, r.round))
@@ -187,6 +189,8 @@ def group_matches(results: list[RoundResult], rules: Rules) -> list[Match]:
     cur: Match | None = None
     misses: dict[Side, int] = {}
     for r in real:
+        if r.match_start:
+            cur = None
         if cur is None:
             cur = Match(rounds=[], score={"X": 0, "B": 0}, winner=None)
             matches.append(cur)
