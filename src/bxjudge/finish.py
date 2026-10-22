@@ -43,6 +43,7 @@ class _Note:
     side: Side | None
     blocks: bool             # a possible earlier finish at an unknown time
     owner: Side | None = None  # transit into this side's own pocket entry (R55a)
+    deferrable: bool = True  # False: contradicts a pocket finish, never a note (R58)
 
 
 def _settled_frame(result: FinishResult, th: Thresholds) -> int | None:
@@ -241,9 +242,12 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
     """Earliest evidenced finish; stop reasons are propagated by Task13 (R21).
 
     Evidence is judged up to the decisive event (R55). A whole-box pocket run
-    is an entry once it is the final observation or lasts ``pocket_confirm_s``;
-    a shorter run followed by a battle-floor return is cancelled, since this
-    API has no crop rates to rule out a rotating return (R25). Partial or
+    is an entry when it is the final observation, or lasts ``pocket_confirm_s``
+    and is not followed by a return to the battle floor. This API has no crop
+    rates, so any floor return counts as a possibly rotating return and
+    cancels the run (R25/R58), unless the top's stop was observed inside the
+    pocket (or immediately on the return); ``exit_returned`` always remains a
+    review trigger. Persistence alone only decides disappearance. Partial or
     offscreen frames leading into that entry belong to it: they bound its
     earliest time against the other side instead of blocking it. Unexplained
     earlier track loss or position uncertainty cannot be hidden by a later
@@ -287,7 +291,22 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
                 runs[-1][1] = f
             else:
                 runs.append([f, f, whole[f]])
-        entry = next((r for r in runs if r[1] == frames[-1] or r[1] - r[0] + 1 >= confirm), None)
+        stop = stops.get(side)
+
+        def is_entry(i: int, frames=frames, runs=runs, stop=stop, side=side) -> bool:
+            start, end, _ = runs[i]
+            if end == frames[-1]:
+                return True
+            if end - start + 1 < confirm:
+                return False
+            # R58: the first battle-floor centre before the next pocket run is
+            # a possibly rotating return unless the top was seen stopped first.
+            following = runs[i + 1][0] if i + 1 < len(runs) else math.inf
+            back = next((f for f in frames if end < f < following
+                         and zone_of(centers[side][f], c) == 'battle_area'), None)
+            return back is None or (stop is not None and start <= stop <= back + 1)
+
+        entry = next((r for i, r in enumerate(runs) if is_entry(i)), None)
         # Chronological uncertainty since the last whole-body battle-floor frame.
         # A later pocket observation does not prove when an earlier partial,
         # offscreen or transient exit occurred, unless that run of frames leads
@@ -303,7 +322,7 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
             if whole[f] is not None:
                 entered = True
             elif entered and zone_of(centers[side][f], c) == 'battle_area':
-                notes.append(_Note(f, f'exit_returned@{side}', side, False))
+                notes.append(_Note(f, f'exit_returned@{side}', side, False, deferrable=False))
                 entered = False
             if entry is not None and entry[0] <= f <= entry[1]:
                 continue
@@ -379,7 +398,8 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
             result = FinishResult(first.finish, first.loser, first.frame, first.confidence, [])
             result.reasons = [
                 AFTER_FINISH_PREFIX + n.reason
-                if n.frame is not None and is_after_finish(result, n.side, n.frame, th) else n.reason
+                if n.deferrable and n.frame is not None
+                and is_after_finish(result, n.side, n.frame, th) else n.reason
                 for n in notes if n.owner != first.loser]
     result.reasons = list(dict.fromkeys(result.reasons))
     if any(r.startswith('track_evidence_gap@') for r in result.reasons):

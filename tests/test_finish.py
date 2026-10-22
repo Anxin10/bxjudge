@@ -1,3 +1,4 @@
+import math
 from dataclasses import asdict, replace
 
 import numpy as np
@@ -468,31 +469,86 @@ def test_post_finish_gap_and_contact_do_not_lower_confidence(th):
                                    AFTER_FINISH_PREFIX + 'id_swap_risk'}
 
 
-@pytest.mark.parametrize('lifted_box', [(310, 200, 330, 220), (310, -60, 330, -40)])
-def test_non_rotating_removal_after_confirmed_pocket_finish_keeps_it(lifted_box, th):
+def test_lift_out_of_frame_after_confirmed_pocket_finish_keeps_it(th):
+    # Disappearance after a confirmed stay is a non-rotating removal (R55c/R58).
     bey, parts, stops, c = scene(b_path_into='xtreme')
     for d in bey['B'].dets:
         if d.frame >= 330:
-            d.box = lifted_box
+            d.box = (310, -60, 330, -40)
     result = detect_finish(bey, parts, stops, c, th, 60)
     assert (result.finish, result.loser, result.frame) == ('xtreme', 'B', 100)
     assert _triggers(result) == []
     assert result.confidence == pytest.approx(0.9)
 
 
-def test_return_before_pocket_confirmation_still_cancels(th):
-    confirm = round(th.pocket_confirm_s * 60)
-    for stay, expected in ((confirm - 1, None), (confirm, 'xtreme')):
-        bey, parts, stops, c = scene(b_path_into='xtreme')
-        bey['B'].dets = [d for d in bey['B'].dets if d.frame < 100 + stay]
-        bey['B'].dets.extend(make_track(2, 'bey', {f: (330, 200)
-                                                for f in range(100 + stay, 340)}).dets)
-        result = detect_finish(bey, parts, stops, c, th, 60)
-        assert result.finish == expected
-        if expected is None:
-            assert 'exit_returned@B' in result.reasons
+def _xtreme_stay_then_floor(fps, stay, floor):
+    """B wholly in xtreme from E for ``stay`` frames, then back on the floor."""
+    n, enter = round(340 * fps / 60), round(100 * fps / 60)
+    b = {}
+    for f in range(n):
+        if f < enter:
+            b[f] = (450, 180)
+        elif f < enter + stay:
+            b[f] = (320, 320)
         else:
-            assert result.loser == 'B' and _triggers(result) == []
+            b[f] = floor(f - enter - stay)
+    bey = {'X': make_track(1, 'bey', {f: (180, 180) for f in range(n)}),
+           'B': make_track(2, 'bey', b)}
+    return bey, enter
+
+
+def _orbit(k):
+    a = math.radians(4 * k)
+    return (380 + 60 * math.cos(a), 170 + 50 * math.sin(a))
+
+
+@pytest.mark.parametrize('fps', [60, 30])
+@pytest.mark.parametrize('factor', [1, 2])
+def test_rotating_return_after_confirmed_pocket_stay_cancels(fps, factor, th):
+    # R58: a return to the battle floor after any pocket entry cancels the
+    # pocket finish; a later stop decides instead, and the return is reviewed.
+    confirm = round(th.pocket_confirm_s * fps)
+    bey, _ = _xtreme_stay_then_floor(fps, factor * confirm, _orbit)
+    x_stop = round(250 * fps / 60)
+    result = detect_finish(bey, [], {'X': x_stop, 'B': None}, make_calibration(), th, fps)
+    assert (result.finish, result.loser, result.frame) == ('spin', 'X', x_stop)
+    assert 'exit_returned@B' in _triggers(result)
+
+
+@pytest.mark.parametrize('stay_offset', [-1, 0, 30])
+def test_stationary_floor_return_without_stop_evidence_cancels(stay_offset, th):
+    # Rotation is unobservable here, so a floor return is treated as rotating.
+    confirm = round(th.pocket_confirm_s * 60)
+    bey, _ = _xtreme_stay_then_floor(60, confirm + stay_offset, lambda k: (330, 200))
+    result = detect_finish(bey, [], {'X': None, 'B': None}, make_calibration(), th, 60)
+    assert result.finish is None and result.loser is None
+    assert 'exit_returned@B' in result.reasons
+
+
+def test_lift_to_floor_after_observed_stop_in_pocket_keeps_finish_for_review(th):
+    # A top observed stopped in the pocket cannot return rotating; the lift
+    # onto the floor keeps the finish but exit_returned still triggers review.
+    confirm = round(th.pocket_confirm_s * 60)
+    stay = confirm + th.still_frames
+    bey, enter = _xtreme_stay_then_floor(60, stay, lambda k: (330, 200))
+    stops = {'X': None, 'B': enter + 1}
+    result = detect_finish(bey, [], stops, make_calibration(), th, 60)
+    assert (result.finish, result.loser, result.frame) == ('xtreme', 'B', enter)
+    assert 'exit_returned@B' in _triggers(result)
+    # A stop observed only after the top is back on the floor proves nothing.
+    late = {'X': None, 'B': enter + stay + 5}
+    result = detect_finish(bey, [], late, make_calibration(), th, 60)
+    assert result.finish != 'xtreme' and 'exit_returned@B' in result.reasons
+
+
+def test_exit_returned_is_never_an_after_finish_note(th):
+    bey, parts, stops, c = scene(x_path_into='over_left', x_enter_at=100)
+    for d in bey['B'].dets:
+        if 200 <= d.frame < 210:
+            d.box = (310, 310, 330, 330)  # winner bounces through xtreme later
+    result = detect_finish(bey, parts, stops, c, th, 60)
+    assert (result.finish, result.loser, result.frame) == ('over', 'X', 100)
+    assert result.reasons == ['exit_returned@B']
 
 
 @pytest.mark.parametrize('first', [79, 78])
