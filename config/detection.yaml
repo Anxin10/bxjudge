@@ -1,0 +1,58 @@
+# Both adapters accept decoder BGR uint8 HWC frames.
+confidence: 0.3
+evaluation_confidence: 0.001
+device: cuda:0
+selection_tie_ap: 0.01  # AP is on [0, 1]; one percentage point.
+latency_warmup_frames: 2
+tracking:
+  lost_track_buffer: 30
+  track_activation_threshold: 0.3
+  minimum_consecutive_frames: 1
+  minimum_iou_threshold: 0.1
+  high_conf_det_threshold: 0.3
+training:
+  epochs: 100
+  rfdetr:
+    model:
+      resolution: 384
+    fit:
+      batch_size: 2
+      grad_accum_steps: 1
+      num_workers: 2
+      amp_dtype: bf16
+      multi_scale: false
+      expanded_scales: false
+      scale_jitter: false
+      use_ema: true
+      tensorboard: false
+      wandb: false
+      mlflow: false
+      clearml: false
+      run_test: false
+      log_per_class_metrics: true
+      save_dataset_grids: false
+  yolo26:
+    model: runs/pretrained/yolo26n.pt
+    fit:
+      imgsz: 384
+      batch: 2
+      workers: 2
+      amp: true
+      seed: 42
+      deterministic: true
+      plots: false
+      save: true
+      val: true
+      pretrained: true
+      patience: 100
+      mosaic: 0.0
+      close_mosaic: 0
+      mixup: 0.0
+      fliplr: 0.0
+      hsv_h: 0.0
+      hsv_s: 0.0
+      hsv_v: 0.0
+      translate: 0.0
+      scale: 0.0
+      auto_augment: null
+      erasing: 0.0

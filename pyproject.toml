@@ -9,6 +9,11 @@ dependencies = [
     "numpy",
     "opencv-python",
     "pyyaml",
+    "supervision>=0.31.1",
+    "rfdetr[train]>=1.11.2",
+    "ultralytics>=8.4.183",
+    "trackers>=2.6.1",
+    "pycocotools>=2.0.11",
 ]
 
 [project.scripts]
@@ -28,6 +33,11 @@ packages = ["src/bxjudge"]
 
 [tool.uv]
 default-groups = ["dev"]
+# roboflow's headless wheel overwrites cv2 from the existing desktop wheel.
+# Keep one cv2 provider, including Task 4's interactive calibration GUI.
+exclude-dependencies = [
+    { package = { name = "roboflow" }, dependencies = ["opencv-python-headless"] },
+]
 
 # PyTorch stable 2.14.x, CUDA 13.2 wheels (the only CUDA 13.x option on
 # pytorch.org "Get Started" for Linux/Pip). Wheels bundle CUDA runtime.

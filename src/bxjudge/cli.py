@@ -71,7 +71,50 @@ def _add_scan(sub: argparse._SubParsersAction) -> None:
 
 from bxjudge.labeling.cli import add_label
 
-_REGISTRARS = [_add_calibrate, _add_scan, add_label]
+
+def _cmd_train(args: argparse.Namespace) -> int:
+    from bxjudge.train import train
+
+    print(train(args.kind, Path(args.dataset), Path(args.out), args.epochs,
+                config=args.config))
+    return 0
+
+
+def _add_train(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("train", help="train one detector on the reviewed COCO dataset")
+    p.add_argument("--kind", required=True, choices=("rfdetr", "yolo26"))
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--out", required=True, help="new isolated run directory")
+    p.add_argument("--epochs", type=int, help="defaults to config training.epochs")
+    p.add_argument("--config", default="config/detection.yaml")
+    p.set_defaults(func=_cmd_train)
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    import json
+
+    from bxjudge.train import compare
+
+    print(json.dumps(compare(
+        {"rfdetr": Path(args.rfdetr), "yolo26": Path(args.yolo26)},
+        Path(args.dataset), output=Path(args.output),
+        selection_out=Path(args.selection_out), config=args.config), indent=2))
+    return 0
+
+
+def _add_compare(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("compare", help="compare both detectors using common COCO validation")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--rfdetr", required=True, help="trained RF-DETR Nano checkpoint")
+    p.add_argument("--yolo26", required=True, help="trained YOLO26 Nano checkpoint")
+    p.add_argument("--output", default="runs/compare.json")
+    p.add_argument("--selection-out", default="weights/selected.json",
+                   help="selection manifest (synthetic datasets require an isolated path)")
+    p.add_argument("--config", default="config/detection.yaml")
+    p.set_defaults(func=_cmd_compare)
+
+
+_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare]
 
 
 def build_parser() -> argparse.ArgumentParser:
