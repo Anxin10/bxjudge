@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from .config import config_loader
 from .output import effective, matches_for, row_to_result
 from .rules import SIDES, Rules, group_matches, is_not_a_round
 from .vlm import UNAVAILABLE_PREFIX
@@ -78,6 +79,7 @@ class EvalConfig:
     shake_overlap_percentile: float
     spin_min_samples: int
     audit_confidence_level: float
+    audit_min_n: int  # R64: smallest fully reviewed audit sample that can PASS
 
 
 def _number(v) -> bool:
@@ -90,6 +92,7 @@ def _keys(path, where, raw, expected) -> None:
         raise ValueError(f"{path}: {where} must have exactly {sorted(expected)}, got {got!r}")
 
 
+@config_loader
 def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
     """Load evaluation policy; unknown/missing keys or invalid values raise ``ValueError``."""
     with open(path, encoding="utf-8") as f:
@@ -97,10 +100,13 @@ def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
     _keys(path, "top level", raw, (
         "targets", "speed_max_video_s", "latency_percentile", "truth_t_launch_tolerance_s",
         "shake_overlap_percentile", "spin_min_samples", "audit_confidence_level",
+        "audit_min_n",
     ))
     level = raw["audit_confidence_level"]
     if not _number(level) or not 0 < level < 1:
         raise ValueError(f"{path}: audit_confidence_level must be in (0, 1)")
+    if type(raw["audit_min_n"]) is not int or raw["audit_min_n"] < 1:
+        raise ValueError(f"{path}: audit_min_n must be a positive int, got {raw['audit_min_n']!r}")
     _keys(path, "targets", raw["targets"], METRIC_NAMES)
     targets = {}
     for name in METRIC_NAMES:
@@ -127,6 +133,7 @@ def load_eval_config(path: str | Path = "config/evaluation.yaml") -> EvalConfig:
         shake_overlap_percentile=float(raw["shake_overlap_percentile"]),
         spin_min_samples=raw["spin_min_samples"],
         audit_confidence_level=float(level),
+        audit_min_n=raw["audit_min_n"],
     )
 
 
@@ -157,6 +164,11 @@ class Metrics:
     speed_ratio_wall: float = NAN  # batch wall_s / video duration (R61)
     speed_basis: str = "unverified"  # wall-clock | sum-based | unverified
     finish_accuracy_unflagged_method: str = "unverified"  # exact | audit_sample | unverified
+    # R64 support for the verdict: Wilson bounds of the audit estimate (= the value when
+    # exact) and the reviewed share of the audit sample.
+    finish_accuracy_unflagged_low: float = NAN
+    finish_accuracy_unflagged_high: float = NAN
+    finish_accuracy_unflagged_coverage: float = NAN
 
 
 def _ratio(num: int, den: int) -> float:
@@ -375,6 +387,9 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         speed_ratio_wall=wall,
         speed_basis=basis,
         finish_accuracy_unflagged_method=u["method"],
+        finish_accuracy_unflagged_low=u["low"],
+        finish_accuracy_unflagged_high=u["high"],
+        finish_accuracy_unflagged_coverage=u["coverage"],
     )
 
 
@@ -385,10 +400,37 @@ def _meets(value: float, target: tuple[str, float]) -> bool:
     return value >= limit if op == "min" else value <= limit
 
 
-def passes(m: Metrics, config: EvalConfig | None = None) -> dict[str, bool]:
-    """Spec section 11 pass/fail per metric; targets from ``config/evaluation.yaml``."""
+PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
+
+
+def _accuracy_verdict(m: Metrics, cfg: EvalConfig) -> str:
+    """R64: the point estimate alone never passes. PASS needs the exact value, or a FULLY
+    reviewed audit sample of at least ``audit_min_n`` whose Wilson bound also meets the
+    target; a point estimate that meets the target without that support is INCONCLUSIVE."""
+    target = cfg.targets["finish_accuracy_unflagged"]
+    if not _meets(m.finish_accuracy_unflagged, target):
+        return FAIL
+    if m.finish_accuracy_unflagged_method == "exact":
+        return PASS
+    bound = m.finish_accuracy_unflagged_low if target[0] == "min" else m.finish_accuracy_unflagged_high
+    if (m.finish_accuracy_unflagged_method == "audit_sample"
+            and m.finish_accuracy_unflagged_coverage == 1
+            and m.n_unflagged_reviewed >= cfg.audit_min_n and _meets(bound, target)):
+        return PASS
+    return INCONCLUSIVE
+
+
+def passes(m: Metrics, config: EvalConfig | None = None) -> dict[str, str]:
+    """Spec section 11 verdict per metric: ``PASS`` / ``FAIL`` / ``INCONCLUSIVE``.
+
+    Targets come from ``config/evaluation.yaml``; an unverified (nan) value is ``FAIL``.
+    Only ``finish_accuracy_unflagged`` can be ``INCONCLUSIVE`` (R64, 樣本不足).
+    """
     cfg = config if config is not None else load_eval_config()
-    return {name: _meets(getattr(m, name), cfg.targets[name]) for name in METRIC_NAMES}
+    out = {name: PASS if _meets(getattr(m, name), cfg.targets[name]) else FAIL
+           for name in METRIC_NAMES}
+    out["finish_accuracy_unflagged"] = _accuracy_verdict(m, cfg)
+    return out
 
 
 # --------------------------------------------------------------------------- R60 metrics
@@ -867,10 +909,12 @@ def _target(t: tuple[str, float]) -> str:
     return f"{'≥' if t[0] == 'min' else '≤'} {t[1]:g}"
 
 
-def _verdict(value: float, ok: bool) -> str:
-    if ok:
-        return "PASS"
-    return "UNVERIFIED (FAIL)" if not math.isfinite(value) else "FAIL"
+def _verdict(value: float, verdict: str) -> str:
+    if verdict == PASS:
+        return PASS
+    if verdict == INCONCLUSIVE:
+        return "INCONCLUSIVE (樣本不足)"  # R64: meets the target without statistical support
+    return "UNVERIFIED (FAIL)" if not math.isfinite(value) else FAIL
 
 
 _SMOKE = (
@@ -904,7 +948,7 @@ def _count(value: float, den: int) -> int:
     return round(value * den) if math.isfinite(value) else 0
 
 
-def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[str, bool],
+def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[str, str],
                        extra: ReportMetrics, config: EvalConfig, *,
                        truth: TruthMatch | None = None, truth_dir=None, today: str) -> str:
     """Markdown eval report: R60 summary table first, then timing, R37 coverage, errors."""
@@ -926,6 +970,8 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
             how += (f"; WARNING: audit sample only partly reviewed ({u['n_used']}/"
                     f"{u['n_sampled']} sampled rounds, coverage {_f(u['coverage'])}): "
                     "review the rest with the 抽樣稽核 filter")
+        how += (f"; R64: PASS needs a fully reviewed sample of ≥ {config.audit_min_n} "
+                "with the Wilson bound meeting the target")
     elif u["method"] == "exact":
         how = f"exact: all {u['n_unflagged']} unflagged rounds reviewed"
     else:

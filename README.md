@@ -53,6 +53,135 @@ a bare `rclone authorize "drive"` drops that scope. Sync a batch with
 `scripts/sync_videos.sh <drive_folder_id> <batch_name>` (lands in `~/bx/videos/<batch_name>`),
 and list new/changed videos with `uv run bxjudge scan ~/bx/videos/<batch_name>`.
 
+## 完整流程（從同步到評估）
+
+以下依序執行即可從全新 checkout 跑完一個批次（以 10/1 批次 `20261001` 為例）。全部在
+WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的 `calib/`、`results/`、
+`reports/`、`runs/`、`data/`、`weights/` 都在 `.gitignore` 內，**不要**加進 Git 或上傳
+（內含比賽畫面）。指令有錯（路徑不存在、YAML 格式錯、設定值不合法）時只印一行
+`error: …` 並以結束碼 2 結束；要看完整 traceback 時在子指令前加 `--debug`，例如
+`uv run bxjudge --debug run …`。
+
+1. **環境與同步**（見上方「環境設定」「同步影片」）：
+
+   ```bash
+   cd ~/bxjudge
+   bash scripts/setup_wsl.sh
+   scripts/sync_videos.sh 1ExampleDriveFolderId0123456789ab 20261001
+   uv run bxjudge scan ~/bx/videos/20261001
+   ```
+
+2. **校準場地**（spec §6.2；需要 WSLg 視窗，依畫面提示點選各區域）。每種機位／場地
+   擺放各做一次，名稱自訂；輸出 `calib/<name>.json` 與參考畫面 `calib/<name>.png`：
+
+   ```bash
+   uv run bxjudge calibrate ~/bx/videos/20261001/<任一支影片>.mp4 --name 20261001 --at 1.0
+   ```
+
+3. **標註**（見下方「本機標註」）：抽格 → SAM 3.1 預標 → Label Studio 人工修正 → 匯出 COCO：
+
+   ```bash
+   bash scripts/setup_labeling.sh
+   uv run bxjudge label sample ~/bx/videos/20261001 --out data/labeling --per-video 8
+   uv run bxjudge label prelabel --out data/labeling
+   # 在 Label Studio 匯入 data/labeling/tasks.json，逐張修正並 Submit，匯出 JSON
+   uv run bxjudge label export human-export.json --out data/dataset
+   ```
+
+4. **訓練兩種偵測器並比較**（RTX 3090；兩個輸出資料夾都必須是新的空資料夾）。`train`
+   會印出最佳 checkpoint 的路徑；`compare` 用同一份 COCO 驗證集比較，並把勝出者寫進
+   `weights/selected.json`（`bxjudge run` 預設讀這個檔）：
+
+   ```bash
+   uv run bxjudge train --kind rfdetr --dataset data/dataset --out runs/train-rfdetr-20261001
+   uv run bxjudge train --kind yolo26 --dataset data/dataset --out runs/train-yolo26-20261001
+   uv run bxjudge compare --dataset data/dataset \
+     --rfdetr runs/train-rfdetr-20261001/fit/checkpoint_best_total.pth \
+     --yolo26 runs/train-yolo26-20261001/fit/weights/best.pt
+   # → weights/selected.json 與 runs/compare.json
+   ```
+
+   沒有 `weights/selected.json` 時 `bxjudge run` 會直接報錯並提示先做這一步。
+
+5. **啟動本機 VLM**（spec §8、R26）：只用專案內獨立的 Ollama 0.40.7，綁 loopback
+   `127.0.0.1:11435`、`OLLAMA_NO_CLOUD=1`，模型存在 `weights/ollama`；不影響系統上其他
+   Ollama（例如 11434）。第一次先安裝並下載模型（壓縮檔 SHA256 必須一致）：
+
+   ```bash
+   sudo apt-get install -y zstd
+   mkdir -p weights/ollama-runtime weights/ollama
+   curl -L -o /tmp/ollama-linux-amd64-v0.40.7.tar.zst \
+     https://github.com/ollama/ollama/releases/download/v0.40.7/ollama-linux-amd64.tar.zst
+   echo "7f082e625b4c334df84ed1558fe282d6d8091fe3545790aef30b3a9c50d44d41  /tmp/ollama-linux-amd64-v0.40.7.tar.zst" | sha256sum -c -
+   tar --zstd -xf /tmp/ollama-linux-amd64-v0.40.7.tar.zst -C weights/ollama-runtime
+   ```
+
+   每次開機後啟動（背景執行，log 寫到 `runs/ollama-11435.log`），並確認有回應：
+
+   ```bash
+   cd ~/bxjudge
+   mkdir -p runs
+   OLLAMA_HOST=127.0.0.1:11435 OLLAMA_MODELS="$PWD/weights/ollama" OLLAMA_NO_CLOUD=1 \
+     nohup weights/ollama-runtime/bin/ollama serve > runs/ollama-11435.log 2>&1 &
+   curl -s --max-time 5 http://127.0.0.1:11435/api/version
+   ```
+
+   第一次啟動後下載兩個模型（`config/vlm.yaml` 的主模型與備用模型，只下載、不上傳）：
+
+   ```bash
+   OLLAMA_HOST=127.0.0.1:11435 weights/ollama-runtime/bin/ollama pull qwen3.8:27b
+   OLLAMA_HOST=127.0.0.1:11435 weights/ollama-runtime/bin/ollama pull qwen3-vl:8b
+   ```
+
+   VLM 階段開始前會先以 `GET /api/version` 檢查伺服器（逾時 `preflight_timeout_s`，
+   在 `config/vlm.yaml`）。連不上時**不解碼任何畫面**，直接跳過 VLM 階段：需 VLM 的回合
+   寫入 `vlm_unavailable: server unreachable …` 註記並印一行警告；之後啟動伺服器再執行
+   第 7 步即可補問。VLM 只寫 `vlm_note`，永不改判定。
+
+6. **判定**：只處理新的或變更過的影片，結果寫到 `results/20261001/`（`--out` 可改）。
+   `config/vlm.yaml` 的 `after_run: true` 會在判定後（偵測器釋放後）接著問 VLM；
+   加 `--no-vlm` 跳過：
+
+   ```bash
+   uv run bxjudge run ~/bx/videos/20261001 --calib calib
+   ```
+
+7. **（選用）單獨補問 VLM**：對尚未覆核、需覆核且還沒有成功 VLM 註記的回合再問一次：
+
+   ```bash
+   uv run bxjudge vlm results/20261001 --calib calib
+   ```
+
+8. **人工覆核**：開本機網頁（只綁 127.0.0.1），Windows 瀏覽器開
+   <http://127.0.0.1:8501>，逐一確認或修正需覆核的回合：
+
+   ```bash
+   uv run bxjudge review results/20261001 --calib calib
+   ```
+
+9. **隨機抽樣稽核**（R62/R64）：從原判「不需覆核」的回合隨機抽樣，回到第 8 步的覆核
+   畫面用「抽樣稽核」篩選，把抽到的回合**全部**覆核完：
+
+   ```bash
+   uv run bxjudge audit-sample results/20261001 --n 80 --seed 1
+   uv run bxjudge review results/20261001 --calib calib   # 篩選「抽樣稽核」，全部覆核
+   ```
+
+   只有抽樣全部覆核、回合數 ≥ `audit_min_n`，而且 Wilson 下界 ≥ 目標（95%）時，
+   「未標覆核回合判定正確率」才會 PASS；只達到點估計時顯示 `INCONCLUSIVE (樣本不足)`。
+   目標 0.95、信心水準 0.95 時，下界本身就需要至少 73 個全部正確的抽樣回合，所以建議
+   `--n 80`（不能超過可抽的回合數）。若之後重新判定（rerun）同一個結果資料夾，請重新抽樣。
+
+10. **評估與門檻校正**（見下方「評估與門檻校正」）：
+
+    ```bash
+    uv run bxjudge eval results/20261001     # reports/eval-YYYYMMDD.md
+    uv run bxjudge tune results/20261001     # reports/tune-YYYYMMDD.md（只印建議 diff，不改設定）
+    ```
+
+注意：同一個結果資料夾一次只跑一個 `bxjudge run` / `bxjudge vlm`；試不同設定時每次用新的
+`--out`，再以 `bxjudge eval <新資料夾> --truth results/20261001` 比較。
+
 ## 本機標註：抽格 → SAM 3.1 → 人工修正 → COCO
 
 先在 WSL 執行 `bash scripts/setup_labeling.sh`。主程式保留 NumPy 2 / OpenCV 5；
@@ -207,6 +336,9 @@ uv run bxjudge eval results/20261001-try2 --truth results/20261001
   否則用已覆核的抽樣回合估計並附 Wilson 區間（信心水準 `audit_confidence_level`）；
   沒有抽樣 → unverified（selection bias / no random sample）。抽樣外自行覆核的未標回合
   另列為 biased，不納入。全部未標回合都覆核時，此值等於原定義（已覆核未標回合的比例）。
+  判定（R64）：精確值直接比目標；抽樣估計只有在抽樣**全部**覆核、覆核數 ≥ `audit_min_n`
+  且 Wilson 下界 ≥ 目標時才 PASS，點估計達標但證據不足 → `INCONCLUSIVE (樣本不足)`，
+  點估計未達標 → FAIL。CLI 摘要與報告表格的「判定」欄一致。
 - 取捨區塊（R63）並列自動化率（1 − 需覆核比例）、全部真實回合的自動判定估計正確率、
   覆核後估計正確率與速度達標，各附區間 / 依據，不合成單一加權分數。
 - 目標值、容許誤差與百分位都在 `config/evaluation.yaml`。

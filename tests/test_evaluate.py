@@ -46,9 +46,10 @@ def test_touch_recall_counts_flagged_as_caught():
 
 
 def test_passes_thresholds():
-    assert all(passes(Metrics(0.96, 0.92, 0.91, 0.25, 0.8, 50)).values())
-    assert passes(Metrics(0.90, 0.92, 0.91, 0.25, 0.8, 50))["finish_accuracy_unflagged"] is False
-    assert passes(Metrics(0.96, 0.92, 0.91, 0.35, 0.8, 50))["review_ratio"] is False
+    exact = {"finish_accuracy_unflagged_method": "exact"}  # R64: a value needs its basis
+    assert all(v == "PASS" for v in passes(Metrics(0.96, 0.92, 0.91, 0.25, 0.8, 50, **exact)).values())
+    assert passes(Metrics(0.90, 0.92, 0.91, 0.25, 0.8, 50))["finish_accuracy_unflagged"] == "FAIL"
+    assert passes(Metrics(0.96, 0.92, 0.91, 0.35, 0.8, 50))["review_ratio"] == "FAIL"
 
 
 def test_derive_shake_px_midpoint():
@@ -67,14 +68,14 @@ def test_no_rows_is_unverified_never_perfect():
     assert all(math.isnan(getattr(m, name)) for name in METRIC_NAMES)
     assert m.n_reviewed == 0
     assert set(passes(m)) == set(METRIC_NAMES)
-    assert not any(passes(m).values())
+    assert "PASS" not in passes(m).values()
 
 
 def test_only_flagged_truth_leaves_finish_accuracy_unverified():
     m = evaluate([rev(needs_review=True), rev(round=2, needs_review=True)])
     assert math.isnan(m.finish_accuracy_unflagged)
     assert m.review_ratio == 1.0 and m.n_reviewed == 2
-    assert passes(m)["finish_accuracy_unflagged"] is False
+    assert passes(m)["finish_accuracy_unflagged"] == "FAIL"
 
 
 def test_no_true_touch_or_air_leaves_recalls_unverified():
@@ -149,7 +150,7 @@ def test_placeholder_rows_are_never_truth():
 def test_speed_without_timings_is_unverified_and_fails():
     m = evaluate(_rows_of_videos("a.mp4"))
     assert math.isnan(m.speed_ratio) and math.isnan(m.speed_ratio_core)
-    assert passes(m)["speed_ratio"] is False
+    assert passes(m)["speed_ratio"] == "FAIL"
 
 
 def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
@@ -159,7 +160,7 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     assert m.speed_ratio == pytest.approx(1.2)
     assert m.speed_ratio_core == pytest.approx(0.5)
     assert m.n_speed_videos == 1 and m.n_vlm_videos == 1
-    assert passes(m)["speed_ratio"] is False
+    assert passes(m)["speed_ratio"] == "FAIL"
 
 
 def test_speed_without_vlm_phase_is_core_time():
@@ -172,7 +173,7 @@ def test_speed_without_vlm_phase_is_core_time():
     m = evaluate(rows, timings)
     assert m.speed_ratio == pytest.approx(0.8) == m.speed_ratio_core
     assert m.n_vlm_videos == 0
-    assert passes(m)["speed_ratio"] is True
+    assert passes(m)["speed_ratio"] == "PASS"
 
 
 def test_speed_excludes_placeholder_only_unmeasured_and_overlong_videos():
@@ -203,8 +204,9 @@ def test_speed_excludes_placeholder_only_unmeasured_and_overlong_videos():
 
 
 def test_passes_boundaries_are_inclusive_and_nan_fails():
-    assert all(passes(Metrics(0.95, 0.90, 0.90, 0.30, 1.0, 1)).values())
-    assert passes(Metrics(0.96, 0.92, 0.91, 0.25, math.nan, 1))["speed_ratio"] is False
+    exact = {"finish_accuracy_unflagged_method": "exact"}
+    assert all(v == "PASS" for v in passes(Metrics(0.95, 0.90, 0.90, 0.30, 1.0, 1, **exact)).values())
+    assert passes(Metrics(0.96, 0.92, 0.91, 0.25, math.nan, 1))["speed_ratio"] == "FAIL"
 
 
 def test_targets_come_from_yaml(tmp_path):
@@ -213,7 +215,7 @@ def test_targets_come_from_yaml(tmp_path):
     p = tmp_path / "evaluation.yaml"
     p.write_text(yaml.safe_dump(raw), encoding="utf-8")
     cfg = load_eval_config(p)
-    assert passes(Metrics(0.96, 0.92, 0.91, 0.25, 0.8, 50), cfg)["review_ratio"] is False
+    assert passes(Metrics(0.96, 0.92, 0.91, 0.25, 0.8, 50), cfg)["review_ratio"] == "FAIL"
 
 
 def test_default_targets_are_spec_section_11():
@@ -721,7 +723,7 @@ def test_speed_uses_wall_clock_when_recorded_and_never_double_counts_vlm():
     assert m.speed_ratio == pytest.approx(1.0)  # 100 / 100, not (100 + 40) / 100
     assert m.speed_ratio_wall == pytest.approx(1.0)
     assert m.speed_ratio_sum == pytest.approx(0.9)  # (50 + 40) / 100, VLM once per video
-    assert passes(m)["speed_ratio"] is True
+    assert passes(m)["speed_ratio"] == "PASS"
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert (w["wall_s"], w["vlm_wall_s"], w["duration_s"]) == (100.0, 40.0, 100.0)
 
@@ -806,7 +808,7 @@ def test_unflagged_accuracy_without_random_sample_is_unverified_selection_bias()
     assert u["method"] == "unverified" and u["reason"] == "selection bias / no random sample"
     assert math.isnan(u["estimate"]) and u["biased"]["n"] == 2
     assert math.isnan(evaluate(rows).finish_accuracy_unflagged)
-    assert passes(evaluate(rows))["finish_accuracy_unflagged"] is False
+    assert passes(evaluate(rows))["finish_accuracy_unflagged"] == "FAIL"
 
 
 def test_no_human_truth_leaves_every_accuracy_unverified():
@@ -890,7 +892,7 @@ def test_wall_clock_excludes_gate_video_duration_probe():
     m = evaluate(rows, timings, runs=runs)
     assert m.speed_basis == "wall-clock"
     assert m.speed_ratio == pytest.approx(1.5)  # gate work and duration both left out
-    assert passes(m)["speed_ratio"] is False  # was 0.503 PASS before the fix
+    assert passes(m)["speed_ratio"] == "FAIL"  # was 0.503 PASS before the fix
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert w["duration_s"] == 100.0 and w["excluded"] == ["g.mp4"]
 
@@ -987,3 +989,90 @@ def test_partly_reviewed_audit_sample_reports_coverage_and_warns(tmp_path):
     assert "WARNING: audit sample only partly reviewed (1/3" in text
     full = _unflagged(20, sampled={1, 2}, reviewed={1, 2})
     assert report_metrics(full, None, _cfg()).unflagged["coverage"] == 1.0
+
+
+# ---- R64: the unflagged-accuracy target needs statistical support ---------------
+
+
+def _eval_cfg(tmp_path, **change):
+    raw = yaml.safe_load(EVAL_CONFIG.read_text(encoding="utf-8"))
+    for key, value in change.items():
+        if key == "accuracy_min":
+            raw["targets"]["finish_accuracy_unflagged"] = {"min": value}
+        else:
+            raw[key] = value
+    path = tmp_path / "evaluation.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return load_eval_config(path)
+
+
+def test_r64_one_of_thirty_reviewed_audit_rounds_is_inconclusive_not_pass():
+    # final review probe: 100 unflagged, sample of 30, one reviewed (correct)
+    rows = _unflagged(100, sampled=set(range(1, 31)), reviewed={1})
+    m = evaluate(rows, config=_cfg())
+    assert m.finish_accuracy_unflagged == 1.0 and m.finish_accuracy_unflagged_method == "audit_sample"
+    assert m.finish_accuracy_unflagged_coverage == pytest.approx(1 / 30)
+    assert passes(m, _cfg())["finish_accuracy_unflagged"] == "INCONCLUSIVE"
+
+
+def test_r64_fully_reviewed_five_of_five_is_inconclusive_under_lower_bound_rule():
+    rows = _unflagged(100, sampled=set(range(1, 6)), reviewed=set(range(1, 6)))
+    m = evaluate(rows, config=_cfg())
+    assert m.finish_accuracy_unflagged == 1.0
+    assert m.finish_accuracy_unflagged_low == pytest.approx(_wilson(5, 5, 0.95)[0])  # ~0.566
+    assert m.finish_accuracy_unflagged_coverage == 1.0
+    assert passes(m, _cfg())["finish_accuracy_unflagged"] == "INCONCLUSIVE"
+
+
+def test_r64_large_clean_fully_reviewed_sample_clears_lower_bound_and_passes():
+    rows = _unflagged(200, sampled=set(range(1, 81)), reviewed=set(range(1, 81)))
+    m = evaluate(rows, config=_cfg())
+    assert m.finish_accuracy_unflagged_low == pytest.approx(_wilson(80, 80, 0.95)[0])
+    assert m.finish_accuracy_unflagged_low >= 0.95 and m.n_unflagged_reviewed == 80
+    assert passes(m, _cfg())["finish_accuracy_unflagged"] == "PASS"
+
+
+def test_r64_audit_min_n_comes_from_yaml(tmp_path):
+    rows = _unflagged(100, sampled=set(range(1, 6)), reviewed=set(range(1, 6)))
+    # target 0.5: Wilson low ~0.566 clears it, so only audit_min_n decides
+    low_target = _eval_cfg(tmp_path, accuracy_min=0.5, audit_min_n=5)
+    assert passes(evaluate(rows, config=low_target), low_target)["finish_accuracy_unflagged"] == "PASS"
+    strict = _eval_cfg(tmp_path, accuracy_min=0.5, audit_min_n=6)
+    assert passes(evaluate(rows, config=strict), strict)["finish_accuracy_unflagged"] == "INCONCLUSIVE"
+
+
+def test_r64_point_estimate_below_target_fails():
+    rows = _unflagged(200, sampled=set(range(1, 81)), reviewed=set(range(1, 81)),
+                      wrong=set(range(1, 11)))
+    m = evaluate(rows, config=_cfg())
+    assert passes(m, _cfg())["finish_accuracy_unflagged"] == "FAIL"
+
+
+def test_r64_exact_basis_passes_on_the_exact_value():
+    rows = _unflagged(4, reviewed={1, 2, 3, 4})
+    m = evaluate(rows, config=_cfg())
+    assert m.finish_accuracy_unflagged_method == "exact"
+    assert passes(m, _cfg())["finish_accuracy_unflagged"] == "PASS"
+
+
+def test_r64_value_without_a_basis_never_passes():
+    m = Metrics(0.99, 0.92, 0.91, 0.25, 0.8, 50)  # method defaults to unverified
+    assert passes(m)["finish_accuracy_unflagged"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("bad", [0, -3, 1.5, True, "30"])
+def test_r64_audit_min_n_is_validated(tmp_path, bad):
+    with pytest.raises(ValueError, match="audit_min_n"):
+        _eval_cfg(tmp_path, audit_min_n=bad)
+
+
+def test_r64_inconclusive_shown_in_cli_summary_and_report_table(tmp_path, capsys):
+    rows = _unflagged(100, sampled=set(range(1, 31)), reviewed={1})
+    res = _results(tmp_path / "res", rows, None)
+    report = tmp_path / "eval.md"
+    assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
+    assert "finish_accuracy_unflagged=1.000 INCONCLUSIVE" in capsys.readouterr().out
+    row = next(line for line in report.read_text(encoding="utf-8").splitlines()
+               if line.startswith("| 未標覆核回合判定正確率"))
+    assert row.endswith("| INCONCLUSIVE (樣本不足) |")
+    assert "WARNING: audit sample only partly reviewed" in row

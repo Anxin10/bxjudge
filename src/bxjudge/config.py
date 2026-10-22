@@ -1,10 +1,39 @@
 """Thresholds loaded from ``config/thresholds.yaml`` (no numbers hard-coded in code)."""
 from __future__ import annotations
 
+import functools
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
 
 import yaml
+
+
+class ConfigError(ValueError):
+    """A configuration file is malformed YAML or has the wrong shape (cli: exit 2)."""
+
+
+def config_loader[T](load: Callable[..., T]) -> Callable[..., T]:
+    """Report malformed YAML and shape errors met while validating a config file as
+    ``ConfigError`` naming the file. A wrongly shaped value (a list where a mapping is
+    expected, ...) makes validation code raise TypeError/KeyError/AttributeError; inside a
+    loader that is the user's config mistake, not a program bug."""
+    signature = inspect.signature(load)
+
+    @functools.wraps(load)
+    def wrapper(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)  # a wrong call is a bug: raised as is
+        bound.apply_defaults()
+        try:
+            return load(*args, **kwargs)
+        except (yaml.YAMLError, TypeError, KeyError, AttributeError) as error:
+            path = next(iter(bound.arguments.values()), "config")
+            raise ConfigError(
+                f"{path}: invalid configuration ({type(error).__name__}: {error})"
+            ) from error
+
+    return wrapper
 
 
 @dataclass
@@ -50,6 +79,7 @@ class Thresholds:
 _HWACCEL = ("cuda", "cpu")
 
 
+@config_loader
 def load_thresholds(path: str | Path = "config/thresholds.yaml") -> Thresholds:
     """Load thresholds; unknown keys, missing keys or wrong types raise ``ValueError``."""
     with open(path, encoding="utf-8") as f:

@@ -140,14 +140,23 @@ def find_calibration(frame: np.ndarray, calib_dir: Path, min_similarity: float) 
 
 
 # --------------------------------------------------------------------------- frame grab
+class FrameGrabError(ValueError):
+    """ffmpeg could not decode a reference frame from the given video."""
+
+
 def grab_frame(video: Path, at: float) -> np.ndarray:
-    """Decode the single frame at ``at`` seconds with ffmpeg (minimal; the real decoder is Task 5)."""
-    cmd = ["ffmpeg", "-v", "error", "-ss", f"{at}", "-i", str(video),
+    """Decode the single frame at ``at`` seconds with ffmpeg (minimal; the real decoder is Task 5).
+
+    A missing file is ``FileNotFoundError``; a file ffmpeg cannot read a frame from is
+    ``FrameGrabError`` (a ``ValueError``: the user passed an unusable video)."""
+    if not Path(video).is_file():
+        raise FileNotFoundError(f"{video}: video file not found")
+    cmd =["ffmpeg", "-v", "error", "-ss", f"{at}", "-i", str(video),
            "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]
     r = subprocess.run(cmd, capture_output=True)
     img = cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR) if r.stdout else None
     if r.returncode != 0 or img is None:
-        raise RuntimeError(f"ffmpeg could not read a frame at {at}s from {video}: {r.stderr.decode(errors='replace')}")
+        raise FrameGrabError(f"ffmpeg could not read a frame at {at}s from {video}:{r.stderr.decode(errors='replace')}")
     return img
 
 

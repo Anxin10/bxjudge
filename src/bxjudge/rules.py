@@ -12,6 +12,7 @@ from typing import Literal, get_args
 
 import yaml
 
+from bxjudge.config import config_loader
 from bxjudge.types import Finish, RoundResult, Side
 
 SIDES: tuple[Side, ...] = get_args(Side)
@@ -54,6 +55,7 @@ def _check_keys(path, where: str, raw, expected) -> None:
         raise ValueError(f"{path}: {where}: unknown keys {unknown}, missing keys {missing}")
 
 
+@config_loader
 def load_rules(path: str | Path = "config/rules.yaml") -> Rules:
     """Load rules; unknown/missing keys, wrong types or unsupported modes raise ``ValueError``."""
     with open(path, encoding="utf-8") as f:

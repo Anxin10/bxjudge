@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from .config import config_loader
+
 CLASSES = ("bey", "bey_part", "launcher")
 KINDS = ("rfdetr", "yolo26")
 
@@ -89,6 +91,7 @@ def validate_training(training) -> dict:
     return training
 
 
+@config_loader
 def load_training_policy(path: Path | str) -> dict:
     """Explicitly selected training policy file holding only a training block."""
     data = yaml.safe_load(Path(path).read_text())
@@ -130,6 +133,7 @@ def resolve_training(training: dict, infer_long_edge: int) -> dict:
     }
 
 
+@config_loader
 def load_policy(path: Path | str = "config/detection.yaml") -> dict:
     cfg = yaml.safe_load(Path(path).read_text())
     required = {

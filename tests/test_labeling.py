@@ -492,7 +492,7 @@ def test_sample_cli_rejects_identical_copies_before_video_sampling(
 
     monkeypatch.setattr(label_cli, "probe", unexpected_probe)
     with pytest.raises(ValueError, match="duplicate video content") as error:
-        main(["label", "sample", str(tmp_path), "--out", str(out)])
+        main(["--debug", "label", "sample", str(tmp_path), "--out", str(out)])
     assert str(original) in str(error.value) and str(duplicate) in str(error.value)
     assert not out.exists()
 
@@ -531,6 +531,6 @@ def test_prelabel_cli_rejects_duplicate_manifest_before_gpu(tmp_path, monkeypatc
 
     monkeypatch.setattr(sam, "run_prelabel_jobs", unexpected_worker)
     with pytest.raises(ValueError, match="duplicate video content") as error:
-        main(["label", "prelabel", "--samples", str(manifest), "--out", str(out)])
+        main(["--debug", "label", "prelabel", "--samples", str(manifest), "--out", str(out)])
     assert str(original) in str(error.value) and str(duplicate) in str(error.value)
     assert not out.exists()

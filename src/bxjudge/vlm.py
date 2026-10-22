@@ -31,7 +31,7 @@ import numpy as np
 import yaml
 
 from .calibration import ZONES, find_calibration, scale_calibration
-from .config import Thresholds
+from .config import Thresholds, config_loader
 from .manifest import probe
 from .output import record_vlm_timing, row_to_result, write_results
 from .rules import Rules, is_not_a_round
@@ -87,6 +87,7 @@ class VlmConfig:
     fallback: str
     after_run: bool
     timeout_s: float
+    preflight_timeout_s: float  # R65: GET /api/version reachability check
     keep_alive: str | int
     think: bool
     num_ctx: int
@@ -154,6 +155,7 @@ def _validated(cfg: VlmConfig) -> VlmConfig:
     return replace(cfg, host=host)
 
 
+@config_loader
 def load_vlm_config(path: str | Path = "config/vlm.yaml") -> VlmConfig:
     """Load and validate the VLM config; unknown/missing keys or bad values raise ``ValueError``."""
     with open(path, encoding="utf-8") as f:
@@ -171,7 +173,8 @@ def load_vlm_config(path: str | Path = "config/vlm.yaml") -> VlmConfig:
     for name in ("num_ctx", "num_predict", "frames", "image_long_edge"):
         if type(values[name]) is not int or values[name] <= 0:
             raise ValueError(f"{path}: {name} must be a positive int, got {values[name]!r}")
-    for name, minimum in (("timeout_s", 0.0), ("event_window_s", 0.0), ("temperature", None)):
+    for name, minimum in (("timeout_s", 0.0), ("preflight_timeout_s", 0.0),
+                          ("event_window_s", 0.0), ("temperature", None)):
         v = values[name]
         if name == "temperature" and v is None:
             continue  # null: the model's own sampling defaults
@@ -238,6 +241,20 @@ def _post(host: str, payload: dict, *, path: str = "/api/chat", timeout: float) 
         return json.loads(body)
     except ValueError:
         raise VlmError(f"non-JSON response from {url}") from None
+
+
+def preflight(config: VlmConfig) -> str | None:
+    """R65 reachability check: ``None`` when the local server answers ``GET /api/version``
+    within ``preflight_timeout_s``, else the reason (one cheap request, no frames)."""
+    url = validate_endpoint(config.host) + "/api/version"
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with _opener().open(request, timeout=config.preflight_timeout_s) as response:
+            json.loads(response.read())
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError,
+            VlmError) as error:
+        return f"server unreachable at {config.host}: {_short(getattr(error, 'reason', error))}"
+    return None
 
 
 def _encode(image: np.ndarray) -> str:
@@ -688,11 +705,24 @@ def review_results_dir(
     timing_path = out_dir / "videos.json"
     timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     summary = {"asked": 0, "answered": 0, "unavailable": 0}
+    targets = [video for video, results in sorted(by_video.items())
+               if (videos is None or video in videos) and any(map(needs_vlm, results))]
+    reason = preflight(session.config) if targets else None
+    if reason is not None:
+        # R65: skip the phase before any calibration/frame work; one warning, explicit notes
+        log.warning("VLM phase skipped: %s. Start the local Ollama (README 完整流程) and "
+                    "rerun `bxjudge vlm`", reason)
+        note = f"{UNAVAILABLE_PREFIX}{reason}"
+        for video in targets:
+            asked = {(r.video, r.round): (note, (r.t_launch, r.t_end))
+                     for r in by_video[video] if needs_vlm(r)}
+            _persist_notes(out_dir, video, asked, rules)
+            summary["unavailable"] += len(asked)
+        return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
     calibrations: dict = {}
     try:
-        for video, results in sorted(by_video.items()):
-            if (videos is not None and video not in videos) or not any(map(needs_vlm, results)):
-                continue
+        for video in targets:
+            results = by_video[video]
             began = time.perf_counter()
             source = recorded_source(timing.get(video))
 

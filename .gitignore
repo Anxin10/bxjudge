@@ -7,3 +7,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+# Generated outputs: match-video reference frames, trajectory PNGs on frames, reports with
+# absolute source paths. Never commit or push them (no video frames to any cloud service).
+/calib/
+/results/
+/reports/

@@ -308,7 +308,12 @@ def judge_video(
 
 
 def _load_selection(path: Path, th: Thresholds) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path}: no selected detector; train both detectors (`bxjudge train`) and "
+            "write the selection with `bxjudge compare` first (README 完整流程)"
+        )
+    data =json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("kind") not in ("rfdetr", "yolo26"):
         raise ValueError(f"{path}: expected selected detector kind")
     try:
@@ -471,7 +476,7 @@ def run_batch(
         vlm_began = time.perf_counter()
         del detector
         _release_gpu_memory()
-        review_results_dir(
+        summary = review_results_dir(
             out_dir,
             calib_dir=calib_dir,
             th=th,
@@ -479,7 +484,10 @@ def run_batch(
             config=vlm,
             videos={path.name for path, _ in entries},
         )
-        vlm_wall_s = time.perf_counter() - vlm_began
+        # R65: an unreachable server skips the phase (bounded preflight, still inside the
+        # honest batch wall_s) and records no VLM phase.
+        if not (summary or {}).get("skipped"):
+            vlm_wall_s = time.perf_counter() - vlm_began
     if entries:  # nothing judged = no judgment wall-clock to report
         record_run_timing(
             out_dir,

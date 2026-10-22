@@ -13,6 +13,10 @@ targets:
 # R62: unflagged accuracy is estimated from the reviewed random audit sample
 # (`bxjudge audit-sample`) with a Wilson score interval at this confidence level.
 audit_confidence_level: 0.95
+# R64: the audit estimate can PASS only from a FULLY reviewed sample of at least this many
+# rounds AND a Wilson lower bound >= the target; otherwise INCONCLUSIVE (樣本不足).
+# (At target 0.95 / level 0.95 the bound alone needs >= 73 all-correct rounds.)
+audit_min_n: 30
 
 # Spec section 11 speed criterion covers videos up to 5 minutes of playback.
 speed_max_video_s: 300

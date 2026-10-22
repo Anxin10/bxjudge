@@ -5,7 +5,10 @@ from pathlib import Path
 
 import yaml
 
+from ..config import config_loader
 
+
+@config_loader
 def load_config(path: str | Path = "config/labeling.yaml") -> dict:
     with Path(path).open(encoding="utf-8") as f:
         cfg = yaml.safe_load(f)

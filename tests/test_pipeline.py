@@ -971,3 +971,18 @@ def test_run_cli_passes_vlm_config_unless_disabled(tmp_path, monkeypatch):
     assert calls[-1]["vlm_config"] == Path("x/vlm.yaml")
     assert main(["run", str(tmp_path), "--no-vlm"]) == 0
     assert calls[-1]["vlm_config"] is None
+
+
+def test_unreachable_vlm_phase_records_no_vlm_wall_but_keeps_batch_wall(tmp_path, monkeypatch):
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "a.mp4", seconds=0.1)
+    monkeypatch.setattr(pipeline, "load_detector", lambda *a, **k: (lambda image, frame: []))
+    monkeypatch.setattr(pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")])
+    monkeypatch.setattr(pipeline, "review_results_dir", lambda out_dir, **kw: {
+        "asked": 0, "answered": 0, "unavailable": 1, "skipped": "vlm_unreachable", "models": {}})
+    out = tmp_path / "out"
+    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+                       vlm_config=_vlm_config(tmp_path))
+    [run] = json.loads((out / "runs.json").read_text())
+    assert run["vlm_wall_s"] is None and run["wall_s"] > 0  # R65

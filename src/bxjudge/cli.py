@@ -182,13 +182,17 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
     try:
         if not results.is_dir():
             raise ValueError(f"{results}: expected a results directory")
+        config = vlm.load_vlm_config(Path(args.config).expanduser())
         summary = vlm.review_results_dir(
             results,
             calib_dir=Path(args.calib).expanduser(),
             th=load_thresholds(Path(args.thresholds).expanduser()),
             rules=load_rules(Path(args.rules).expanduser()),
-            config=vlm.load_vlm_config(Path(args.config).expanduser()),
+            config=config,
         )
+        if summary.get("skipped"):  # R65: nothing asked, so no VLM run is recorded
+            print(f"warning: VLM phase skipped, {config.host} unreachable; start the local "
+                  "Ollama (README 完整流程) and rerun `bxjudge vlm`", file=sys.stderr)
         if summary.get("asked"):
             wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
             record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
@@ -301,7 +305,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         value = getattr(metrics, name)
         return f"{value:.3f}" if math.isfinite(value) else "unverified"
 
-    summary = ", ".join(f"{name}={shown(name)} {'PASS' if ok[name] else 'FAIL'}"
+    summary = ", ".join(f"{name}={shown(name)} {ok[name]}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
     if ev.is_synthetic(rows):
@@ -395,15 +399,43 @@ _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bxjudge", description="Local AI referee for Beyblade X videos")
+    parser.add_argument("--debug", action="store_true",
+                        help="show the full traceback instead of a one-line error")
     sub = parser.add_subparsers(dest="command", required=True)
     for register in _REGISTRARS:
         register(sub)
     return parser
 
 
+def _user_errors() -> tuple[type[BaseException], ...]:
+    """Exceptions that mean the user's input is wrong, not that the program is.
+
+    - ``OSError``: missing / unreadable / unwritable paths (FileNotFoundError, ...).
+    - ``yaml.YAMLError``: malformed YAML outside a config loader.
+    - ``ValueError``: invalid values; every config loader reports wrong values AND wrong
+      shapes (the TypeError/KeyError its validation hits) as ``config.ConfigError``,
+      a ValueError naming the file. JSON decode errors and CorrectionError are ValueErrors.
+
+    Deliberately NOT caught: TypeError, KeyError, AttributeError, RuntimeError (CUDA, ...)
+    raised outside config loading: those are bugs or environment faults whose traceback
+    is the evidence needed to fix them.
+    """
+    import yaml
+
+    return (OSError, yaml.YAMLError, ValueError)
+
+
 def main(argv: list[str] | None = None) -> int:
+    import sys
+
     args = build_parser().parse_args(argv)
-    return int(args.func(args) or 0)
+    try:
+        return int(args.func(args) or 0)
+    except _user_errors() as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -58,6 +58,15 @@ def cfg(**change):
     return replace(vlm.load_vlm_config(), **change)
 
 
+_REAL_PREFLIGHT = getattr(vlm, "preflight", None)
+
+
+@pytest.fixture(autouse=True)
+def _reachable_vlm(monkeypatch):
+    """No test reaches a real server: the R65 preflight passes unless a test restores it."""
+    monkeypatch.setattr(vlm, "preflight", lambda config: None, raising=False)
+
+
 # --------------------------------------------------------------------------- brief
 
 
@@ -881,3 +890,142 @@ def test_session_records_each_request_with_cold_and_failure(monkeypatch):
     assert [(q["round"], q["model"], q["ok"], q["cold"]) for q in session.requests] == [
         (4, FALLBACK, True, True), (5, FALLBACK, True, False), (6, None, False, None)]
     assert all(q["seconds"] >= 0 for q in session.requests)
+
+
+# --------------------------------------------------------------------------- R65 preflight
+
+
+def _closed_port_url():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    return f"http://127.0.0.1:{port}"  # nothing listens any more: connection refused
+
+
+class _Silent:
+    """Accepts TCP connections (kernel backlog) but never answers: a hung server."""
+
+    def __init__(self):
+        import socket
+
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+
+    def close(self):
+        self.sock.close()
+
+
+def _version_server():
+    hits = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            _send_json(self, {"version": "0.40.7"})
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}", hits
+
+
+def test_preflight_timeout_comes_from_yaml_and_is_validated(tmp_path):
+    import yaml
+
+    assert 0 < vlm.load_vlm_config().preflight_timeout_s <= 10
+    raw = yaml.safe_load(Path("config/vlm.yaml").read_text(encoding="utf-8"))
+    for bad in (0, -1, "5", True):
+        raw["preflight_timeout_s"] = bad
+        path = tmp_path / "vlm.yaml"
+        path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        with pytest.raises(ValueError, match="preflight_timeout_s"):
+            vlm.load_vlm_config(path)
+
+
+def test_preflight_reachable_server_answers_version():
+    server, url, hits = _version_server()
+    try:
+        assert _REAL_PREFLIGHT(cfg(host=url, preflight_timeout_s=2.0)) is None
+        assert hits == ["/api/version"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_preflight_refused_and_hung_servers_are_bounded(tmp_path):
+    import time
+
+    assert "unreachable" in _REAL_PREFLIGHT(cfg(host=_closed_port_url(), preflight_timeout_s=2.0))
+    silent = _Silent()
+    try:
+        began = time.perf_counter()
+        reason = _REAL_PREFLIGHT(cfg(host=silent.url, preflight_timeout_s=0.3))
+        assert time.perf_counter() - began < 2.0
+        assert reason is not None and "unreachable" in reason
+    finally:
+        silent.close()
+
+
+@pytest.mark.parametrize("server", ["refused", "hung"])
+def test_unreachable_vlm_skips_phase_before_any_frame_work(
+    tmp_path, monkeypatch, rules, th, caplog, server
+):
+    import time
+
+    monkeypatch.setattr(vlm, "preflight", _REAL_PREFLIGHT)
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"")
+    out = _results(tmp_path, rules, source.resolve())
+    before = json.loads((out / "rounds.json").read_text())
+    timing_before = json.loads((out / "videos.json").read_text())
+    monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("frames decoded"))
+    monkeypatch.setattr(vlm, "find_calibration", lambda *a, **k: pytest.fail("calibration read"))
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: pytest.fail("chat request sent"))
+    silent = _Silent() if server == "hung" else None
+    url = silent.url if silent else _closed_port_url()
+    try:
+        began = time.perf_counter()
+        with caplog.at_level("WARNING"):
+            summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules,
+                                             config=cfg(host=url, preflight_timeout_s=0.3))
+        assert time.perf_counter() - began < 2.0  # bounded by preflight_timeout_s
+    finally:
+        if silent:
+            silent.close()
+    assert summary["skipped"] == "vlm_unreachable" and summary["asked"] == 0
+    assert summary["unavailable"] == 3
+    after = json.loads((out / "rounds.json").read_text())
+    notes = {(r["video"], r["round"]): r["vlm_note"] for r in after}
+    for key in (("a.mp4", 1), ("a.mp4", 3), ("b.mp4", 1)):
+        assert notes[key].startswith(vlm.UNAVAILABLE_PREFIX) and "unreachable" in notes[key]
+    assert notes[("a.mp4", 4)] is None and notes[("a.mp4", 2)] is None  # reviewed / confident
+    for r, o in zip(after, before):
+        assert {k: v for k, v in r.items() if k != "vlm_note"} == {
+            k: v for k, v in o.items() if k != "vlm_note"}
+    assert json.loads((out / "videos.json").read_text()) == timing_before  # no vlm_s recorded
+    assert [m for m in caplog.messages if "unreachable" in m and "skipped" in m]
+
+
+def test_no_review_required_rows_needs_no_preflight(tmp_path, monkeypatch, rules, th):
+    monkeypatch.setattr(vlm, "preflight", lambda c: pytest.fail("preflight without work"))
+    out = tmp_path / "out"
+    output.write_results([res("a.mp4", 1, finish="spin", winner="X")], out, rules)
+    summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    assert summary["asked"] == 0 and "skipped" not in summary
+
+
+def test_vlm_cli_unreachable_server_warns_and_records_no_vlm_run(tmp_path, monkeypatch, capsys):
+    from bxjudge.cli import main
+
+    monkeypatch.setattr(vlm, "review_results_dir", lambda out, **kw: {
+        "asked": 0, "answered": 0, "unavailable": 2, "skipped": "vlm_unreachable", "models": {}})
+    assert main(["vlm", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "warning:" in captured.err and "11435" in captured.err
+    assert not (tmp_path / "runs.json").exists()

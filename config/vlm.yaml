@@ -7,6 +7,7 @@ model: qwen3.8:27b            # primary (spec section 5)
 fallback: qwen3-vl:8b         # used when the primary returns an error, OOM or an invalid reply
 after_run: true               # `bxjudge run` asks the VLM after the core judge (detector released first)
 timeout_s: 900                # per request; measured 27b cold request 141 s, of which 117 s model load
+preflight_timeout_s: 5        # R65: GET /api/version before any frame work; unreachable = phase skipped
 keep_alive: 10m               # stay loaded across rows; explicitly unloaded at phase end / error
 think: false
 num_ctx: 16384
