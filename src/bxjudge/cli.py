@@ -45,8 +45,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     folder = Path(args.folder).expanduser()
     if not folder.is_dir():
-        print(f"error: {folder} is not a folder", file=sys.stderr)
-        return 2
+        raise ValueError(f"{folder} is not a folder")
     failed: list[Path] = []
 
     def on_error(path: Path, err: Exception) -> None:
@@ -126,23 +125,18 @@ def _add_compare(sub: argparse._SubParsersAction) -> None:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     import logging
-    import sys
 
     from bxjudge.pipeline import run_batch
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     folder = Path(args.folder).expanduser()
-    try:
-        run_batch(folder, Path(args.calib).expanduser(),
-                  Path(args.out).expanduser() if args.out else Path("results") / folder.name,
-                  selection=Path(args.selection).expanduser(),
-                  thresholds=Path(args.thresholds).expanduser(),
-                  rules_path=Path(args.rules).expanduser(),
-                  detection_config=Path(args.config).expanduser(), limit=args.limit,
-                  vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser())
-    except (ValueError, OSError, RuntimeError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    run_batch(folder, Path(args.calib).expanduser(),
+              Path(args.out).expanduser() if args.out else Path("results") / folder.name,
+              selection=Path(args.selection).expanduser(),
+              thresholds=Path(args.thresholds).expanduser(),
+              rules_path=Path(args.rules).expanduser(),
+              detection_config=Path(args.config).expanduser(), limit=args.limit,
+              vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser())
     return 0
 
 
@@ -166,7 +160,6 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
 def _cmd_vlm(args: argparse.Namespace) -> int:
     import json
     import logging
-    import sys
     import time
     from datetime import datetime
 
@@ -179,23 +172,19 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
     results = Path(args.results).expanduser()
     began = time.perf_counter()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    try:
-        if not results.is_dir():
-            raise ValueError(f"{results}: expected a results directory")
-        summary = vlm.review_results_dir(
-            results,
-            calib_dir=Path(args.calib).expanduser(),
-            th=load_thresholds(Path(args.thresholds).expanduser()),
-            rules=load_rules(Path(args.rules).expanduser()),
-            config=vlm.load_vlm_config(Path(args.config).expanduser()),
-        )
-        if summary.get("asked"):
-            wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
-            record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
-                              vlm_wall_s=wall, videos={})
-    except (ValueError, OSError, RuntimeError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    if not results.is_dir():
+        raise ValueError(f"{results}: expected a results directory")
+    summary = vlm.review_results_dir(
+        results,
+        calib_dir=Path(args.calib).expanduser(),
+        th=load_thresholds(Path(args.thresholds).expanduser()),
+        rules=load_rules(Path(args.rules).expanduser()),
+        config=vlm.load_vlm_config(Path(args.config).expanduser()),
+    )
+    if summary.get("asked"):
+        wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
+        record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
+                          vlm_wall_s=wall, videos={})
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 
@@ -217,8 +206,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
     results = Path(args.results).expanduser().resolve()
     if not (results / "rounds.json").is_file():
-        print(f"error: {results} has no rounds.json (run `bxjudge run` first)", file=sys.stderr)
-        return 2
+        raise ValueError(f"{results} has no rounds.json (run `bxjudge run` first)")
     app = Path(__file__).with_name("review_app.py")
     argv = [
         sys.executable, "-m", "streamlit", "run", str(app),
@@ -279,24 +267,19 @@ def _write_report(path: Path, text: str) -> None:
 
 def _cmd_eval(args: argparse.Namespace) -> int:
     import math
-    import sys
 
     from bxjudge import evaluate as ev
     from bxjudge.rules import load_rules
 
-    try:
-        cfg, results, rows, timings, runs, truth = _eval_inputs(args)
-        rules = load_rules(Path(args.rules).expanduser())
-        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs)
-        ok = ev.passes(metrics, cfg)
-        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs)
-        path, today = _report_path(args, "eval")
-        _write_report(path, ev.render_eval_report(
-            results, rows, timings, metrics, ok, extra, cfg, truth=truth,
-            truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today))
-    except (ValueError, OSError, KeyError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    cfg, results, rows, timings, runs, truth = _eval_inputs(args)
+    rules = load_rules(Path(args.rules).expanduser())
+    metrics = ev.evaluate(rows, timings, config=cfg, runs=runs)
+    ok = ev.passes(metrics, cfg)
+    extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs)
+    path, today = _report_path(args, "eval")
+    _write_report(path, ev.render_eval_report(
+        results, rows, timings, metrics, ok, extra, cfg, truth=truth,
+        truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today))
     def shown(name: str) -> str:
         value = getattr(metrics, name)
         return f"{value:.3f}" if math.isfinite(value) else "unverified"
@@ -325,28 +308,23 @@ def _add_eval(sub: argparse._SubParsersAction) -> None:
 
 
 def _cmd_tune(args: argparse.Namespace) -> int:
-    import sys
 
     from bxjudge import evaluate as ev
     from bxjudge.config import load_thresholds
 
-    try:
-        cfg, results, rows, _, _, truth = _eval_inputs(args)
-        th_path = Path(args.thresholds).expanduser()
-        th = load_thresholds(th_path)
-        samples = ev.shake_samples(rows, th.impact_coincide_frames)
-        derivation = ev.derive_shake(samples.samples, cfg.shake_overlap_percentile)
-        diff = ("" if derivation.method == "insufficient"
-                else ev.thresholds_diff(th_path, "shake_px", derivation.value))
-        path, today = _report_path(args, "tune")
-        _write_report(path, ev.render_tune_report(
-            results, rows, samples, derivation, diff, th.shake_px,
-            ev.spin_dir_check(rows, cfg.spin_min_samples), ev.reversed_finish_check(rows),
-            impact_coincide_frames=th.impact_coincide_frames, thresholds_path=th_path,
-            truth=truth, today=today))
-    except (ValueError, OSError, KeyError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    cfg, results, rows, _, _, truth = _eval_inputs(args)
+    th_path = Path(args.thresholds).expanduser()
+    th = load_thresholds(th_path)
+    samples = ev.shake_samples(rows, th.impact_coincide_frames)
+    derivation = ev.derive_shake(samples.samples, cfg.shake_overlap_percentile)
+    diff = ("" if derivation.method == "insufficient"
+            else ev.thresholds_diff(th_path, "shake_px", derivation.value))
+    path, today = _report_path(args, "tune")
+    _write_report(path, ev.render_tune_report(
+        results, rows, samples, derivation, diff, th.shake_px,
+        ev.spin_dir_check(rows, cfg.spin_min_samples), ev.reversed_finish_check(rows),
+        impact_coincide_frames=th.impact_coincide_frames, thresholds_path=th_path,
+        truth=truth, today=today))
     print(diff.rstrip() if diff else f"shake_px: no change proposed ({derivation.method})")
     print(f"advisory only, {th_path} not modified; report: {path}")
     return 0
@@ -364,17 +342,12 @@ def _add_tune(sub: argparse._SubParsersAction) -> None:
 
 
 def _cmd_audit_sample(args: argparse.Namespace) -> int:
-    import sys
 
-    from bxjudge.corrections import CorrectionError, mark_audit_sample
+    from bxjudge.corrections import mark_audit_sample
     from bxjudge.rules import load_rules
 
-    try:
-        picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
-                                   rules=load_rules(Path(args.rules).expanduser()))
-    except (CorrectionError, ValueError, OSError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
+                               rules=load_rules(Path(args.rules).expanduser()))
     for video, number in picked:
         print(f"{video}\t{number}")
     print(f"{len(picked)} unflagged round(s) in the audit sample (seed {args.seed}); review "
@@ -398,15 +371,40 @@ _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bxjudge", description="Local AI referee for Beyblade X videos")
+    # Suppressed subparser defaults let --debug work before or after any command.
+    def add_debug(p):
+        p.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                       help="show tracebacks for user errors and cancellation")
+        for action in p._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    add_debug(child)
+
     sub = parser.add_subparsers(dest="command", required=True)
     for register in _REGISTRARS:
         register(sub)
+    add_debug(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return int(args.func(args) or 0)
+    import sys
+
+    import yaml
+
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        if getattr(args, "debug", False):
+            raise
+        print("cancelled", file=sys.stderr)
+        return 130
+    except (ValueError, OSError, RuntimeError, yaml.YAMLError) as error:
+        if getattr(args, "debug", False):
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

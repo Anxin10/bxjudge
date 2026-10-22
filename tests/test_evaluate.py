@@ -874,3 +874,14 @@ def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):
     for text in ("wall-clock", "sum-based", "Wilson", "audit_sample", "自動化率 Automation Rate",
                  "Overall Original Accuracy", "Reviewed-output Agreement", "no weighted score"):
         assert text in summary, text
+
+
+@pytest.mark.parametrize("raw", [None, {}, "rows", 1, [None], ["row"]])
+def test_read_results_rejects_invalid_row_containers(tmp_path, raw):
+    from bxjudge.evaluate import read_results
+
+    path = tmp_path / "rounds.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="rounds.json.*list of.*mapping"):
+        read_results(tmp_path)
+    assert path.read_text() == json.dumps(raw)

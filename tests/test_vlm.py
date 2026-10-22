@@ -27,6 +27,13 @@ FINAL_Q = "左方開始的陀螺最後停在哪個區域，還是先停止旋轉
 AIR_Q = "兩顆陀螺落地前是否在空中相撞？"
 
 
+@pytest.fixture(autouse=True)
+def reachable_endpoint(monkeypatch):
+    # Existing tests focus on replies/frames; real preflight transport is exercised
+    # by test_operability without loading either model.
+    monkeypatch.setattr(vlm, "preflight", lambda config: None)
+
+
 def res(video, round, *, finish=None, winner=None, needs_review=False, reasons=(), **kw):
     r = rr(finish, winner, video=video, round=round, review_reasons=list(reasons), **kw)
     r.needs_review = needs_review

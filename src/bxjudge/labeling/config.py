@@ -43,8 +43,10 @@ def load_config(path: str | Path = "config/labeling.yaml") -> dict:
         or cfg["launcher_max_aspect"] < 1
     ):
         raise ValueError("invalid labeling ratios")
-    if set(cfg["prompts"]) != {"bey", "bey_part", "launcher"} or any(
-        not isinstance(p, str) or not p.strip() for p in cfg["prompts"].values()
+    if (
+        not isinstance(cfg["prompts"], dict)
+        or set(cfg["prompts"]) != {"bey", "bey_part", "launcher"}
+        or any(not isinstance(p, str) or not p.strip() for p in cfg["prompts"].values())
     ):
         raise ValueError("prompts must name all three classes")
     return cfg

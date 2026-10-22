@@ -833,6 +833,8 @@ def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None, list
     if not rounds.is_file():
         raise ValueError(f"{results_dir}: no rounds.json (run `bxjudge run` first)")
     rows = json.loads(rounds.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"{rounds}: expected a list of round mappings")
     from .corrections import AUDIT_META, validate_audit_sample
 
     audit_path = results_dir / AUDIT_META

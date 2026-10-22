@@ -492,7 +492,7 @@ def test_sample_cli_rejects_identical_copies_before_video_sampling(
 
     monkeypatch.setattr(label_cli, "probe", unexpected_probe)
     with pytest.raises(ValueError, match="duplicate video content") as error:
-        main(["label", "sample", str(tmp_path), "--out", str(out)])
+        main(["--debug", "label", "sample", str(tmp_path), "--out", str(out)])
     assert str(original) in str(error.value) and str(duplicate) in str(error.value)
     assert not out.exists()
 
@@ -531,6 +531,20 @@ def test_prelabel_cli_rejects_duplicate_manifest_before_gpu(tmp_path, monkeypatc
 
     monkeypatch.setattr(sam, "run_prelabel_jobs", unexpected_worker)
     with pytest.raises(ValueError, match="duplicate video content") as error:
-        main(["label", "prelabel", "--samples", str(manifest), "--out", str(out)])
+        main(["--debug", "label", "prelabel", "--samples", str(manifest), "--out", str(out)])
     assert str(original) in str(error.value) and str(duplicate) in str(error.value)
     assert not out.exists()
+
+
+@pytest.mark.parametrize("prompts", [None, [], ["bey", "bey_part", "launcher"], "bey", 1])
+def test_config_rejects_non_mapping_prompts(tmp_path, prompts):
+    import yaml
+
+    from bxjudge.labeling.config import load_config
+
+    cfg = load_config()
+    cfg["prompts"] = prompts
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(ValueError, match="prompts"):
+        load_config(path)

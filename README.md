@@ -3,6 +3,13 @@
 Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X match videos）。
 所有程式都在 WSL2 Ubuntu 內執行；影片不上傳到任何雲端服務。
 
+首次執行依本文順序：環境／同步 → 校準 → 抽格／人工標註／匯出 → 訓練兩種偵測器 →
+比較並產生 selection → 安裝／啟動專案 Ollama → run → 選用 standalone vlm →
+review → 抽樣稽核／eval／tune。以下命令都從 repo 根目錄執行。
+來源影片（含雲端與 WSL 同步副本）只讀，輸出放在 repo 的獨立資料夾。
+同一 results 目錄一次只能有一個寫入者：run、vlm、review、audit-sample 不可並行。
+一般輸入錯誤回傳非零與 `error:`；加 `--debug` 可保留 traceback，Ctrl+C 回傳 130。
+
 ## 環境設定
 
 ```bash
@@ -52,6 +59,17 @@ prints (the second argument carries the drive.readonly scope) to a machine with 
 a bare `rclone authorize "drive"` drops that scope. Sync a batch with
 `scripts/sync_videos.sh <drive_folder_id> <batch_name>` (lands in `~/bx/videos/<batch_name>`),
 and list new/changed videos with `uv run bxjudge scan ~/bx/videos/<batch_name>`.
+
+## 校準（必須先有真實場地多邊形）
+
+```bash
+uv run bxjudge calibrate ~/bx/videos/20261001/example.mp4 --at 1 --name 20261001 --out calib
+```
+
+將 `example.mp4` 換成已同步的一支影片；WSL 需可顯示 OpenCV GUI。依視窗提示點選
+stadium、lid、battle_area、over_left、over_right、xtreme、launch_left、launch_right，
+Enter 儲存、u 復原、Esc 取消。參考 PNG 與 JSON 放在 `calib/`，換機位／場地須重新校準；
+低相似度影片會標記 `recalibrate`，不硬套舊區域。校準原始畫面與來源路徑不進 Git。
 
 ## 本機標註：抽格 → SAM 3.1 → 人工修正 → COCO
 
@@ -169,26 +187,109 @@ uv run python scripts/smoke_labeling.py --out .superpowers/sdd/plan/scratch/labe
 預標。零物件只證明管線可運作，不證明真實陀螺辨識準確率。真實批次同步/OAuth、
 約 400 張人工標註與 Windows 瀏覽器人工驗收仍須使用者完成。
 
-## 評估與門檻校正（`bxjudge eval` / `bxjudge tune`）
+## 訓練兩種偵測器 → 比較 → selection
 
-覆核完（`bxjudge review`）後，以人工確認的回合（`reviewed`）為真值評估：
+先完成人工修正與 COCO 匯出，資料須含互不重疊的整支影片 train / val；一支影片全放 train
+的資料不足以比較。SAM 預標不是真值。下載官方 Ultralytics 的 YOLO26 Nano 預訓練權重，
+放到 `config/detection.yaml` 實際使用的位置（不會啟動訓練或推論）：
 
 ```bash
+mkdir -p runs/pretrained
+curl --fail --location --output runs/pretrained/yolo26n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt
+uv run bxjudge train --kind rfdetr --dataset data/dataset --out runs/rfdetr-real --config config/detection.yaml --thresholds config/thresholds.yaml
+uv run bxjudge train --kind yolo26 --dataset data/dataset --out runs/yolo26-real --config config/detection.yaml --thresholds config/thresholds.yaml
+uv run bxjudge compare --dataset data/dataset --rfdetr runs/rfdetr-real/fit/checkpoint_best_total.pth --yolo26 runs/yolo26-real/fit/weights/best.pt --output runs/compare-real.json --selection-out weights/selected.json --config config/detection.yaml --thresholds config/thresholds.yaml
+```
+
+[官方 YOLO26 說明](https://docs.ultralytics.com/models/yolo26/)；下載位置對應已安裝套件下載器的官方
+`ultralytics/assets` v8.4.0 release。RF-DETR Nano 由框架取得其官方預訓練權重。
+訓練採 `config/detection.yaml` 的 production policy（100 epochs，解析度取自
+`config/thresholds.yaml`）；每次訓練用新的空 out 目錄。compare 在相同 COCO val 上比較兩者
+並產生 `weights/selected.json`，run 必須使用此 manifest，不能用任意單一 checkpoint 代替。
+`config/detection_smoke.yaml` 僅供明確指定的合成 smoke，不支持真實準確率驗收；
+不要以 smoke selection 覆寫上述正式 selection。
+
+## 專案本機 Ollama（固定 0.40.7）
+
+使用[官方 Linux release](https://github.com/ollama/ollama/releases/tag/v0.40.7)，不執行
+全域 install.sh、不使用 systemd，也不變動共享的 11434。安裝器只接受新 runtime 目錄，
+先驗證官方 amd64 archive 的 1505607169 bytes 與 SHA256
+`7f082e625b4c334df84ed1558fe282d6d8091fe3545790aef30b3a9c50d44d41`，再安全解壓。
+解壓工具 zstandard 0.25.0 放在 uv 的一次性隔離環境，不改專案或全域 Python 依賴。
+
+```bash
+uv run --isolated --no-project --with zstandard==0.25.0 python scripts/setup_ollama.py
+# 已下載同一官方 archive 時可重用，仍會檢查大小與 SHA256：
+# uv run --isolated --no-project --with zstandard==0.25.0 python scripts/setup_ollama.py --archive /absolute/path/ollama-linux-amd64.tar.zst
+bash scripts/serve_ollama.sh
+```
+
+此命令以前景執行 `weights/ollama-runtime/bin/ollama serve`，固定
+`OLLAMA_HOST=127.0.0.1:11435`、`OLLAMA_NO_CLOUD=1`、`OLLAMA_MODELS=$PWD/weights/ollama`。
+終端保留服務，Ctrl+C 停止此服務；若 11435 已被占用，先確認原服務，不要終止他人的程序。
+不需更新已存在且版本正確的 runtime；重新安裝須明確選擇新的 `--runtime` 目錄，
+並將該路徑作為 `serve_ollama.sh` 第一參數。第二參數可指定另一個本機 model store。
+
+另開終端，先確認服務，再明確下載所選的兩個本地模型（這兩步不會上傳影片）：
+
+```bash
+curl --fail --noproxy '*' http://127.0.0.1:11435/api/version
+OLLAMA_HOST=127.0.0.1:11435 OLLAMA_NO_CLOUD=1 weights/ollama-runtime/bin/ollama pull qwen3.8:27b
+OLLAMA_HOST=127.0.0.1:11435 OLLAMA_NO_CLOUD=1 weights/ollama-runtime/bin/ollama pull qwen3-vl:8b
+```
+
+`config/vlm.yaml` 指向上述端點，主模型 27b、備援 8b。每次 VLM phase 在抽取事件畫面前
+只做一次 `/api/version` preflight（最多 5 秒，不載入模型）；端點不可用時只警告一次，
+保留核心判定並寫 `vlm_unavailable` 備註。preflight 不保證模型已下載或 GPU 記憶體足夠；
+推論失敗時保留既有本地備援政策。只接受 literal loopback，拒絕 cloud tag、HTTP redirect
+與環境代理；VLM 永遠只寫 `vlm_note`，不覆寫判定或人工覆核。
+
+## 批次判定 → 選用 VLM 重試 → 人工覆核
+
+```bash
+uv run bxjudge run ~/bx/videos/20261001 --calib calib --out results/20261001 --selection weights/selected.json --config config/detection.yaml --thresholds config/thresholds.yaml --rules config/rules.yaml --vlm-config config/vlm.yaml
+# after_run: true 預設會在釋放偵測器後執行 VLM；--no-vlm 可先只產出核心結果。
+# 服務就緒後可另跑，只處理仍未人工覆核、needs_review 且尚無成功備註的回合：
+uv run bxjudge vlm results/20261001 --calib calib --config config/vlm.yaml --thresholds config/thresholds.yaml --rules config/rules.yaml
+uv run bxjudge review results/20261001 --calib calib --thresholds config/thresholds.yaml --rules config/rules.yaml
+```
+
+瀏覽器開啟 http://127.0.0.1:8501，逐一覆核需覆核回合；完成後停止 UI，再做稽核抽樣。
+run 會跳過同一 outdir 中未變的影片；已人工覆核的影片不可重分析。變更偵測器／門檻或加入
+影片以重做驗收時，一律使用新的 results outdir。建立 audit_sample.json 後整批原始母體凍結，
+不可在原目錄補判或重跑；請保留該目錄及稽核 metadata，不可手改或刪除 metadata 以重抽。
+`calib/`、`results/`、`reports/`、`graphify-out/` 預設忽略，另選自訂路徑也須自行避免加入 Git。
+
+## 評估與門檻校正（`bxjudge eval` / `bxjudge tune`）
+
+人工確認需覆核回合後，也必須抽查「原始未標覆核」回合，才能評估自動裁判正確率。
+以下 `--n 100 --seed 42` 是抽樣例子，樣本不足則指令拒絕，不能自行挑容易的回合取代；
+可改為實際母體大小做全查。抽樣後需逐筆完成人工覆核（UI 的「抽樣稽核」篩選器）：
+
+```bash
+uv run bxjudge audit-sample results/20261001 --n 100 --seed 42 --rules config/rules.yaml
+uv run bxjudge review results/20261001 --calib calib
 uv run bxjudge eval results/20261001            # 寫 reports/eval-YYYYMMDD.md
 uv run bxjudge tune results/20261001            # 寫 reports/tune-YYYYMMDD.md，印出建議 diff
 # 優化迴圈：新設定輸出到新資料夾，再拿已覆核的舊結果當真值（兩邊都只讀）
-uv run bxjudge run ~/bx/videos/20261001 --out results/20261001-try2
+uv run bxjudge run ~/bx/videos/20261001 --calib calib --selection weights/selected.json --out results/20261001-try2
 uv run bxjudge eval results/20261001-try2 --truth results/20261001
 ```
 
 - 真值 = 已覆核回合的 effective 值（原判 + `reviewer_fix`）；預測 = 原始欄位（含原始
   `needs_review`）。`recalibrate` / `no_round` / `decode_error` / `analysis_error` 不是回合。
 - 報告最上方是摘要表：spec §11 五項（未標覆核回合判定正確率、觸碰召回、空碰召回、
-  需覆核比例、處理速度比中位數）與是否達標，以及核心判定延遲、VLM 單次請求延遲
+  需覆核比例、逐影片速度要求）與是否達標，以及核心判定延遲、VLM 單次請求延遲
   （中位數 / p95 / 最大，冷 / 熱）、VLM 觸發率、端到端延遲、速度達標率、裁判正確率。
   分母為 0 的指標顯示 unverified，一律不算達標。
-- 速度以「核心 + VLM」計（R59）；核心時間不含一次性的模型載入與掃描 / probe，核心-only
-  比值另列為診斷。影片長度用 videos.json 記錄的播放秒數，慢動作不換算。
+- 未標覆核準確率需完整全查，或凍結的隨機 audit 樣本完整覆核後以 Wilson 信賴下界判定；
+  樣本未覆核完、來源不完整或真值不足都顯示 unverified。只覆核被標記回合不能驗證自動判定。
+  reviewed output agreement 是覆核輸出對覆核真值的一致性，不能當作原始裁判準確率。
+- 逐影片速度要求保留「處理時間 ≤ 影片長度」；目前核心 + VLM stage sum 的最差逐片比值
+  超標會 FAIL，符合估計值仍為 UNVERIFIED，正式 PASS 需要實測逐影片 wall 證據，目前管線
+  尚未記錄。batch wall throughput 與中位數僅是獨立診斷，不能取代逐影片要求。
+  核心 stage 不含一次性模型載入與 scan / probe；批次 wall 含初始化與 VLM。
+  影片長度用 videos.json 的播放秒數，慢動作不換算。
 - 目標值、容許誤差與百分位都在 `config/evaluation.yaml`。
 - `--truth` 只用 (video, round) 唯一、該影片回合數相同、`t_launch` 差在容許內的回合；
   重複、缺少、分段不同、時間不符都列在報告並排除，不猜最近的回合，也不改任何檔案。

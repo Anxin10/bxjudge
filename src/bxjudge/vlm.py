@@ -227,6 +227,12 @@ def _post(host: str, payload: dict, *, path: str = "/api/chat", timeout: float) 
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    return _request_json(request, timeout=timeout)
+
+
+def _request_json(request: urllib.request.Request, *, timeout: float):
+    """One no-proxy/no-redirect transport for chat and the frame-free preflight."""
+    url = request.full_url
     try:
         with _opener().open(request, timeout=timeout) as response:
             body = response.read()
@@ -238,6 +244,14 @@ def _post(host: str, payload: dict, *, path: str = "/api/chat", timeout: float) 
         return json.loads(body)
     except ValueError:
         raise VlmError(f"non-JSON response from {url}") from None
+
+
+def preflight(config: VlmConfig) -> None:
+    """Check local Ollama reachability without sending images or loading a model."""
+    request = urllib.request.Request(validate_endpoint(config.host) + "/api/version")
+    data = _request_json(request, timeout=min(5.0, config.timeout_s))
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str) or not data["version"].strip():
+        raise VlmError("invalid /api/version response from local Ollama")
 
 
 def _encode(image: np.ndarray) -> str:
@@ -378,11 +392,24 @@ class VlmSession:
     def __init__(self, config: VlmConfig):
         self.config = _validated(config)
         self.used = False
+        self._checked = False
+        self.unavailable: str | None = None
         self.models: Counter[str] = Counter()
         self.primary_down: str | None = None
         # One record per request actually sent (output.VLM_REQUEST_KEYS, R60). "cold" is
         # the first answer by that model in this phase; models are unloaded at close().
         self.requests: list[dict] = []
+
+    def available(self) -> bool:
+        """Preflight once per phase, before any event frames are read."""
+        if not self._checked:
+            self._checked = True
+            try:
+                preflight(self.config)
+            except VlmError as error:
+                self.unavailable = _short(error)
+                log.warning("VLM unavailable: %s; continuing without VLM frames", self.unavailable)
+        return self.unavailable is None
 
     def _mark(self, name: str, error: VlmError) -> None:
         if name == self.config.model and not isinstance(error, VlmReplyError):
@@ -503,6 +530,8 @@ def _describe(error: BaseException) -> str:
 
 
 def _note(r: RoundResult, get_frames, session: VlmSession) -> str:
+    if not session.available():
+        return f"{UNAVAILABLE_PREFIX}{session.unavailable}"
     question = question_for(r)
     try:
         images = list(get_frames(r))
