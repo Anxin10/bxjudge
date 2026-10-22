@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import cv2
@@ -65,6 +65,16 @@ def load_calibration(path: Path) -> Calibration:
     polys: dict[str, Polygon] = {f: [(float(x), float(y)) for x, y in d[f]] for f in _POLY_FIELDS}
     w, h = d["frame_size"]
     return Calibration(name=d["name"], frame_size=(int(w), int(h)), ref_frame=ref, **polys)
+
+
+def scale_calibration(c: Calibration, size: tuple[int, int]) -> Calibration:
+    """``c`` with ``frame_size`` and all zone polygons scaled to decoded ``(width, height)``."""
+    sx, sy = size[0] / c.frame_size[0], size[1] / c.frame_size[1]
+    return replace(
+        c,
+        frame_size=size,
+        **{name: [(x * sx, y * sy) for x, y in getattr(c, name)] for name in _POLY_FIELDS},
+    )
 
 
 # --------------------------------------------------------------------------- similarity

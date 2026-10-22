@@ -138,7 +138,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   selection=Path(args.selection).expanduser(),
                   thresholds=Path(args.thresholds).expanduser(),
                   rules_path=Path(args.rules).expanduser(),
-                  detection_config=Path(args.config).expanduser(), limit=args.limit)
+                  detection_config=Path(args.config).expanduser(), limit=args.limit,
+                  vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser())
     except (ValueError, OSError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -156,10 +157,52 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--config", default="config/detection.yaml")
     p.add_argument("--limit", type=int, help="maximum new/changed videos")
+    p.add_argument("--vlm-config", default="config/vlm.yaml",
+                   help="local VLM second opinion after judging (its after_run key enables it)")
+    p.add_argument("--no-vlm", action="store_true", help="skip the VLM phase")
     p.set_defaults(func=_cmd_run)
 
 
-_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run]
+def _cmd_vlm(args: argparse.Namespace) -> int:
+    import json
+    import logging
+    import sys
+
+    from bxjudge import vlm
+    from bxjudge.config import load_thresholds
+    from bxjudge.rules import load_rules
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    results = Path(args.results).expanduser()
+    try:
+        if not results.is_dir():
+            raise ValueError(f"{results}: expected a results directory")
+        summary = vlm.review_results_dir(
+            results,
+            calib_dir=Path(args.calib).expanduser(),
+            th=load_thresholds(Path(args.thresholds).expanduser()),
+            rules=load_rules(Path(args.rules).expanduser()),
+            config=vlm.load_vlm_config(Path(args.config).expanduser()),
+        )
+    except (ValueError, OSError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
+def _add_vlm(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("vlm", help="ask the local VLM about unreviewed review-required rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--calib", default="calib", help="calibration directory used by the run")
+    p.add_argument("--config", default="config/vlm.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.set_defaults(func=_cmd_vlm)
+
+
+_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
+               _add_vlm]
 
 
 def build_parser() -> argparse.ArgumentParser:

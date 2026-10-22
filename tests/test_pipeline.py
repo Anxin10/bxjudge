@@ -761,3 +761,113 @@ def test_case_variant_video_artifact_collision_fails_preflight(tmp_path):
     with pytest.raises(ValueError, match="basename|artifact"):
         pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+# --------------------------------------------------------------------------- VLM phase (Task 14)
+
+
+def _vlm_config(tmp_path, **change):
+    import yaml
+
+    raw = yaml.safe_load(Path("config/vlm.yaml").read_text(encoding="utf-8"))
+    raw.update(change)
+    path = tmp_path / "vlm.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
+    import weakref
+
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "a.mp4", seconds=0.1)
+    refs = []
+
+    class Detector:
+        def __call__(self, image, frame):
+            return []
+
+    def load(*a, **k):
+        d = Detector()
+        refs.append(weakref.ref(d))
+        return d
+
+    monkeypatch.setattr(pipeline, "load_detector", load)
+    monkeypatch.setattr(
+        pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")]
+    )
+    phases = []
+
+    def review(out_dir, **kw):
+        assert refs and refs[0]() is None, "detector still alive when the VLM loads"
+        assert (out_dir / "rounds.json").exists()
+        phases.append((out_dir, kw))
+        return {"asked": 0, "answered": 0, "unavailable": 0, "models": {}}
+
+    monkeypatch.setattr(pipeline, "review_results_dir", review)
+    out = tmp_path / "out"
+    pipeline.run_batch(
+        folder,
+        tmp_path,
+        out,
+        selection=_synthetic_selection(tmp_path),
+        vlm_config=_vlm_config(tmp_path),
+    )
+    [(out_dir, kw)] = phases
+    assert out_dir == out and kw["videos"] == {"a.mp4"}
+    assert kw["calib_dir"] == tmp_path and kw["config"].model == "qwen3.8:27b"
+
+
+def test_vlm_phase_is_opt_in_and_config_guarded(tmp_path, monkeypatch, rules, th):
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+    monkeypatch.setattr(
+        pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")]
+    )
+    monkeypatch.setattr(
+        pipeline, "review_results_dir", lambda *a, **k: pytest.fail("VLM ran")
+    )
+    for name, vlm_config in (
+        ("default", None),
+        ("disabled", _vlm_config(tmp_path, after_run=False)),
+    ):
+        pipeline.run_batch(
+            tmp_path,
+            tmp_path,
+            tmp_path / name,
+            detector=lambda *a: [],
+            rules=rules,
+            th=th,
+            vlm_config=vlm_config,
+        )
+
+
+def test_invalid_vlm_config_fails_before_model_and_outputs(tmp_path, monkeypatch):
+    make_video(tmp_path / "a.mp4", seconds=0.1)
+
+    def forbidden(*a, **k):
+        pytest.fail("reached model/judging with invalid VLM config")
+
+    monkeypatch.setattr(pipeline, "load_detector", forbidden)
+    monkeypatch.setattr(pipeline, "judge_video", forbidden)
+    with pytest.raises(ValueError, match="loopback"):
+        pipeline.run_batch(
+            tmp_path,
+            tmp_path,
+            tmp_path / "out",
+            vlm_config=_vlm_config(tmp_path, host="http://192.0.2.10:11435"),
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_run_cli_passes_vlm_config_unless_disabled(tmp_path, monkeypatch):
+    from bxjudge.cli import main
+
+    calls = []
+    monkeypatch.setattr(pipeline, "run_batch", lambda *a, **kw: calls.append(kw))
+    assert main(["run", str(tmp_path)]) == 0
+    assert calls[-1]["vlm_config"] == Path("config/vlm.yaml")
+    assert main(["run", str(tmp_path), "--vlm-config", "x/vlm.yaml"]) == 0
+    assert calls[-1]["vlm_config"] == Path("x/vlm.yaml")
+    assert main(["run", str(tmp_path), "--no-vlm"]) == 0
+    assert calls[-1]["vlm_config"] is None

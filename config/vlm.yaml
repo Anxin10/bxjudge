@@ -1,0 +1,17 @@
+# Local VLM second opinion (spec section 8; Rulings R26/R40).
+# Only the project-local isolated Ollama 0.40.7 (weights/ollama-runtime/bin/ollama,
+# model store weights/ollama, OLLAMA_NO_CLOUD=1) is used. The host must be a literal
+# loopback address and cloud model tags are rejected: frames never leave this machine.
+host: http://127.0.0.1:11435
+model: qwen3.8:27b            # primary (spec section 5)
+fallback: qwen3-vl:8b         # used when the primary returns an error, OOM or an invalid reply
+after_run: true               # `bxjudge run` asks the VLM after the core judge (detector released first)
+timeout_s: 900                # per request; measured 27b cold request 141 s, of which 117 s model load
+keep_alive: 10m               # stay loaded across rows; explicitly unloaded at phase end / error
+think: false
+num_ctx: 16384
+num_predict: 6144             # 8b (a thinking build) ignores think:false: 64 and 2048 tokens ended done_reason length
+temperature: null             # model default sampling; greedy (0) made the 8b thinking build loop to done_reason length
+event_window_s: 1.0           # playback seconds on each side of the event (spec section 8)
+frames: 8                     # spec section 8: about 6-10 key frames
+image_long_edge: 768          # decoded long edge of the frames sent to the VLM (never upscaled)

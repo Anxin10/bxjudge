@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
+import sys
 import time
 from collections import Counter
 from contextlib import closing
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from itertools import chain
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .calibration import ZONES, find_calibration
+from .calibration import find_calibration, scale_calibration
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -35,8 +37,9 @@ from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
-from .types import Calibration, RoundResult, Track
+from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames
+from .vlm import load_vlm_config, review_results_dir
 
 log = logging.getLogger(__name__)
 
@@ -57,18 +60,6 @@ def _provenance(
                 r.review_reasons.append("synthetic_detector")
             r.needs_review = True
     return results
-
-
-def _scaled(c: Calibration, size: tuple[int, int]) -> Calibration:
-    sx, sy = size[0] / c.frame_size[0], size[1] / c.frame_size[1]
-    return replace(
-        c,
-        frame_size=size,
-        **{
-            name: [(x * sx, y * sy) for x, y in getattr(c, name)]
-            for name, _, _ in ZONES
-        },
-    )
 
 
 def _crop(frame: np.ndarray, box) -> np.ndarray | None:
@@ -118,7 +109,7 @@ def judge_video(
                 return _provenance(
                     [_review(info.path.name, info.duration, "recalibrate")], provenance
                 )
-            c = _scaled(c, (prefix[-1][1].shape[1], prefix[-1][1].shape[0]))
+            c = scale_calibration(c, (prefix[-1][1].shape[1], prefix[-1][1].shape[0]))
             ref = cv2.imread(c.ref_frame)
             if ref is None:
                 raise FileNotFoundError(c.ref_frame)
@@ -367,6 +358,7 @@ def run_batch(
     detector: Detector | None = None,
     rules: Rules | None = None,
     th: Thresholds | None = None,
+    vlm_config: Path | None = None,
 ) -> None:
     folder, out_dir = Path(folder).expanduser(), Path(out_dir).expanduser()
     if not folder.is_dir():
@@ -391,6 +383,11 @@ def run_batch(
     rules = load_rules(rules_path) if rules is None else rules
     _validate_thresholds(th)
     policy = load_policy(detection_config)
+    # Spec section 8: the optional VLM phase is configured (and its loopback endpoint
+    # validated) up front; None or after_run: false keeps the run Ollama-free.
+    vlm = load_vlm_config(vlm_config) if vlm_config is not None else None
+    if vlm is not None and not vlm.after_run:
+        vlm = None
     provenance = None
     if detector is None:
         provenance = _load_selection(Path(selection).expanduser(), th)
@@ -459,3 +456,22 @@ def run_batch(
             processing,
             info.duration if info else 0.0,
         )
+    if vlm is not None and entries:
+        # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
+        del detector
+        _release_gpu_memory()
+        review_results_dir(
+            out_dir,
+            calib_dir=calib_dir,
+            th=th,
+            rules=rules,
+            config=vlm,
+            videos={path.name for path, _ in entries},
+        )
+
+
+def _release_gpu_memory() -> None:
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()

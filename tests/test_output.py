@@ -185,3 +185,15 @@ def test_burst_finish_marker_uses_trailing_part_observation(tmp_path, monkeypatc
         tmp_path, rr("burst", "B"), bey, parts, c, 30, {"finish": 11}
     )
     assert (205, 180) in markers
+
+
+def test_vlm_timing_is_separate_and_accumulates(tmp_path):
+    output.record_video_timing(tmp_path, "a.mp4", 10, 2, source_video=tmp_path / "a.mp4")
+    output.record_vlm_timing(tmp_path, "a.mp4", 30.5)
+    output.record_vlm_timing(tmp_path, "a.mp4", 1.5)
+    data = json.loads((tmp_path / "videos.json").read_text())
+    assert data["a.mp4"]["processing_s"] == 2 and data["a.mp4"]["vlm_s"] == 32.0
+    assert data["a.mp4"]["source_video"] == str(tmp_path / "a.mp4")
+    # A fresh core analysis replaces the rounds, so earlier VLM time no longer applies.
+    output.record_video_timing(tmp_path, "a.mp4", 10, 3)
+    assert "vlm_s" not in json.loads((tmp_path / "videos.json").read_text())["a.mp4"]

@@ -202,6 +202,19 @@ def record_video_timing(
     _write_json(path, rows)
 
 
+def record_vlm_timing(out_dir: Path, video: str, vlm_s: float) -> None:
+    """Add VLM phase time to ``vlm_s``, kept apart from core ``processing_s``.
+
+    A later core analysis (``record_video_timing``) replaces the entry and its rounds,
+    so accumulated VLM time always belongs to the current round set.
+    """
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    entry = rows.setdefault(video, {})
+    entry["vlm_s"] = entry.get("vlm_s", 0.0) + vlm_s
+    _write_json(path, rows)
+
+
 def write_trajectory(
     out_dir: Path,
     r: RoundResult,
