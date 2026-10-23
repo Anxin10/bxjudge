@@ -142,8 +142,9 @@ def judge_video(
     (``select_snapshot``: manual, else reused/new auto, else ``None`` = ``recalibrate``),
     unless the caller already selected one on that same frame (``snapshot``, may be ``None``).
     The chosen snapshot (or ``None``) is reported to ``on_snapshot``. Its polygons are scaled to
-    the decoded frame size; its reference image (any size) is the stadium-displacement
-    reference; every result carries its id and its preview is written. Subsequent frames
+    the decoded frame size; the stadium-displacement reference is that same first-second frame
+    of this video (ruling T3-1: the snapshot's image serves only selection, grouping, previews);
+    every result carries the snapshot id and its preview is written. Subsequent frames
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
     """
@@ -170,9 +171,10 @@ def judge_video(
                 )
             write_preview(out_dir, snap)
             c = scale_calibration(snap.calibration, (first.shape[1], first.shape[0]))
-            ref = cv2.imread(c.ref_frame)
-            if ref is None:
-                raise FileNotFoundError(c.ref_frame)
+            # Ruling T3-1 (spec 6.2b): shake is measured against this video's own camera view,
+            # never the snapshot's reference image (another video's frame, or the manual
+            # template), whose small offset would read as constant stadium displacement.
+            ref = first
             disp = {}
             crops = {}
 

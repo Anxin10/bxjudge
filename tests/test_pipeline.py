@@ -51,6 +51,7 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None):
     def measured(frames, scaled, ref):
         assert scaled.frame_size == (1280, 720)
         assert scaled.battle_area == [(240, 120), (1040, 120), (1040, 560), (240, 560)]
+        assert ref is frame  # the video's own first-second frame, not the 640x360 snapshot PNG
         for f, image in frames:
             yield f, image, 0.0 if f != 2 else float("nan")
 
@@ -1224,3 +1225,84 @@ def test_run_cli_passes_autocalib_config(tmp_path, monkeypatch):
     assert calls[-1]["autocalib_config"] == Path("config/autocalib.yaml")
     assert main(["run", str(tmp_path), "--autocalib", "x/ac.yaml"]) == 0
     assert calls[-1]["autocalib_config"] == Path("x/ac.yaml")
+
+
+# --------------------------------------------------------------------------- displacement reference (ruling T3-1)
+
+_SHAKE = {f: (4, 0) for f in range(42, 46)}  # a 4 px stadium shake right after launch (frame 40)
+
+
+def _displacement_spy(monkeypatch):
+    """Records each judged video's displacement series ({frame: px}) in call order."""
+    series = []
+    real = pipeline.iter_stadium_displacement
+
+    def spy(frames, c, ref):
+        s = {}
+        series.append(s)
+        for f, image, d in real(frames, c, ref):
+            s[f] = d
+            yield f, image, d
+
+    monkeypatch.setattr(pipeline, "iter_stadium_displacement", spy)
+    return series
+
+
+def _assert_own_reference(series, th, rows=None):
+    """Static frames stay below shake_px; the synthetic shake gives an onset in the window."""
+    static = [d for f, d in series.items() if f not in _SHAKE and np.isfinite(d)]
+    assert static and max(static) < th.shake_px
+    assert all(series[f] > th.shake_px for f in _SHAKE)
+    assert series[min(_SHAKE) - 1] <= th.shake_px  # an onset: detect_touch can see it
+    if rows is not None:
+        window = rows[0]["motion_evidence"]["displacements"]
+        assert all(window[str(f)] > th.shake_px for f in _SHAKE)
+
+
+def test_reused_auto_snapshot_measures_shake_against_the_videos_own_frame(
+    tmp_path, rules, monkeypatch
+):
+    from tests.helpers import add_manual_calibration, stadium_scene, write_scene_video
+
+    videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
+    videos.mkdir()
+    write_scene_video(videos / "a.mp4", stadium_scene(shift=(45, 20))[0])
+    # b: the camera is 4 px away from a's frame, which becomes the group reference
+    write_scene_video(videos / "b.mp4", stadium_scene(shift=(49, 20))[0], shake=_SHAKE)
+    add_manual_calibration(calib, stadium_scene())
+    series = _displacement_spy(monkeypatch)
+    _run(videos, calib, out, rules)
+    recorded = json.loads((out / "videos.json").read_text())
+    assert recorded["a.mp4"]["calibration"]["kind"] == "auto"
+    assert recorded["b.mp4"]["calibration"]["id"] == recorded["a.mp4"]["calibration"]["id"]
+    rows = [r for r in json.loads((out / "rounds.json").read_text()) if r["video"] == "b.mp4"]
+    _assert_own_reference(series[1], _cpu_th(), rows)
+
+    # Reanalysis path (judge_video(snapshot=...) from the pre-run selection): same reference.
+    db = out / "processed_videos.json"
+    records = json.loads(db.read_text())
+    key = str((videos / "b.mp4").resolve())
+    records[key]["calibration_id"] = "0000000000000000"  # recorded id differs -> reanalysis
+    db.write_text(json.dumps(records))
+    series.clear()
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)
+    assert spy.videos == {"b.mp4"} and len(series) == 1
+    _assert_own_reference(series[0], _cpu_th())
+
+
+def test_manual_match_with_moved_camera_measures_shake_against_the_videos_own_frame(
+    tmp_path, rules, monkeypatch
+):
+    from tests.helpers import add_manual_calibration, stadium_scene, write_scene_video
+
+    videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
+    videos.mkdir()
+    write_scene_video(videos / "clip.mp4", stadium_scene(shift=(3, 0))[0], shake=_SHAKE)
+    add_manual_calibration(calib, stadium_scene())
+    series = _displacement_spy(monkeypatch)
+    _run(videos, calib, out, rules)
+    v = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert v["calibration"]["kind"] == "manual"
+    rows = json.loads((out / "rounds.json").read_text())
+    _assert_own_reference(series[0], _cpu_th(), rows)

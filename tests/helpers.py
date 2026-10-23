@@ -452,9 +452,10 @@ def stadium_scene(
     return img, calib
 
 
-def write_scene_video(path, img, *, seconds: float = 3.0, fps: int = 30):
+def write_scene_video(path, img, *, seconds: float = 3.0, fps: int = 30, shake=None):
     """Encode the static BGR frame ``img`` as a near-lossless H.264 clip of ``seconds`` at ``fps``
-    (frame size = the image size)."""
+    (frame size = the image size). ``shake`` maps frame index -> (dx, dy): that frame shows the
+    whole scene translated (a stadium shake as the camera sees it)."""
     import subprocess
     from pathlib import Path
 
@@ -466,7 +467,13 @@ def write_scene_video(path, img, *, seconds: float = 3.0, fps: int = 30):
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{w}x{h}", "-r", str(fps), "-i", "-", "-c:v", "libx264", "-preset",
            "ultrafast", "-crf", "10", "-pix_fmt", "yuv420p", str(path)]
-    data = np.ascontiguousarray(img, dtype=np.uint8).tobytes() * n
+    still = np.ascontiguousarray(img, dtype=np.uint8).tobytes()
+    shake = shake or {}
+    data = b"".join(
+        np.ascontiguousarray(shift(img, *shake[f])).tobytes() if f in shake
+        else still
+        for f in range(n)
+    )
     subprocess.run(cmd, input=data, check=True, capture_output=True)
     return path
 
