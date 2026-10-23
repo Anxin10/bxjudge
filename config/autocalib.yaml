@@ -1,0 +1,23 @@
+# Automatic calibration (spec docs/superpowers/specs/2026-10-23-auto-calibration-design.md §6.2):
+# a manual calibration "template" is aligned to a slightly moved camera frame by matching
+# polarity/colour-free edge maps; estimates outside these bounds are rejected, never used.
+# Pixel values are inference pixels (long edge 1280) unless stated otherwise.
+
+# Width (px) both images are resized to for alignment (coarse search runs at 1/4, ECC at 1/2 then full).
+work_width: 640
+# Minimum 0-1 edge-map NCC between the warped template and the frame over the warped rim mask.
+min_score: 0.6
+# Largest allowed movement of the template stadium centroid, as a fraction of the frame width.
+max_shift_frac: 0.15
+# Largest allowed in-plane camera rotation (degrees).
+max_rotation_deg: 8.0
+# Allowed zoom range (each principal stretch of the local transform must lie inside it).
+min_scale: 0.85
+max_scale: 1.15
+# Largest allowed |h20| / |h21| of the homography (frame px, h22 = 1): slight perspective only.
+max_perspective: 0.0005
+# ECC refinement termination: iteration cap per pyramid level and correlation-increment epsilon.
+ecc_iterations: 200
+ecc_epsilon: 1.0e-6
+# Acceptance threshold for the mean boundary error between auto and manual zones (inference px).
+max_boundary_error_px: 8.0

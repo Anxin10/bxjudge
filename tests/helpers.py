@@ -348,3 +348,105 @@ def rev(
         "motion_evidence": motion_evidence,
         "detector_provenance": None,
     }
+
+
+def _ellipse_poly(cx: float, cy: float, a: float, b: float, n: int = 72) -> Polygon:
+    import math
+
+    return [(cx + a * math.cos(2 * math.pi * k / n), cy + b * math.sin(2 * math.pi * k / n))
+            for k in range(n)]
+
+
+def _resample_closed(pts: Polygon, step: float) -> list[Point]:
+    """Points every ``step`` px of arc length along the closed polygon ``pts``."""
+    import math
+
+    out: list[Point] = []
+    carry = 0.0
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        t = carry
+        while t < seg:
+            out.append((x0 + (x1 - x0) * t / seg, y0 + (y1 - y0) * t / seg))
+            t += step
+        carry = t - seg
+    return out
+
+
+def stadium_scene(
+    size: tuple[int, int] = (1280, 720),
+    floor: str = "white",
+    shift: tuple[float, float] = (0, 0),
+    rotation_deg: float = 0.0,
+    scale: float = 1.0,
+):
+    """Synthetic BGR stadium frame (``size`` = (width, height)) and its exact 8-zone calibration.
+
+    The canonical layout is defined at 1280x720: an octagonal stadium body (outer rim), a
+    transparent lid drawn only as a thin ellipse outline, an elliptical battle floor ringed by
+    a toothed rail, and three dark pockets (over_left, over_right, xtreme) in the rim. Every
+    outline is a dashed band so edges are textured along their length. The whole scene is
+    rotated by ``rotation_deg`` (counter-clockwise on screen) and scaled by ``scale`` about the
+    image centre, then translated by ``shift`` output pixels; the returned polygons are the
+    same transform of the canonical zones. ``floor="black"`` inverts the floor brightness.
+    Deterministic: the sensor noise uses a fixed seed and does not move with the scene."""
+    import cv2
+    import numpy as np
+
+    if floor not in ("white", "black"):
+        raise ValueError(f"floor must be 'white' or 'black', got {floor!r}")
+    w, h = size
+    m = cv2.getRotationMatrix2D((640.0, 360.0), rotation_deg, scale)
+    sx, sy = w / 1280.0, h / 720.0
+
+    def tf(pts: Polygon) -> Polygon:
+        out = []
+        for x, y in pts:
+            u = m[0, 0] * x + m[0, 1] * y + m[0, 2]
+            v = m[1, 0] * x + m[1, 1] * y + m[1, 2]
+            out.append((float(u * sx + shift[0]), float(v * sy + shift[1])))
+        return out
+
+    def fixed(pts: Polygon) -> np.ndarray:  # 4 fractional bits for cv2's shift argument
+        return np.round(np.array(tf(pts)) * 16).astype(np.int32).reshape(-1, 1, 2)
+
+    stadium = [(270, 70), (1010, 70), (1150, 210), (1150, 560), (1010, 700), (270, 700),
+               (130, 560), (130, 210)]
+    lid = _ellipse_poly(640, 330, 470, 240)
+    battle = _ellipse_poly(640, 440, 420, 210)
+    over_left = [(160, 240), (280, 205), (300, 300), (185, 345)]
+    over_right = [(1280 - x, y) for x, y in over_left]
+    xtreme = [(560, 95), (720, 95), (700, 160), (580, 160)]
+    launch_left = rect(130, 70, 660, 330)
+    launch_right = rect(620, 70, 1150, 330)
+
+    img = np.full((h, w, 3), (40, 42, 45), np.uint8)
+    floor_bgr = (228, 228, 228) if floor == "white" else (27, 27, 27)
+    cv2.fillPoly(img, [fixed(stadium)], (150, 150, 150), cv2.LINE_AA, 4)
+    for pocket in (over_left, over_right, xtreme):
+        cv2.fillPoly(img, [fixed(pocket)], (70, 70, 75), cv2.LINE_AA, 4)
+    cv2.fillPoly(img, [fixed(battle)], floor_bgr, cv2.LINE_AA, 4)
+
+    def dashed(pts: Polygon, colors, thickness: float, step: float) -> None:
+        q = fixed(_resample_closed(pts, step)).reshape(-1, 2)
+        t = max(1, round(thickness * scale * sx))
+        for i in range(len(q)):
+            a, b = q[i], q[(i + 1) % len(q)]
+            cv2.line(img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])),
+                     colors[i % len(colors)], t, cv2.LINE_AA, 4)
+
+    dashed(stadium, [(210, 210, 210), (90, 90, 90)], 6, 14)
+    for pocket in (over_left, over_right, xtreme):
+        dashed(pocket, [(200, 200, 200), (30, 30, 30)], 4, 10)
+    dashed(battle, [(60, 190, 90), (40, 120, 60)], 12, 10)
+    dashed(lid, [(235, 235, 235), (170, 170, 170)], 3, 20)
+
+    noise = np.random.default_rng(0).normal(0.0, 2.0, (h, w, 1))
+    img = np.clip(img + noise, 0, 255).astype(np.uint8)
+    calib = Calibration(
+        name="stadium_scene", frame_size=(w, h), stadium=tf(stadium), lid=tf(lid),
+        battle_area=tf(battle), over_left=tf(over_left), over_right=tf(over_right),
+        xtreme=tf(xtreme), launch_left=tf(launch_left), launch_right=tf(launch_right),
+        ref_frame="",
+    )
+    return img, calib
