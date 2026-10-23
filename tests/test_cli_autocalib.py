@@ -199,3 +199,36 @@ def test_autocalib_cli_unreadable_video_is_an_error_line(tmp_path, capsys):
     assert code == 2
     assert "broken.mp4" in captured.err and "Traceback" not in captured.err
     assert "good.mp4: manual" in captured.out  # the next video is still judged
+
+
+def test_autocalib_cli_out_equal_to_calib_is_an_error_and_calib_is_unchanged(tmp_path, capsys):
+    calib = make_calib(tmp_path)
+    video = render_video(tmp_path, stadium_scene(shift=SHIFT))
+    before = sorted(p.name for p in calib.rglob("*"))
+    assert main(["autocalib", str(video), "--calib", str(calib), "--out", str(calib)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "Traceback" not in err
+    assert sorted(p.name for p in calib.rglob("*")) == before
+
+
+def test_autocalib_cli_out_inside_calib_is_an_error(tmp_path, capsys):
+    calib = make_calib(tmp_path)
+    video = render_video(tmp_path, stadium_scene(shift=SHIFT))
+    assert main(["autocalib", str(video), "--calib", str(calib),
+                 "--out", str(calib / "gen")]) == 2
+    assert capsys.readouterr().err.startswith("error: ")
+    assert not (calib / "gen").exists()
+
+
+def test_autocalib_cli_truth_error_exactly_at_the_limit_fails(tmp_path, capsys, monkeypatch):
+    from bxjudge import autocalib as ac
+
+    calib = make_calib(tmp_path)
+    scene = stadium_scene(shift=SHIFT)
+    video = render_video(tmp_path, scene)
+    truth = save_truth(tmp_path, scene[1])
+    limit = ac.load_autocalib_config().max_boundary_error_px
+    monkeypatch.setattr(ac, "mean_boundary_error", lambda *a, **k: limit)
+    assert main(["autocalib", str(video), "--calib", str(calib), "--out", str(tmp_path / "o"),
+                 "--truth", str(truth)]) == 1
+    assert "FAIL" in lines(capsys)[0]

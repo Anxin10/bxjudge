@@ -339,3 +339,86 @@ def test_veto_leaves_other_positions_and_manual_selection_alone(tmp_path):
     assert select_snapshot(far, calib, out, th(), load_autocalib_config(), {a.id}).id == b.id
     manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config(), {a.id})
     assert manual.kind == "manual"
+
+
+# --------------------------------------------------------------------------- shape validation (codex port Task 1)
+
+
+def _stored_manual_snapshot(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame, _ = stadium_scene()
+    snap = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    return out, snap, out / "calibrations" / f"{snap.id}.json"
+
+
+def _edit_snapshot_json(path, edit):
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    edit(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _break_polygon(doc):
+    doc[ZONES[0][0]] = [[1]]
+
+
+def _break_kind(doc):
+    doc["snapshot"]["kind"] = "bogus"
+
+
+def _drop_score(doc):
+    del doc["snapshot"]["score"]
+
+
+def _snapshot_is_list(doc):
+    doc["snapshot"] = []
+
+
+def _break_homography(doc):
+    doc["snapshot"]["homography"] = [[1, 2, 3]]
+
+
+def _break_template_set(doc):
+    doc["snapshot"]["template_set"] = "abc"
+
+
+@pytest.mark.parametrize("edit", [_break_polygon, _break_kind, _drop_score, _snapshot_is_list,
+                                  _break_homography, _break_template_set])
+def test_load_snapshot_rejects_a_malformed_file_with_valueerror(tmp_path, edit):
+    out, snap, jpath = _stored_manual_snapshot(tmp_path)
+    _edit_snapshot_json(jpath, edit)
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id)
+
+
+def test_load_snapshot_rejects_a_top_level_list(tmp_path):
+    out, snap, jpath = _stored_manual_snapshot(tmp_path)
+    jpath.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id)
+
+
+def test_load_snapshot_rejects_a_missing_reference_image(tmp_path):
+    out, snap, _ = _stored_manual_snapshot(tmp_path)
+    (out / "calibrations" / f"{snap.id}.png").unlink()
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id)
+
+
+def test_load_snapshot_still_reads_a_good_file(tmp_path):
+    out, snap, _ = _stored_manual_snapshot(tmp_path)
+    assert load_snapshot(out, snap.id).id == snap.id
+
+
+def test_validate_output_paths_rejects_overlap_and_files(tmp_path):
+    from bxjudge.calibration_store import validate_output_paths
+
+    calib = tmp_path / "calib"
+    calib.mkdir()
+    validate_output_paths(tmp_path / "out", calib)  # disjoint: fine
+    for bad in (calib, calib / "sub", tmp_path, tmp_path / "calib" / ".." / "calib"):
+        with pytest.raises(ValueError):
+            validate_output_paths(bad, calib)
+    afile = tmp_path / "file.txt"
+    afile.write_text("x")
+    with pytest.raises(ValueError, match="file"):
+        validate_output_paths(afile, calib)

@@ -157,22 +157,88 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
 
 def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
     """Read snapshot ``snapshot_id`` from ``<out_dir>/calibrations``; ``ref_frame`` is absolute.
-    Raises ``FileNotFoundError`` for an unknown id."""
+    Raises ``FileNotFoundError`` for an unknown id and ``ValueError`` for a malformed file."""
     if not snapshot_id or Path(snapshot_id).name != snapshot_id:
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}")
     jpath = _cal_dir(out_dir) / f"{snapshot_id}.json"
     if not jpath.is_file():
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}: {jpath}")
-    meta = json.loads(jpath.read_text(encoding="utf-8"))["snapshot"]
+    try:
+        doc = json.loads(jpath.read_text(encoding="utf-8"))
+        meta = _checked_meta(doc)
+        calibration = load_calibration(jpath)
+        if not calibration.ref_frame or not Path(calibration.ref_frame).is_file():
+            raise ValueError(f"missing reference image {calibration.ref_frame!r}")
+        hom = meta.get("homography")
+        tset = meta.get("template_set")
+        return Snapshot(
+            id=meta["id"], kind=meta["kind"], calibration=calibration,
+            score=float(meta["score"]), template_id=meta.get("template_id"),
+            source_path=meta.get("source_path"), source_sha256=meta.get("source_sha256"),
+            homography=None if hom is None else tuple(tuple(float(v) for v in r) for r in hom),
+            template_set=None if tset is None else tuple(str(t) for t in tset),
+        )
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(f"{jpath}: malformed calibration snapshot ({e!r})") from None
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _checked_meta(doc) -> dict:
+    """The ``snapshot`` block of a parsed snapshot file after a shape check; raises ValueError."""
+    if not isinstance(doc, dict):
+        raise TypeError("top level is not an object")
+    meta = doc.get("snapshot")
+    if not isinstance(meta, dict):
+        raise TypeError("'snapshot' is not an object")
+    if not isinstance(meta.get("id"), str):
+        raise TypeError("snapshot id is not a string")
+    if meta.get("kind") not in _KINDS:
+        raise ValueError(f"unknown kind {meta.get('kind')!r}")
+    if not _is_number(meta.get("score")):
+        raise ValueError("score is not a number")
+    for key in ("template_id", "source_path", "source_sha256"):
+        if meta.get(key) is not None and not isinstance(meta[key], str):
+            raise ValueError(f"{key} is not a string")
     hom = meta.get("homography")
+    if hom is not None and not (
+        isinstance(hom, list) and len(hom) == 3
+        and all(isinstance(r, list) and len(r) == 3 and all(map(_is_number, r)) for r in hom)
+    ):
+        raise ValueError("homography is not a 3x3 matrix of numbers")
     tset = meta.get("template_set")
-    return Snapshot(
-        id=meta["id"], kind=meta["kind"], calibration=load_calibration(jpath),
-        score=float(meta["score"]), template_id=meta.get("template_id"),
-        source_path=meta.get("source_path"), source_sha256=meta.get("source_sha256"),
-        homography=None if hom is None else tuple(tuple(float(v) for v in r) for r in hom),
-        template_set=None if tset is None else tuple(str(t) for t in tset),
-    )
+    if tset is not None and not (isinstance(tset, list) and all(isinstance(t, str) for t in tset)):
+        raise ValueError("template_set is not a list of strings")
+    size = doc.get("frame_size")
+    if not (isinstance(size, list) and len(size) == 2 and all(_is_number(v) for v in size)):
+        raise ValueError("frame_size is not [width, height]")
+    if not isinstance(doc.get("name"), str):
+        raise TypeError("name is not a string")
+    for f in _POLY_FIELDS:
+        poly = doc.get(f)
+        if not (isinstance(poly, list) and all(
+                isinstance(pt, list) and len(pt) == 2 and all(map(_is_number, pt))
+                for pt in poly)):
+            raise ValueError(f"{f} is not a list of [x, y] points")
+    return meta
+
+
+def validate_output_paths(out_dir: Path, calib_dir: Path) -> None:
+    """Raise ``ValueError`` when ``out_dir`` and ``calib_dir`` overlap (resolved equal, or one
+    inside the other, including through a ``calibrations`` symlink) or ``out_dir`` is a file.
+    Called before anything is written, so ``calib/`` is never modified by a run."""
+    out = Path(out_dir).expanduser()
+    if out.is_file():
+        raise ValueError(f"{out}: --out is a file, expected a results folder")
+    source = Path(calib_dir).expanduser().resolve()
+    output = out.resolve()
+    snapshots = (output / "calibrations").resolve()
+    for target in (output, snapshots):
+        if target.is_relative_to(source) or source.is_relative_to(target):
+            raise ValueError(f"{out}: --out must be outside --calib {calib_dir} "
+                             "(equal or nested folders would write results into calibrations)")
 
 
 class _Template(NamedTuple):

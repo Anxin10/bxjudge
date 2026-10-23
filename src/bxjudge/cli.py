@@ -191,7 +191,11 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
 
     from bxjudge import manifest
     from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
-    from bxjudge.calibration_store import select_snapshot, write_preview
+    from bxjudge.calibration_store import (
+        select_snapshot,
+        validate_output_paths,
+        write_preview,
+    )
     from bxjudge.config import load_thresholds
     from bxjudge.pipeline import first_second_frame
     from bxjudge.video import VideoDecodeError
@@ -202,6 +206,7 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
     if not calib_dir.is_dir():  # a typo must not silently turn every video into recalibrate
         raise ValueError(f"{calib_dir}: --calib is not a folder")
     out_dir = Path(args.out).expanduser()  # scratch results folder: --calib is only ever read
+    validate_output_paths(out_dir, calib_dir)
     truth = _load_truth(Path(args.truth).expanduser()) if args.truth else None
     counts = {"PASS": 0, "FAIL": 0, "REJECTED": 0}
     errors = 0
@@ -226,7 +231,7 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
                 status, shown = "REJECTED", "-"
             else:
                 err = mean_boundary_error(snap.calibration, truth, th.infer_long_edge)
-                status = "PASS" if err <= cfg.max_boundary_error_px else "FAIL"
+                status = "PASS" if err < cfg.max_boundary_error_px else "FAIL"
                 shown = f"{err:.2f}"
             counts[status] += 1
             line += f" boundary_error_px={shown} {status}"
@@ -250,7 +255,7 @@ def _add_autocalib(sub: argparse._SubParsersAction) -> None:
                    help="scratch results-style folder for calibrations/<id>.json|png|preview.jpg")
     p.add_argument("--truth", help="manual calibration JSON (keep it OUTSIDE --calib) applied to "
                                    "every video given; prints boundary_error_px PASS|FAIL "
-                                   "(above max_boundary_error_px) or REJECTED (recalibrate); "
+                                   "(at or above max_boundary_error_px) or REJECTED (recalibrate); "
                                    "exit 1 on any FAIL or REJECTED")
     p.add_argument("--allow-recalibrate", action="store_true",
                    help="with --truth: REJECTED (recalibrate) videos do not fail the run "

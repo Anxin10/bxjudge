@@ -21,7 +21,13 @@ import numpy as np
 
 from .autocalib import AutoCalibConfig, load_autocalib_config
 from .calibration import scale_calibration
-from .calibration_store import Snapshot, select_snapshot, vetoed_ids, write_preview
+from .calibration_store import (
+    Snapshot,
+    select_snapshot,
+    validate_output_paths,
+    vetoed_ids,
+    write_preview,
+)
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -483,6 +489,7 @@ def run_batch(
     calib_dir = Path(calib_dir).expanduser()
     if not calib_dir.is_dir():
         raise ValueError(f"{calib_dir}: expected calibration directory (--calib)")
+    validate_output_paths(out_dir, calib_dir)
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th

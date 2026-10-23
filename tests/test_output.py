@@ -307,3 +307,10 @@ def test_matches_for_excludes_only_unreviewed_vetoed_rows(rules):
               for r, _ in m.rounds]
     assert scored == [("a.mp4", 2)]
     assert len([r for m in output.matches_for(rows, rules) for r in m.rounds]) == 3
+
+
+@pytest.mark.parametrize("payload", ["{}", "null", "\"x\"", "3"])
+def test_read_rounds_rejects_a_non_list_rounds_json(tmp_path, payload):
+    (tmp_path / "rounds.json").write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="rounds.json must be a list of rows"):
+        output.read_rounds(tmp_path)

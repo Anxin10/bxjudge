@@ -24,6 +24,13 @@ def info(path=Path("a.mp4")):
     return VideoInfo(path, 1, 1, 4, 30, 1280, 720, "h264", False, None)
 
 
+def _empty_calib(tmp_path):
+    """An empty calibration folder disjoint from the results folder tmp_path/out."""
+    calib = tmp_path / "calib"
+    calib.mkdir(exist_ok=True)
+    return calib
+
+
 def _kw(tmp_path):
     """judge_video's required keywords for unit tests."""
     return {"out_dir": tmp_path / "out", "autocalib": _ac()}
@@ -427,7 +434,7 @@ def test_placeholder_only_video_is_retried_until_real_rounds(
 
     def run():
         pipeline.run_batch(
-            tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+            tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
         )
 
     run()  # placeholder only: nothing recorded
@@ -453,7 +460,7 @@ def test_mixed_real_and_diagnostic_rows_video_is_cached(
     )
     out = tmp_path / "out"
     pipeline.run_batch(
-        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+        tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
     )
     assert "a.mp4" in (out / "processed_videos.json").read_text()
 
@@ -494,7 +501,7 @@ def test_run_cli_missing_calibration_is_error_line(tmp_path, capsys):
 def test_invalid_global_selection_fails_without_output(tmp_path):
     with pytest.raises((ValueError, FileNotFoundError)):
         pipeline.run_batch(
-            tmp_path, tmp_path, tmp_path / "out", selection=tmp_path / "absent.json"
+            tmp_path, _empty_calib(tmp_path), tmp_path / "out", selection=tmp_path / "absent.json"
         )
     assert not (tmp_path / "out").exists()
 
@@ -579,7 +586,7 @@ def test_invalid_numeric_config_fails_before_model_and_outputs(
 
     monkeypatch.setattr(pipeline, "load_detector", forbidden)
     with pytest.raises(ValueError, match="threshold"):
-        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out", thresholds=thresholds)
+        pipeline.run_batch(tmp_path, _empty_calib(tmp_path), tmp_path / "out", thresholds=thresholds)
     assert not (tmp_path / "out").exists()
 
 
@@ -592,7 +599,7 @@ def test_run_batch_injected_dependencies_require_no_selection(
     )
     out = tmp_path / "out"
     pipeline.run_batch(
-        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+        tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
     )
     assert json.loads((out / "rounds.json").read_text())[0]["finish"] == "spin"
 
@@ -762,7 +769,7 @@ def test_injected_thresholds_are_the_detector_policy(tmp_path, monkeypatch, th, 
 
     monkeypatch.setattr(pipeline, "load_detector", loader)
     pipeline.run_batch(
-        tmp_path, tmp_path, tmp_path / "out", selection=selection, th=th, rules=rules
+        tmp_path, _empty_calib(tmp_path), tmp_path / "out", selection=selection, th=th, rules=rules
     )
     assert captured == [th]
 
@@ -789,7 +796,7 @@ def test_invalid_tracking_is_startup_failure(tmp_path, monkeypatch, tracking_cha
     monkeypatch.setattr(pipeline, "load_detector", forbidden)
     with pytest.raises(ValueError, match="tracking"):
         pipeline.run_batch(
-            tmp_path, tmp_path, tmp_path / "out", detection_config=config
+            tmp_path, _empty_calib(tmp_path), tmp_path / "out", detection_config=config
         )
     assert not (tmp_path / "out").exists()
 
@@ -798,7 +805,7 @@ def test_case_variant_video_artifact_collision_fails_preflight(tmp_path):
     (tmp_path / "a.mp4").touch()
     (tmp_path / "a.MP4").touch()
     with pytest.raises(ValueError, match="basename|artifact"):
-        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out")
+        pipeline.run_batch(tmp_path, _empty_calib(tmp_path), tmp_path / "out")
     assert not (tmp_path / "out").exists()
 
 
@@ -834,7 +841,7 @@ def test_run_records_batch_wall_clock_with_vlm_phase_inside(tmp_path, monkeypatc
     monkeypatch.setattr(pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")])
     monkeypatch.setattr(pipeline, "review_results_dir", review)
     out = tmp_path / "out"
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     [run] = json.loads((out / "runs.json").read_text())
     videos = json.loads((out / "videos.json").read_text())
@@ -845,7 +852,7 @@ def test_run_records_batch_wall_clock_with_vlm_phase_inside(tmp_path, monkeypatc
     assert run["wall_s"] >= 0.1 + videos["a.mp4"]["processing_s"]
     assert run["wall_s"] >= run["vlm_wall_s"] + videos["a.mp4"]["processing_s"]
     # nothing new to judge: no record (init alone is not judgment wall-clock)
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     assert len(json.loads((out / "runs.json").read_text())) == 1
 
@@ -883,7 +890,7 @@ def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     out = tmp_path / "out"
     pipeline.run_batch(
         folder,
-        tmp_path,
+        _empty_calib(tmp_path),
         out,
         selection=_synthetic_selection(tmp_path),
         vlm_config=_vlm_config(tmp_path),
@@ -931,7 +938,7 @@ def test_detector_freed_then_gpu_cache_released_before_first_vlm_work(
     )
     pipeline.run_batch(
         folder,
-        tmp_path,
+        _empty_calib(tmp_path),
         tmp_path / "out",
         selection=_synthetic_selection(tmp_path),
         vlm_config=_vlm_config(tmp_path),
@@ -972,7 +979,7 @@ def test_vlm_phase_is_opt_in_and_config_guarded(tmp_path, monkeypatch, rules, th
     ):
         pipeline.run_batch(
             tmp_path,
-            tmp_path,
+            _empty_calib(tmp_path),
             tmp_path / name,
             detector=lambda *a: [],
             rules=rules,
@@ -992,7 +999,7 @@ def test_invalid_vlm_config_fails_before_model_and_outputs(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="loopback"):
         pipeline.run_batch(
             tmp_path,
-            tmp_path,
+            _empty_calib(tmp_path),
             tmp_path / "out",
             vlm_config=_vlm_config(tmp_path, host="http://192.0.2.10:11435"),
         )
@@ -1021,7 +1028,7 @@ def test_unreachable_vlm_phase_records_no_vlm_wall_but_keeps_batch_wall(tmp_path
     monkeypatch.setattr(pipeline, "review_results_dir", lambda out_dir, **kw: {
         "asked": 0, "answered": 0, "unavailable": 1, "skipped": "vlm_unreachable", "models": {}})
     out = tmp_path / "out"
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     [run] = json.loads((out / "runs.json").read_text())
     assert run["vlm_wall_s"] is None and run["wall_s"] > 0  # R65
@@ -1549,3 +1556,19 @@ def test_placeholder_only_result_removes_the_processed_record_so_recovery_rejudg
     assert {r["calibration_id"] for r in rows} == {sid}
     db = json.loads((out / "processed_videos.json").read_text())
     assert [rec["calibration_id"] for rec in db.values()] == [sid]
+
+
+def test_run_batch_rejects_out_overlapping_calib_before_writing(tmp_path, rules):
+    videos, calib, _out = _clip_setup(tmp_path)
+    before = sorted(p.name for p in calib.rglob("*"))
+    for bad in (calib, calib / "results"):
+        with pytest.raises(ValueError):
+            _run(videos, calib, bad, rules)
+    assert sorted(p.name for p in calib.rglob("*")) == before
+
+
+def test_run_batch_rejects_out_that_is_a_file(tmp_path, rules):
+    videos, calib, out = _clip_setup(tmp_path)
+    out.write_text("x")
+    with pytest.raises(ValueError):
+        _run(videos, calib, out, rules)

@@ -64,7 +64,11 @@ def _read_json(path: Path, default):
 
 def read_rounds(out_dir: Path) -> list[dict]:
     """Authoritative flat rows of ``out_dir/rounds.json`` (empty when absent)."""
-    return _read_json(Path(out_dir) / "rounds.json", [])
+    path = Path(out_dir) / "rounds.json"
+    rows = _read_json(path, [])
+    if not isinstance(rows, list):
+        raise ValueError(f"{path}: rounds.json must be a list of rows")  # noqa: TRY004 (callers expect ValueError)
+    return rows
 
 
 def effective(row: dict) -> dict:
