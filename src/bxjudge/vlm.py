@@ -30,7 +30,8 @@ import cv2
 import numpy as np
 import yaml
 
-from .calibration import ZONES, find_calibration, scale_calibration
+from .calibration import ZONES, scale_calibration
+from .calibration_store import Snapshot, load_snapshot
 from .config import Thresholds, config_loader
 from .manifest import probe
 from .output import record_vlm_timing, row_to_result, write_results
@@ -41,6 +42,7 @@ from .video import iter_frames
 log = logging.getLogger(__name__)
 
 UNAVAILABLE_PREFIX = "vlm_unavailable: "
+NO_CALIBRATION_RECORD = "no calibration record"  # spec 6.5b: never guess the zones
 
 TOUCH_QUESTION = "發射時是否有發射器或手碰到盤面？是哪一側？"
 FINAL_QUESTION = "左方開始的陀螺最後停在哪個區域，還是先停止旋轉？"
@@ -78,6 +80,11 @@ class VlmConfigError(ValueError):
 
 class VlmFramesError(RuntimeError):
     """The event frames for a round cannot be produced."""
+
+
+class NoCalibrationRecord(VlmFramesError):
+    """The row has no recorded calibration snapshot (no ``calibration_id``, or its snapshot
+    file is missing): the zones are not guessed (spec section 6.5b)."""
 
 
 @dataclass(frozen=True)
@@ -523,6 +530,9 @@ def _note(r: RoundResult, get_frames, session: VlmSession) -> str:
     question = question_for(r)
     try:
         images = list(get_frames(r))
+    except NoCalibrationRecord as error:
+        log.warning("no calibration record for %s round %s: %s", r.video, r.round, error)
+        return f"{UNAVAILABLE_PREFIX}{NO_CALIBRATION_RECORD}"
     except Exception as error:  # noqa: BLE001 - any frame failure is noted; the batch continues
         log.warning("frames unavailable for %s round %s: %s", r.video, r.round, _describe(error))
         return f"{UNAVAILABLE_PREFIX}frames: {_describe(error)}"
@@ -584,44 +594,21 @@ def overlay_zones(frame: np.ndarray, c: Calibration, t: float) -> np.ndarray:
     return image
 
 
-def select_calibration(source: Path, fps: float, calib_dir: Path, th: Thresholds) -> Calibration:
-    """The same calibration choice as the judge: first-second frame at inference size."""
-    last = None
-    with closing(iter_frames(source, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel)) as frames:
-        for idx, frame in frames:
-            last = frame
-            if idx >= round(fps):
-                break
-    if last is None:
-        raise VlmFramesError(f"{source}: no frames decoded")
-    c = find_calibration(last, calib_dir, th.calibration_min_similarity)
-    if c is None:
-        raise VlmFramesError(f"{source}: no matching calibration in {calib_dir}")
-    return c
-
-
 def event_frames(
     source: Path,
     t: float,
-    calib_dir: Path,
+    snapshot: Snapshot,
     config: VlmConfig,
     th: Thresholds,
-    *,
-    calibrations: dict | None = None,
 ) -> list[np.ndarray]:
     """``config.frames`` frames spread over ``t +- event_window_s`` playback seconds.
 
-    Each frame carries all 8 calibration polygons scaled to the decoded size and its
-    playback time. ``calibrations`` caches the per-source calibration choice.
+    Each frame carries all 8 polygons of the recorded calibration ``snapshot`` (the one the
+    round was judged with, spec section 6.5b) scaled to the decoded size, and its playback
+    time.
     """
     source = Path(source)
     info = probe(source)
-    if calibrations is not None and source in calibrations:
-        c = calibrations[source]
-    else:
-        c = select_calibration(source, info.fps, calib_dir, th)
-        if calibrations is not None:
-            calibrations[source] = c
     lo = max(0.0, t - config.event_window_s)
     hi = max(lo, min(t + config.event_window_s, info.duration))
     wanted = sorted({round(x * info.fps) for x in np.linspace(lo, hi, config.frames)})
@@ -643,7 +630,7 @@ def event_frames(
     if not picked:
         raise VlmFramesError(f"{source}: no frames decoded in [{lo:.2f}, {hi:.2f}] s")
     first = next(iter(picked.values()))
-    scaled = scale_calibration(c, (first.shape[1], first.shape[0]))
+    scaled = scale_calibration(snapshot.calibration, (first.shape[1], first.shape[0]))
     return [overlay_zones(frame, scaled, idx / info.fps) for idx, frame in sorted(picked.items())]
 
 
@@ -679,10 +666,23 @@ def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None
         write_results(snapshot, out_dir, rules)
 
 
+def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot]) -> Snapshot:
+    """The recorded snapshot ``r`` was judged with; ``NoCalibrationRecord`` when the row has no
+    ``calibration_id`` or its snapshot file is missing (never re-selected from ``calib/``)."""
+    sid = r.calibration_id
+    if not sid:
+        raise NoCalibrationRecord(f"{r.video} round {r.round} has no calibration_id")
+    if sid not in cache:
+        try:
+            cache[sid] = load_snapshot(out_dir, sid)
+        except FileNotFoundError as error:
+            raise NoCalibrationRecord(str(error)) from None
+    return cache[sid]
+
+
 def review_results_dir(
     out_dir: Path,
     *,
-    calib_dir: Path,
     th: Thresholds,
     rules: Rules,
     config: VlmConfig | None = None,
@@ -690,7 +690,9 @@ def review_results_dir(
 ) -> dict:
     """Ask the VLM about every ``needs_vlm`` round in a results directory.
 
-    Source media come only from the absolute ``source_video`` in ``videos.json``. Each
+    Source media come only from the absolute ``source_video`` in ``videos.json`` and the zones
+    only from each row's recorded calibration snapshot (``calibration_id``); a row without
+    one gets ``vlm_unavailable: no calibration record`` and the batch continues. Each
     video's notes are persisted through ``write_results`` as a complete snapshot and its
     VLM time is recorded as ``vlm_s`` beside the core ``processing_s``.
     """
@@ -719,7 +721,7 @@ def review_results_dir(
             _persist_notes(out_dir, video, asked, rules)
             summary["unavailable"] += len(asked)
         return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
-    calibrations: dict = {}
+    snapshots: dict[str, Snapshot] = {}
     try:
         for video in targets:
             results = by_video[video]
@@ -727,11 +729,10 @@ def review_results_dir(
             source = recorded_source(timing.get(video))
 
             def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
+                snapshot = _row_snapshot(out_dir, r, snapshots)
                 if isinstance(source, str):
                     raise VlmFramesError(source)
-                return event_frames(
-                    source, event_time(r), calib_dir, session.config, th, calibrations=calibrations
-                )
+                return event_frames(source, event_time(r), snapshot, session.config, th)
 
             sent = len(session.requests)
             reviewed = review_low_confidence(results, get_frames, session=session)

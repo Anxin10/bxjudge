@@ -149,14 +149,14 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
 7. **（選用）單獨補問 VLM**：對尚未覆核、需覆核且還沒有成功 VLM 註記的回合再問一次：
 
    ```bash
-   uv run bxjudge vlm results/20261001 --calib calib
+   uv run bxjudge vlm results/20261001
    ```
 
 8. **人工覆核**：開本機網頁（只綁 127.0.0.1），Windows 瀏覽器開
    <http://127.0.0.1:8501>，逐一確認或修正需覆核的回合：
 
    ```bash
-   uv run bxjudge review results/20261001 --calib calib
+   uv run bxjudge review results/20261001
    ```
 
 9. **隨機抽樣稽核**（R62/R64）：從原判「不需覆核」的回合隨機抽樣，回到第 8 步的覆核
@@ -164,7 +164,7 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
 
    ```bash
    uv run bxjudge audit-sample results/20261001 --n 80 --seed 1
-   uv run bxjudge review results/20261001 --calib calib   # 篩選「抽樣稽核」，全部覆核
+   uv run bxjudge review results/20261001   # 篩選「抽樣稽核」，全部覆核
    ```
 
    只有抽樣全部覆核、回合數 ≥ `audit_min_n`，而且 Wilson 下界 ≥ 目標（95%）時，

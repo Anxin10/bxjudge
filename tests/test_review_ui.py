@@ -1,15 +1,33 @@
 """Review UI: read-only helpers and the Streamlit app driven through AppTest."""
 
+import json
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from bxjudge import review_ui, vlm
-from bxjudge.corrections import Correction, load_corrections
-from bxjudge.output import effective, read_rounds, record_video_timing, write_results
-from tests.helpers import make_calibration, make_video, rr
+from bxjudge import review_ui
+from bxjudge.calibration_store import unveto_calibration, veto_calibration, vetoed_ids
+from bxjudge.corrections import Correction, confirm_reviewed, load_corrections
+from bxjudge.output import (
+    effective,
+    read_rounds,
+    record_video_calibration,
+    record_video_timing,
+    write_results,
+)
+from bxjudge.rules import load_rules
+from tests.helpers import (
+    _fixed_auto_snapshot,
+    auto_snapshot_ids,
+    make_calibration,
+    make_ref_img,
+    make_video,
+    read_matches,
+    rr,
+)
 
 APP = Path(__file__).resolve().parents[1] / "src" / "bxjudge" / "review_app.py"
 AT = "2026-10-23T00:00:00"
@@ -102,10 +120,9 @@ def test_repair_steps_are_concrete(tmp_path, reason):
     assert any(str(tmp_path) in s for s in steps)
 
 
-def test_evidence_frame_draws_scaled_zones_at_playback_time(tmp_path, monkeypatch, th):
+def test_evidence_frame_draws_scaled_zones_at_playback_time(tmp_path, th):
     video = make_video(tmp_path / "v.mp4", seconds=3, fps=30, size=(320, 180))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: make_calibration())
-    calibration = review_ui.video_calibration(video, tmp_path, th)
+    calibration = make_calibration()
     image, t, index = review_ui.evidence_frame(video, 1.5, calibration, th)
     assert index == 45 and t == pytest.approx(1.5)
     assert image.shape == (180, 320, 3)
@@ -117,11 +134,11 @@ def test_evidence_frame_draws_scaled_zones_at_playback_time(tmp_path, monkeypatc
     assert last == 89
 
 
-def test_missing_calibration_is_reported_not_invented(tmp_path, monkeypatch, th):
-    video = make_video(tmp_path / "v.mp4", seconds=1, fps=30, size=(320, 180))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: None)
-    with pytest.raises(review_ui.ReviewMediaError, match="calibration"):
-        review_ui.video_calibration(video, tmp_path, th)
+def test_reselection_from_calib_is_gone():
+    from bxjudge import vlm
+
+    assert not hasattr(review_ui, "video_calibration")
+    assert not hasattr(vlm, "select_calibration")
 
 
 # ----------------------------------------------------------------------------- app
@@ -145,8 +162,7 @@ def batch(tmp_path, rules, monkeypatch):
     import cv2
 
     cv2.imwrite(str(out / "trajectories" / "a_r1.png"), np.zeros((18, 32, 3), np.uint8))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: make_calibration())
-    monkeypatch.setattr(sys, "argv", ["review_app.py", str(out), "--calib", str(tmp_path)])
+    monkeypatch.setattr(sys, "argv", ["review_app.py", str(out)])
     return out
 
 
@@ -254,6 +270,196 @@ def test_app_missing_media_and_trajectory_do_not_crash(batch):
     widget(at.button, "確認無誤")  # still reviewable without media
 
 
+# ----------------------------------------------------------------------------- recorded snapshots
+
+SNAP_ID = auto_snapshot_ids()[0]
+
+
+def _calibrated_results(tmp_path, snap_kind="auto", rounds=(1,), *, with_ids=True):
+    """``results/`` with ``clip.mp4`` judged with a recorded snapshot (or, ``with_ids=False``,
+    results made before snapshots: no ``calibration_id`` and no ``videos.json`` record)."""
+    from dataclasses import replace
+
+    from bxjudge.calibration_store import save_snapshot, write_preview
+
+    out = tmp_path / "results"
+    calib = tmp_path / "calib"
+    calib.mkdir()
+    (calib / "unused.json").write_text("{}", encoding="utf-8")  # never consulted
+    source = make_video(tmp_path / "clip.mp4", seconds=3, fps=30, size=(320, 180))
+    snap = None
+    if with_ids:
+        if snap_kind == "auto":
+            snap = _fixed_auto_snapshot(out, 1)
+        else:
+            snap = replace(save_snapshot(out, "manual", make_calibration(), make_ref_img(3),
+                                         score=0.9321), score=0.9321)
+        write_preview(out, snap)
+    results = []
+    for n in rounds:
+        r = rr("spin", "X", video="clip.mp4", round=n, t_launch=1.0 * n,
+               review_reasons=["low_confidence"])
+        r.needs_review = True
+        if snap is not None:
+            r.calibration_id = snap.id
+        results.append(r)
+    write_results(results, out, load_rules())
+    record_video_timing(out, "clip.mp4", 3.0, 1.0, source_video=source)
+    if snap is not None:
+        record_video_calibration(out, "clip.mp4", snap)
+    return out
+
+
+def results_with_auto_snapshot(tmp_path, rounds=(1,)):
+    return _calibrated_results(tmp_path, "auto", rounds)
+
+
+def results_with_manual_snapshot(tmp_path):
+    return _calibrated_results(tmp_path, "manual")
+
+
+def results_without_calibration_ids(tmp_path):
+    return _calibrated_results(tmp_path, with_ids=False)
+
+
+def app_test(out, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["review_app.py", str(out)])
+    return app()
+
+
+def find_row(out, video, round_):
+    return next(r for r in read_rounds(out) if (r["video"], r["round"]) == (video, round_))
+
+
+def _text(at):
+    images = [i.caption for img in at.get("image") for i in img.proto.imgs]
+    return " ".join([*(e.value for e in [*at.markdown, *at.caption, *at.info, *at.warning,
+                                         *at.error]), *images])
+
+
+def test_overlay_uses_recorded_snapshot_not_calib_dir(tmp_path):
+    out = results_with_auto_snapshot(tmp_path)
+    shutil.rmtree(tmp_path / "calib")
+    snap = review_ui.row_calibration(out, read_rounds(out)[0])
+    assert snap.kind == "auto" and snap.id == SNAP_ID
+    assert snap.calibration.battle_area == make_calibration().battle_area
+
+
+def test_row_calibration_is_none_without_a_record(tmp_path):
+    out = results_with_auto_snapshot(tmp_path)
+    row_ = read_rounds(out)[0]
+    assert review_ui.row_calibration(out, {**row_, "calibration_id": None}) is None
+    del row_["calibration_id"]
+    assert review_ui.row_calibration(out, row_) is None
+    (out / "calibrations" / f"{SNAP_ID}.json").unlink()  # snapshot file missing
+    assert review_ui.row_calibration(out, read_rounds(out)[0]) is None
+
+
+def test_manual_row_calibration_shows_the_videos_recorded_similarity(tmp_path):
+    out = results_with_manual_snapshot(tmp_path)
+    snap = review_ui.row_calibration(out, read_rounds(out)[0])
+    assert snap.kind == "manual" and snap.score == pytest.approx(0.9321)
+
+
+def test_no_record_banner_and_no_overlay(tmp_path, monkeypatch):
+    out = results_without_calibration_ids(tmp_path)
+    at = app_test(out, monkeypatch)
+    at.run()
+    assert not at.exception, at.exception
+    assert any("此結果沒有校準紀錄，請用新版重新執行 bxjudge run" in m.value for m in at.warning)
+    assert "未疊校準區域" in _text(at)
+    assert not [b for b in at.button if str(b.key).startswith(("veto-", "unveto-"))]
+    widget(at.button, "確認無誤")  # other review functions keep working
+
+
+def test_auto_snapshot_info_line_and_overlay(tmp_path, monkeypatch):
+    out = results_with_auto_snapshot(tmp_path)
+    at = app_test(out, monkeypatch).run()
+    assert not at.exception, at.exception
+    text = _text(at)
+    assert "校準：auto（test）分數 0.900" in text
+    assert "校準 test 八區" in text
+    assert "此結果沒有校準紀錄" not in text
+
+
+def test_veto_button_round_trip(tmp_path, monkeypatch):
+    out = results_with_auto_snapshot(tmp_path)
+    at = app_test(out, monkeypatch)
+    at.run()
+    assert "目前比分" in _text(at)
+    assert at.button(key=f"veto-{SNAP_ID}").label == "不採用此組校準"
+    at.button(key=f"veto-{SNAP_ID}").click().run()
+    assert not at.exception, at.exception
+    assert SNAP_ID in vetoed_ids(out)
+    assert read_matches(out) == []
+    # scores shown in the app honour the veto like matches.csv does (M3)
+    assert "目前比分" not in _text(at)
+    assert "校準被否決，需重新校準" in _text(at)
+    assert at.button(key=f"unveto-{SNAP_ID}").label == "恢復採用此組校準"
+    at.button(key=f"unveto-{SNAP_ID}").click().run()
+    assert not at.exception, at.exception
+    assert SNAP_ID not in vetoed_ids(out)
+    assert len(read_matches(out)) == 1
+    assert "目前比分" in _text(at)
+
+
+def test_manual_snapshot_has_info_line_but_no_veto_buttons(tmp_path, monkeypatch):
+    out = results_with_manual_snapshot(tmp_path)
+    at = app_test(out, monkeypatch).run()
+    assert not at.exception, at.exception
+    assert "校準：manual（test）分數 0.932" in _text(at)
+    assert not [b for b in at.button if str(b.key).startswith(("veto-", "unveto-"))]
+
+
+def test_reviewed_row_flagged_when_calibration_vetoed(tmp_path, rules):
+    out = results_with_auto_snapshot(tmp_path)
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "ok"
+    confirm_reviewed(out, "clip.mp4", 1, rules=rules)
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "ok"
+    veto_calibration(out, SNAP_ID, rules=rules)
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "changed_since_review"
+
+
+def test_calibration_status_values(tmp_path, rules):
+    out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
+    confirm_reviewed(out, "clip.mp4", 1, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules)
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 2)) == "vetoed"
+    unveto_calibration(out, SNAP_ID, rules=rules)
+    # the video was re-judged with another calibration after the review
+    videos = json.loads((out / "videos.json").read_text(encoding="utf-8"))
+    videos["clip.mp4"]["calibration"]["id"] = "0" * 16
+    (out / "videos.json").write_text(json.dumps(videos), encoding="utf-8")
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "changed_since_review"
+    assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 2)) == "ok"
+    assert review_ui.calibration_status(out, {**find_row(out, "clip.mp4", 2),
+                                              "calibration_id": None}) == "no_record"
+
+
+def test_changed_since_review_banner(tmp_path, monkeypatch, rules):
+    out = results_with_auto_snapshot(tmp_path)
+    confirm_reviewed(out, "clip.mp4", 1, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules)
+    at = app_test(out, monkeypatch).run()
+    assert not at.exception, at.exception
+    assert any("覆核當時使用的校準已被否決／更換，請確認是否需要重新覆核" in m.value
+               for m in at.warning)
+
+
+def test_corrections_after_veto_keep_vetoed_unreviewed_rounds_out_of_matches(
+    tmp_path, monkeypatch
+):
+    out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
+    at = pick(app_test(out, monkeypatch).run(), "clip.mp4::1")
+    at.button(key=f"veto-{SNAP_ID}").click().run()
+    assert read_matches(out) == []
+    at = pick(app_test(out, monkeypatch).run(), "clip.mp4::1")
+    widget(at.button, "確認無誤").click().run()  # confirm goes through save_rounds
+    assert not at.exception, at.exception
+    scored = [(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]]
+    assert scored == [("clip.mp4", 1)]  # reviewed row scores; vetoed unreviewed row 2 does not
+
+
 # ----------------------------------------------------------------------------- cli
 
 
@@ -275,6 +481,7 @@ def test_review_cli_launches_loopback_streamlit_without_telemetry(tmp_path, monk
     assert flags["--browser.gatherUsageStats"] == "false"
     assert flags["--server.headless"] == "true"
     assert argv[argv.index("--") + 1] == str(tmp_path.resolve())
+    assert "--calib" not in argv  # the overlay comes from the recorded snapshots
     assert kw["env"]["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] == "false"
 
 
@@ -283,3 +490,12 @@ def test_review_cli_rejects_folder_without_results(tmp_path, capsys):
 
     assert cli.main(["review", str(tmp_path / "missing")]) == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_review_and_vlm_cli_no_longer_take_calib(tmp_path):
+    from bxjudge import cli
+
+    (tmp_path / "rounds.json").write_text("[]", encoding="utf-8")
+    for command in ("review", "vlm"):
+        with pytest.raises(SystemExit):
+            cli.main([command, str(tmp_path), "--calib", "calib"])

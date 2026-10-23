@@ -6,22 +6,32 @@ Kept free of Streamlit so it can be unit-tested; all writes go through
 
 from __future__ import annotations
 
+import json
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .calibration import scale_calibration
+from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds
 from .corrections import Correction, current_value
 from .manifest import probe
 from .rules import is_not_a_round
 from .types import Calibration
 from .video import VideoDecodeError, iter_frames
-from .vlm import VlmFramesError, overlay_zones, recorded_source, select_calibration
+from .vlm import overlay_zones, recorded_source
 
 FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核")  # 抽樣稽核 = R62 random audit sample
+
+# Calibration copy (spec section 6.5)
+NO_RECORD = "此結果沒有校準紀錄，請用新版重新執行 bxjudge run"
+CHANGED_SINCE_REVIEW = "覆核當時使用的校準已被否決／更換，請確認是否需要重新覆核"
+VETOED = "校準被否決，需重新校準"
+VETO_BUTTON = "不採用此組校準"
+UNVETO_BUTTON = "恢復採用此組校準"
 
 _TOUCH = {"yes": "有碰觸", "no": "沒有碰觸", "unknown": "不確定"}
 _LANDED = {True: "是", False: "否"}
@@ -137,7 +147,8 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
     steps = []
     if "recalibrate" in reasons:
         steps += [
-            "影片第一秒的畫面與 calib/ 內所有校準都不相符（鏡頭或場地位置改變）。",
+            ("影片第一秒的畫面與 calib/ 內所有校準都不相符，也無法自動對齊（鏡頭或場地位置"
+             "改變；或此機位的自動校準已被否決）。"),
             f"為這個鏡頭重新校準：`bxjudge calibrate {video} --name <新校準名稱> --out calib`",
         ]
     if "no_round" in reasons:
@@ -158,13 +169,61 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
     return [*steps, rerun]
 
 
-def video_calibration(source: Path, calib_dir: Path, th: Thresholds) -> Calibration:
-    """The calibration the judge would choose for ``source`` (first-second frame)."""
+def _video_calibration_record(out_dir: Path, video: str) -> dict | None:
+    """``videos.json[video]["calibration"]`` (the snapshot the video's latest run used)."""
+    path = Path(out_dir) / "videos.json"
+    if not path.is_file():
+        return None
+    entry = json.loads(path.read_text(encoding="utf-8")).get(video)
+    record = entry.get("calibration") if isinstance(entry, dict) else None
+    return record if isinstance(record, dict) else None
+
+
+def row_calibration(out_dir: Path, row: dict) -> Snapshot | None:
+    """The recorded snapshot ``row`` was judged with (by its ``calibration_id``), never a
+    re-selection from ``calib/`` (spec section 6.5). ``None`` when the row has no record
+    (results made before snapshots) or its snapshot file is missing. A manual snapshot carries
+    the video's recorded similarity as ``score`` when ``videos.json`` names the same id."""
+    sid = row.get("calibration_id")
+    if not sid:
+        return None
     try:
-        info = probe(source)
-        return select_calibration(source, info.fps, Path(calib_dir), th)
-    except (VlmFramesError, VideoDecodeError, ValueError, OSError, RuntimeError) as e:
-        raise ReviewMediaError(str(e)) from e
+        snap = load_snapshot(Path(out_dir), sid)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ReviewMediaError(f"calibration snapshot {sid}: {e}") from e
+    record = _video_calibration_record(out_dir, row["video"])
+    if snap.kind == "manual" and record and record.get("id") == sid:
+        score = record.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            snap = replace(snap, score=float(score))
+    return snap
+
+
+def calibration_status(out_dir: Path, row: dict) -> str:
+    """``"no_record"`` (no snapshot), ``"changed_since_review"`` (a reviewed row whose snapshot
+    is vetoed or is no longer the video's current ``videos.json`` calibration), ``"vetoed"``
+    (an unreviewed row of a vetoed snapshot: excluded from the scores) or ``"ok"``."""
+    sid = row.get("calibration_id")
+    if not sid or not (Path(out_dir) / "calibrations" / f"{sid}.json").is_file():
+        return "no_record"
+    vetoed = sid in vetoed_ids(Path(out_dir))
+    if row.get("reviewed") is True:
+        record = _video_calibration_record(out_dir, row["video"]) or {}
+        if vetoed or record.get("id") != sid:
+            return "changed_since_review"
+        return "ok"
+    return "vetoed" if vetoed else "ok"
+
+
+def calibration_line(snap: Snapshot) -> str:
+    return f"校準：{snap.kind}（{snap.calibration.name}）分數 {snap.score:.3f}"
+
+
+def preview_path(out_dir: Path, snap: Snapshot) -> Path:
+    """The group's preview image (``<id>.preview.jpg``, written by the run)."""
+    return Path(out_dir) / "calibrations" / f"{snap.id}.preview.jpg"
 
 
 def evidence_frame(

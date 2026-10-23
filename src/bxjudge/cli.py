@@ -188,7 +188,6 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
         config = vlm.load_vlm_config(Path(args.config).expanduser())
         summary = vlm.review_results_dir(
             results,
-            calib_dir=Path(args.calib).expanduser(),
             th=load_thresholds(Path(args.thresholds).expanduser()),
             rules=load_rules(Path(args.rules).expanduser()),
             config=config,
@@ -210,7 +209,6 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
 def _add_vlm(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("vlm", help="ask the local VLM about unreviewed review-required rounds")
     p.add_argument("results", help="results directory written by `bxjudge run`")
-    p.add_argument("--calib", default="calib", help="calibration directory used by the run")
     p.add_argument("--config", default="config/vlm.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")
@@ -235,7 +233,6 @@ def _cmd_review(args: argparse.Namespace) -> int:
         "--browser.gatherUsageStats", "false",
         "--",
         str(results),
-        "--calib", str(Path(args.calib).expanduser().resolve()),
         "--rules", str(Path(args.rules).expanduser().resolve()),
         "--thresholds", str(Path(args.thresholds).expanduser().resolve()),
     ]
@@ -248,8 +245,6 @@ def _add_review(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("review", help="local web UI to review and correct judged rounds")
     p.add_argument("results", help="results directory written by `bxjudge run`")
     p.add_argument("--port", type=int, default=8501, help="loopback port (default 8501)")
-    p.add_argument("--calib", default="calib",
-                   help="calibration directory used by the run (for the zone overlay)")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.set_defaults(func=_cmd_review)

@@ -593,7 +593,6 @@ def run_batch(
         _release_gpu_memory()
         summary = review_results_dir(
             out_dir,
-            calib_dir=calib_dir,
             th=th,
             rules=rules,
             config=vlm,

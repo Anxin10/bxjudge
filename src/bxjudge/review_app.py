@@ -1,9 +1,11 @@
 """Local review UI (Streamlit). Started by ``bxjudge review RESULTS`` on 127.0.0.1.
 
 Shows each round's evidence (video from ``t_launch - 1`` s, launch/end frames with the
-calibration zones, trajectory image, review reasons, VLM note) and saves human
-corrections through :mod:`bxjudge.corrections`. Diagnostic placeholder rows only get
-repair steps (R53).
+zones of the calibration snapshot the round was judged with, trajectory image, review
+reasons, VLM note) and saves human corrections through :mod:`bxjudge.corrections`. An
+auto calibration snapshot can be vetoed / restored (spec section 6.5); scores shown here
+honour vetoes exactly like ``matches.csv``. Diagnostic placeholder rows only get repair
+steps (R53).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from pathlib import Path
 import streamlit as st
 
 from bxjudge import review_ui as ui
+from bxjudge.calibration_store import unveto_calibration, veto_calibration, vetoed_ids
 from bxjudge.config import load_thresholds
 from bxjudge.corrections import (
     CorrectionError,
@@ -32,25 +35,15 @@ from bxjudge.rules import finish_points, load_rules
 def _args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="review_app")
     p.add_argument("results")
-    p.add_argument("--calib", default="calib")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     return p.parse_known_args(sys.argv[1:])[0]
 
 
-@st.cache_data(show_spinner="選擇校準…", max_entries=64)
-def _calibration(source: str, mtime: float, calib_dir: str, thresholds: str):
-    """(calibration, None) or (None, reason); the reason is cached too."""
-    try:
-        th = load_thresholds(thresholds)
-        return ui.video_calibration(Path(source), Path(calib_dir), th), None
-    except ui.ReviewMediaError as e:
-        return None, str(e)
-
-
 @st.cache_data(show_spinner="擷取畫面…", max_entries=256)
-def _frame(source: str, mtime: float, t: float, calib_dir: str, thresholds: str, _calibration):
-    # _calibration is derived from (source, mtime, calib_dir), so it needs no hashing.
+def _frame(source: str, mtime: float, t: float, snapshot_id: str, thresholds: str, _calibration):
+    # Snapshots are immutable and content-addressed: snapshot_id ("" = no overlay) fully
+    # identifies _calibration, so it needs no hashing.
     return ui.evidence_frame(Path(source), t, _calibration, load_thresholds(thresholds))
 
 
@@ -66,7 +59,47 @@ def _flash(message: str) -> None:
     st.rerun()
 
 
-def _evidence(row: dict, source, out: Path, a: argparse.Namespace) -> None:
+def _calibration(row: dict, out: Path, rules):
+    """Info line, banners and veto controls for the row's recorded snapshot; returns it."""
+    st.subheader("校準")
+    try:
+        snap = ui.row_calibration(out, row)
+        state = ui.calibration_status(out, row)
+    except (ui.ReviewMediaError, OSError, ValueError) as e:
+        st.warning(f"校準紀錄無法讀取，畫面不疊區域：{e}")
+        return None
+    if snap is None:
+        st.warning(ui.NO_RECORD)
+        return None
+    st.markdown(ui.calibration_line(snap))
+    if state == "changed_since_review":
+        st.warning(ui.CHANGED_SINCE_REVIEW)
+    elif state == "vetoed":
+        st.warning(f"{ui.VETOED}：此回合不計入比分。")
+    preview = ui.preview_path(out, snap)
+    if preview.is_file():
+        with st.expander("校準組預覽圖"):
+            st.image(str(preview), caption=preview.name, width="stretch")
+    if snap.kind == "auto":  # ruling T4-1: only auto calibrations can be vetoed
+        try:
+            vetoed = snap.id in vetoed_ids(out)
+            if vetoed and st.button(ui.UNVETO_BUTTON, key=f"unveto-{snap.id}"):
+                unveto_calibration(out, snap.id, rules=rules)
+                _flash("已恢復採用此組校準，比分已重新計算。")
+            elif not vetoed and st.button(
+                ui.VETO_BUTTON, key=f"veto-{snap.id}",
+                help="此組校準的未覆核回合不計入比分（原判定保留，可恢復）。",
+            ):
+                veto_calibration(out, snap.id, rules=rules)
+                _flash("已不採用此組校準：其未覆核回合不計入比分。")
+        except (OSError, ValueError) as e:
+            st.error(f"未儲存：{e}")
+    return snap
+
+
+def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules) -> None:
+    snap = _calibration(row, out, rules)
+    calibration = snap.calibration if snap is not None else None
     st.subheader("影片")
     if isinstance(source, str):
         st.info(f"無法播放影片：{source}")
@@ -78,12 +111,8 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace) -> None:
             f"結束 {row['t_end']:.2f} 秒"
         )
     st.subheader("發射與結束瞬間")
-    calibration = None
     if not isinstance(source, str):
         mtime = source.stat().st_mtime
-        calibration, reason = _calibration(str(source), mtime, str(a.calib), a.thresholds)
-        if reason:
-            st.warning(f"沒有可用的校準，畫面不疊區域：{reason}")
         cols = st.columns(2)
         for col, name, t in zip(
             cols, ("發射瞬間", "結束瞬間"), (row["t_launch"], row["t_end"]), strict=True
@@ -91,7 +120,8 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace) -> None:
             with col:
                 try:
                     image, actual, index = _frame(
-                        str(source), mtime, float(t), str(a.calib), a.thresholds, calibration
+                        str(source), mtime, float(t), snap.id if snap else "", a.thresholds,
+                        calibration,
                     )
                 except ui.ReviewMediaError as e:
                     st.warning(f"{name}畫面無法擷取：{e}")
@@ -113,7 +143,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace) -> None:
         st.info(f"此回合沒有軌跡圖（{png}）。")
 
 
-def _judgment(row: dict, rows: list[dict], rules) -> None:
+def _judgment(row: dict, rows: list[dict], rules, vetoed: set[str]) -> None:
     eff = effective(row)
     flagged = "需覆核" if row.get("needs_review") else "不需覆核"
     human = "已完成" if row.get("reviewed") else "尚未"
@@ -131,7 +161,7 @@ def _judgment(row: dict, rows: list[dict], rules) -> None:
         f"**目前有效判定：** {ui.FIELDS['finish'][1].get(eff['finish'], eff['finish'])}，"
         f"獲勝方 {ui.FIELDS['winner'][1].get(eff['winner'], eff['winner'])}，{points} 分"
     )
-    for number, match in enumerate(matches_for(rows, rules), 1):
+    for number, match in enumerate(matches_for(rows, rules, vetoed), 1):
         for r, outcome in match.rounds:
             if (r.video, r.round) == (row["video"], row["round"]):
                 result = (
@@ -225,6 +255,7 @@ def main() -> None:
         rules = load_rules(a.rules)
         load_thresholds(a.thresholds)
         rows = read_rounds(out)
+        vetoed = vetoed_ids(out)
         videos_path = out / "videos.json"
         videos = (
             json.loads(videos_path.read_text(encoding="utf-8"))
@@ -276,7 +307,7 @@ def main() -> None:
                     "勝方": m.winner or "未完成",
                     "回合數": len(m.rounds),
                 }
-                for i, m in enumerate(matches_for(rows, rules), 1)
+                for i, m in enumerate(matches_for(rows, rules, vetoed), 1)
             ],
             hide_index=True,
         )
@@ -302,9 +333,9 @@ def main() -> None:
 
     left, right = st.columns([3, 2], gap="large")
     with left:
-        _evidence(row, source, out, a)
+        _evidence(row, source, out, a, rules)
     with right:
-        _judgment(row, rows, rules)
+        _judgment(row, rows, rules, vetoed)
         _form(row, out, rules)
         history = [
             {
