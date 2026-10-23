@@ -1,5 +1,6 @@
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -104,9 +105,14 @@ def test_snapshot_id_is_content_addressed(tmp_path):
     a = save_snapshot(tmp_path, "manual", c, img, score=1.0)
     b = save_snapshot(tmp_path, "manual", c, img, score=1.0)
     assert a.id == b.id and len(a.id) == 16
-    other = save_snapshot(tmp_path, "manual", c, img, score=0.9)
-    assert other.id != a.id
-    assert len(list((tmp_path / "calibrations").glob("*.json"))) == 2
+    other = save_snapshot(tmp_path, "manual", c, img, score=0.9)  # per-video score: not identity
+    assert other.id == a.id and other.score == 0.9 and a.score == 1.0
+    assert len(list((tmp_path / "calibrations").glob("*.json"))) == 1
+    moved = replace(c, name="other")
+    assert save_snapshot(tmp_path, "manual", moved, img, score=1.0).id != a.id
+    auto_a = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id=a.id)
+    auto_b = save_snapshot(tmp_path, "auto", c, img, score=0.8, template_id=a.id)
+    assert auto_a.id != auto_b.id  # an auto snapshot's alignment score is part of its identity
 
 
 def test_load_unknown_snapshot_raises(tmp_path):
@@ -122,3 +128,61 @@ def test_preview_is_written_with_all_zones(tmp_path):
     out = cv2.imread(str(p))
     assert out is not None and out.shape[:2] == img.shape[:2]
     assert len(ZONES) == 8
+
+
+def test_one_manual_calibration_has_one_snapshot_across_frames(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    snaps = []
+    for seed in range(4):
+        frame = stadium_scene()[0].copy()
+        rng = np.random.default_rng(seed)
+        frame = np.clip(frame + rng.normal(0, 3 + seed, frame.shape), 0, 255).astype(np.uint8)
+        snaps.append(select_snapshot(frame, calib, out, th(), load_autocalib_config()))
+    assert all(s.kind == "manual" for s in snaps)
+    assert len({s.id for s in snaps}) == 1
+    assert len({s.score for s in snaps}) > 1  # the per-video similarity is still reported
+    assert len(list((out / "calibrations").glob("*.json"))) == 1
+    assert len(list((out / "calibrations").glob("*.png"))) == 1
+
+
+def test_auto_template_id_is_the_manual_id_used_for_judging(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    auto = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config())
+    assert auto.kind == "auto" and manual.kind == "manual"
+    assert auto.template_id == manual.id
+    assert len(list((out / "calibrations").glob("*.json"))) == 2  # one manual + one auto
+
+
+def test_manual_wins_over_an_existing_auto_and_is_unrefined(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    img, tpl = stadium_scene()
+    select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    s = select_snapshot(img, calib, out, th(), load_autocalib_config())
+    assert s.kind == "manual" and s.calibration.stadium == tpl.stadium
+
+
+def _edit_template(calib):
+    d = json.loads((calib / "scene.json").read_text())
+    d["launch_left"] = [[x + 7, y + 3] for x, y in d["launch_left"]]  # outside the rim region
+    (calib / "scene.json").write_text(json.dumps(d))
+
+
+def test_edited_template_makes_its_auto_snapshot_ineligible(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20))[0]
+    a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).id == a.id
+    _edit_template(calib)
+    b = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert b.kind == "auto" and b.id != a.id and b.template_id != a.template_id
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).id == b.id
+    assert load_snapshot(out, a.id).id == a.id  # the old snapshot stays on disk, untouched
+
+
+def test_removed_template_makes_its_auto_snapshot_ineligible(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20))[0]
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).kind == "auto"
+    (calib / "scene.json").unlink()
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()) is None
