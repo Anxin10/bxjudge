@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, get_args
 
+from .audit import audit_population, validate_audit
 from .output import _write_json, effective, read_rounds, save_rounds
 from .rules import FINISHES, SIDES, Rules, finish_points, is_not_a_round, load_rules
 from .types import AirState, SpinDir, TouchState, Zone
@@ -212,11 +213,9 @@ def mark_audit_sample(
 
     out_dir = Path(out_dir)
     rows = read_rounds(out_dir)
-    population = sorted(
-        (row["video"], row["round"])
-        for row in rows
-        if not is_not_a_round(row.get("review_reasons") or []) and row["needs_review"] is False
-    )
+    population = [tuple(k) for k in audit_population(rows)]
+    if type(n) is not int or type(seed) is not int:
+        raise ValueError("audit sample n and seed must be integers")
     if n < 1 or n > len(population):
         raise CorrectionError(
             f"audit sample size {n}: only {len(population)} unflagged real rounds available"
@@ -225,6 +224,10 @@ def mark_audit_sample(
     marked = sorted((r["video"], r["round"]) for r in rows if r.get("audit_sample") is True)
     meta_path = out_dir / AUDIT_META
     frozen = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
+    if frozen is None and marked and not replace:
+        raise ValueError("audit marks have no frozen record; redraw with audit-sample --replace")
+    if frozen is not None and not replace:
+        validate_audit(frozen)
     current = [list(k) for k in population]
     if frozen is not None and not replace and (
         not isinstance(frozen, dict) or frozen.get("population") != current

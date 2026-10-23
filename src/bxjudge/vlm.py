@@ -35,7 +35,13 @@ from .calibration import ZONES, scale_calibration
 from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds, config_loader
 from .manifest import probe
-from .output import record_vlm_timing, row_to_result, write_results
+from .output import (
+    invalidate_video_attempt,
+    record_video_probe,
+    record_vlm_timing,
+    row_to_result,
+    write_results,
+)
 from .rules import Rules, is_not_a_round
 from .types import Calibration, RoundResult
 from .video import iter_frames
@@ -614,6 +620,8 @@ def event_frames(
     snapshot: Snapshot,
     config: VlmConfig,
     th: Thresholds,
+    *,
+    on_probe: Callable[[float | None], None] | None = None,
 ) -> list[np.ndarray]:
     """``config.frames`` frames spread over ``t +- event_window_s`` playback seconds.
 
@@ -622,7 +630,14 @@ def event_frames(
     time.
     """
     source = Path(source)
-    info = probe(source)
+    try:
+        info = probe(source)
+    except (ValueError, OSError, RuntimeError):
+        if on_probe is not None:
+            on_probe(None)
+        raise
+    if on_probe is not None:
+        on_probe(info.duration)
     lo = max(0.0, t - config.event_window_s)
     hi = max(lo, min(t + config.event_window_s, info.duration))
     wanted = sorted({round(x * info.fps) for x in np.linspace(lo, hi, config.frames)})
@@ -664,19 +679,25 @@ def recorded_source(entry) -> Path | str:
     return path
 
 
-def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None:
+def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules, *,
+                   invalidate: bool) -> None:
     """Rewrite ``video``'s COMPLETE fresh round set with notes on still-unreviewed rows (R36)."""
     rows = json.loads((out_dir / "rounds.json").read_text(encoding="utf-8"))
     snapshot = []
+    changed = False
     for row in rows:
         if row["video"] != video:
             continue
         r = row_to_result(row)
         note = asked.get((r.video, r.round))
-        if note is not None and not r.reviewed and note[1] == (r.t_launch, r.t_end):
+        if (note is not None and not r.reviewed and note[1] == (r.t_launch, r.t_end)
+                and r.vlm_note != note[0]):
             r.vlm_note = note[0]
+            changed = True
         snapshot.append(r)
-    if snapshot:
+    if changed:
+        if invalidate:
+            invalidate_video_attempt(out_dir, video)
         write_results(snapshot, out_dir, rules)
 
 
@@ -705,6 +726,7 @@ def review_results_dir(
     rules: Rules,
     config: VlmConfig | None = None,
     videos: set[str] | None = None,
+    attempt_starts: dict[str, float] | None = None,
 ) -> dict:
     """Ask the VLM about every ``needs_vlm`` round in a results directory.
 
@@ -728,7 +750,11 @@ def review_results_dir(
     timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     summary = {"asked": 0, "answered": 0, "unavailable": 0}
     targets = [video for video, results in sorted(by_video.items())
-               if (videos is None or video in videos) and any(map(needs_vlm, results))]
+               if (videos is None or video in videos)
+               and (timing.get(video, {}).get("analysis_status") in {None, "ok"}
+                    or (timing.get(video, {}).get("analysis_status") == "pending"
+                        and video in (attempt_starts or {})))
+               and any(map(needs_vlm, results))]
     reason = preflight(session.config) if targets else None
     if reason is not None:
         # R65: skip the phase before any calibration/frame work; one warning, explicit notes
@@ -738,7 +764,8 @@ def review_results_dir(
         for video in targets:
             asked = {(r.video, r.round): (note, (r.t_launch, r.t_end))
                      for r in by_video[video] if needs_vlm(r)}
-            _persist_notes(out_dir, video, asked, rules)
+            _persist_notes(out_dir, video, asked, rules,
+                           invalidate=video not in (attempt_starts or {}))
             summary["unavailable"] += len(asked)
         return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
     snapshots: dict[str, Snapshot] = {}
@@ -746,14 +773,22 @@ def review_results_dir(
     try:
         for video in targets:
             results = by_video[video]
+            if video not in (attempt_starts or {}):
+                # CR2-3: even identical notes/requests are a new disconnected invocation.
+                # Invalidate before work, so interruption cannot leave a prior certificate.
+                invalidate_video_attempt(out_dir, video)
             began = time.perf_counter()
             source = recorded_source(timing.get(video))
 
-            def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
+            def get_frames(r: RoundResult, source=source, video=video) -> list[np.ndarray]:
                 snapshot = _row_snapshot(out_dir, r, snapshots, vetoed)
                 if isinstance(source, str):
+                    record_video_probe(out_dir, video, None)
                     raise VlmFramesError(source)
-                return event_frames(source, event_time(r), snapshot, session.config, th)
+                return event_frames(
+                    source, event_time(r), snapshot, session.config, th,
+                    on_probe=lambda duration: record_video_probe(out_dir, video, duration),
+                )
 
             sent = len(session.requests)
             reviewed = review_low_confidence(results, get_frames, session=session)
@@ -762,7 +797,7 @@ def review_results_dir(
                 for r, before in zip(reviewed, results)
                 if r is not before
             }
-            _persist_notes(out_dir, video, asked, rules)
+            _persist_notes(out_dir, video, asked, rules, invalidate=False)
             record_vlm_timing(
                 out_dir, video, time.perf_counter() - began, session.requests[sent:]
             )

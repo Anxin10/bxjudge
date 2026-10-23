@@ -41,7 +41,12 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
-from bxjudge.autocalib import AutoCalibConfig, estimate_alignment, warp_calibration
+from bxjudge.autocalib import (
+    AutoCalibConfig,
+    estimate_alignment,
+    load_autocalib_config,
+    warp_calibration,
+)
 from bxjudge.calibration import ZONES, calibration_similarity, load_calibration
 from bxjudge.config import Thresholds
 from bxjudge.types import Calibration
@@ -115,7 +120,8 @@ def _snapshot_id(kind: str, c: Calibration, score: float, template_id: str | Non
 def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image: np.ndarray, *,
                   score: float, template_id: str | None = None, source_path: Path | None = None,
                   homography: tuple | None = None,
-                  template_set: Iterable[str] | None = None) -> Snapshot:
+                  template_set: Iterable[str] | None = None,
+                  config: AutoCalibConfig | None = None) -> Snapshot:
     """Write the snapshot of ``calibration`` with reference image ``ref_image`` and return it.
     Idempotent: identical content gives the same id and an existing snapshot is never rewritten.
     For a manual snapshot ``score`` (the per-video similarity) is not part of the identity: it is
@@ -152,11 +158,12 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
         tmp = d / f"{sid}.json.tmp"  # the JSON appears last, so a snapshot is never half-written
         tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, jpath)
-    snap = load_snapshot(out_dir, sid)
+    snap = load_snapshot(out_dir, sid, config=config)
     return replace(snap, score=float(score)) if kind == "manual" else snap
 
 
-def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
+def load_snapshot(out_dir: Path, snapshot_id: str, *,
+                  config: AutoCalibConfig | None = None) -> Snapshot:
     """Read snapshot ``snapshot_id`` from ``<out_dir>/calibrations``; ``ref_frame`` is absolute.
     Raises ``FileNotFoundError`` for an unknown id and ``ValueError`` for a malformed file."""
     if not snapshot_id or Path(snapshot_id).name != snapshot_id:
@@ -166,7 +173,7 @@ def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}: {jpath}")
     try:
         doc = json.loads(jpath.read_text(encoding="utf-8"))
-        meta = _checked_meta(doc)
+        meta = _checked_meta(doc, config if config is not None else load_autocalib_config())
         calibration = load_calibration(jpath)
         if not calibration.ref_frame or not Path(calibration.ref_frame).is_file():
             raise ValueError(f"missing reference image {calibration.ref_frame!r}")
@@ -187,20 +194,15 @@ def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-_MAX_FRAME_SIDE = 100_000  # sane bound for a frame width/height in pixels
-_MAX_COORD = 1e7  # sane bound for a zone polygon coordinate
+def _is_frame_side(v, maximum: int) -> bool:
+    return _is_number(v) and math.isfinite(v) and 1 <= v <= maximum and v == int(v)
 
 
-def _is_frame_side(v) -> bool:
-    """A finite whole number in ``1.._MAX_FRAME_SIDE`` (safe for ``int()``)."""
-    return _is_number(v) and math.isfinite(v) and 1 <= v <= _MAX_FRAME_SIDE and v == int(v)
+def _is_coord(v, maximum: float) -> bool:
+    return _is_number(v) and math.isfinite(v) and abs(v) <= maximum
 
 
-def _is_coord(v) -> bool:
-    return _is_number(v) and math.isfinite(v) and abs(v) <= _MAX_COORD
-
-
-def _checked_meta(doc) -> dict:
+def _checked_meta(doc, config: AutoCalibConfig) -> dict:
     """The ``snapshot`` block of a parsed snapshot file after a shape check; raises ValueError."""
     if not isinstance(doc, dict):
         raise TypeError("top level is not an object")
@@ -226,14 +228,14 @@ def _checked_meta(doc) -> dict:
     if tset is not None and not (isinstance(tset, list) and all(isinstance(t, str) for t in tset)):
         raise ValueError("template_set is not a list of strings")
     size = doc.get("frame_size")
-    if not (isinstance(size, list) and len(size) == 2 and all(_is_frame_side(v) for v in size)):
+    if not (isinstance(size, list) and len(size) == 2 and all(_is_frame_side(v, config.snapshot_max_frame_side) for v in size)):
         raise ValueError("frame_size is not [width, height] of positive whole pixel counts")
     if not isinstance(doc.get("name"), str):
         raise TypeError("name is not a string")
     for f in _POLY_FIELDS:
         poly = doc.get(f)
         if not (isinstance(poly, list) and all(
-                isinstance(pt, list) and len(pt) == 2 and all(map(_is_coord, pt))
+                isinstance(pt, list) and len(pt) == 2 and all(_is_coord(v, config.snapshot_max_coordinate) for v in pt)
                 for pt in poly)):
             raise ValueError(f"{f} is not a list of [x, y] points")
     return meta
@@ -281,12 +283,13 @@ def _manual_templates(calib_dir: Path) -> list[_Template]:
     return out
 
 
-def _existing_auto_snapshots(out_dir: Path, template_ids: set[str]) -> list[Snapshot]:
+def _existing_auto_snapshots(out_dir: Path, template_ids: set[str],
+                             config: AutoCalibConfig) -> list[Snapshot]:
     """Auto snapshots in ``out_dir`` whose template is still one of ``template_ids``."""
     snaps = []
     for p in sorted(_cal_dir(out_dir).glob("*.json")):
         try:
-            s = load_snapshot(out_dir, p.stem)
+            s = load_snapshot(out_dir, p.stem, config=config)
         except _LOAD_ERRORS as e:
             log.warning("skipping calibration snapshot %s: %s", p, e)
             continue
@@ -333,12 +336,12 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
             best_manual, best_sim = t, sim
     if best_manual is not None:
         return save_snapshot(out_dir, "manual", best_manual.cal, best_manual.img, score=best_sim,
-                             source_path=best_manual.path)
+                             source_path=best_manual.path, config=cfg)
 
     best_auto: Snapshot | None = None
     best_sim = -1.0
     barred: set[str] = set()  # templates whose vetoed auto snapshot covers this position
-    for s in _existing_auto_snapshots(out_dir, {t.id for t in templates}):
+    for s in _existing_auto_snapshots(out_dir, {t.id for t in templates}, cfg):
         try:
             sim = calibration_similarity(frame, s.calibration)
         except _LOAD_ERRORS as e:
@@ -365,12 +368,12 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
         return None
     cal = best_t.cal
     template = save_snapshot(out_dir, "manual", cal, best_t.img, score=_MANUAL_STORED_SCORE,
-                             source_path=best_t.path)
+                             source_path=best_t.path, config=cfg)
     h, w = frame.shape[:2]
     warped = warp_calibration(cal, best_al, (w, h), f"auto-{cal.name}")
     snap = save_snapshot(out_dir, "auto", warped, frame, score=best_al.score,
                          template_id=template.id, homography=best_al.homography,
-                         template_set=template_set)
+                         template_set=template_set, config=cfg)
     # A vetoed id is a known snapshot, so save_snapshot wrote nothing new for it.
     return None if snap.id in vetoed else snap
 

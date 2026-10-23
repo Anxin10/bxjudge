@@ -1087,10 +1087,9 @@ def _run(videos, calib, out, rules, detector=None, **kw):
 def _freeze_audit(out):
     """R69: audit marks written by hand need their audit_sample.json record."""
     from bxjudge.output import _write_json, read_rounds
+    from tests.helpers import audit_record
 
-    marked = [[r["video"], r["round"]] for r in read_rounds(out) if r.get("audit_sample")]
-    _write_json(out / "audit_sample.json", {"seed": 0, "n": len(marked), "population": marked,
-                                            "selection": marked})
+    _write_json(out / "audit_sample.json", audit_record(read_rounds(out)))
 
 
 def _confirm_reviewed(out, video, round_no, rules):
@@ -1442,6 +1441,7 @@ def _veto_setup(tmp_path, rules):
     for r in rows:
         if r["video"] == "clip2.mp4":
             r["audit_sample"] = True
+            r["needs_review"] = False  # valid original unflagged audit population
     save_rounds(rows, out, rules)
     _freeze_audit(out)
     veto_calibration(out, sid, rules=rules)
@@ -1450,10 +1450,10 @@ def _veto_setup(tmp_path, rules):
 
 def _eval(out):
     from bxjudge.calibration_store import vetoed_ids
-    from bxjudge.evaluate import evaluate, read_results
+    from bxjudge.evaluate import evaluate, read_audit, read_results
 
     rows, timings, runs = read_results(out)
-    return evaluate(rows, timings, runs=runs, vetoed=vetoed_ids(out))
+    return evaluate(rows, timings, runs=runs, vetoed=vetoed_ids(out), audit=read_audit(out))
 
 
 def test_rerun_after_a_veto_keeps_the_rows_and_the_evaluation_population(tmp_path, rules):
@@ -1623,6 +1623,7 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     assert _status(out, "clip.mp4") == "ok"
     rows = read_rounds(out)
     rows[0]["audit_sample"] = True
+    rows[0]["needs_review"] = False
     save_rounds(rows, out, rules)
     _freeze_audit(out)
     before_rows = (out / "rounds.json").read_bytes()
@@ -1640,8 +1641,8 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     assert (out / "processed_videos.json").read_bytes() == before_db  # left for retry
     entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
     # R66: only the status and the failed attempt's own wall_s change; old timing stays.
-    assert entry == {**before_entry, "analysis_status": status, "wall_s": entry["wall_s"]}
-    assert entry["wall_s"] > 0 and entry["processing_s"] == before_entry["processing_s"]
+    assert entry == {**before_entry, "analysis_status": status, "attempt_wall_s": entry["attempt_wall_s"], "duration_s": entry["duration_s"]}
+    assert entry["attempt_wall_s"] > 0 and entry["processing_s"] == before_entry["processing_s"]
     spy = _JudgeSpy(monkeypatch)
     _run(videos, calib, out, rules)  # the failure has cleared: retried
     assert spy.videos == {"clip.mp4"}

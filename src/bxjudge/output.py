@@ -254,6 +254,52 @@ def save_rounds(rows: list[dict], out_dir: Path, rules: Rules) -> None:
     )
 
 
+def _check_wall(value) -> None:
+    if value is not None and not (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and math.isfinite(value) and value >= 0
+    ):
+        raise ValueError(f"invalid observed wall time: {value!r}")
+
+
+# Pending is persisted before an attempt: an interruption cannot leave an old 'ok' certificate.
+ANALYSIS_STATUSES = ("ok", "pending", "recalibrate", "decode_error", "analysis_error")
+TRANSIENT_FAILURES = frozenset({"decode_error", "analysis_error"})
+
+
+def _probed_duration(value) -> float | None:
+    return value if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                     and math.isfinite(value) and value > 0) else None
+
+
+def record_video_probe(out_dir: Path, video: str, duration_s: float | None) -> None:
+    """Persist the latest current-source probe, independently of retained judgment provenance."""
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    rows.setdefault(video, {})["duration_s"] = _probed_duration(duration_s)
+    _write_json(path, rows)
+
+
+def invalidate_video_attempt(out_dir: Path, video: str) -> None:
+    """A standalone advisory invocation cannot extend a prior continuous judge interval."""
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    if video in rows and rows[video].get("attempt_wall_s") is not None:
+        rows[video]["attempt_wall_s"] = None
+        _write_json(path, rows)
+
+
+def begin_video_attempt(out_dir: Path, video: str, duration_s: float | None) -> None:
+    """Keep the retained analysis provenance; replace only the current probe/attempt evidence."""
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    entry = rows.setdefault(video, {})
+    entry["duration_s"] = _probed_duration(duration_s)
+    entry["analysis_status"] = "pending"
+    entry.pop("attempt_wall_s", None)
+    _write_json(path, rows)
+
+
 def record_video_timing(
     out_dir: Path,
     video: str,
@@ -261,56 +307,54 @@ def record_video_timing(
     processing_s: float,
     *,
     source_video: Path | None = None,
-    wall_s: float | None = None,
+    judged_wall_s: float | None = None,
+    retained: dict | None = None,
 ) -> None:
-    """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (ruling R66) is
-    the observed wall time of the attempt: from that video's first decode (including its
-    calibration selection pass) through its result write; ``None`` leaves it unrecorded."""
-    _check_wall(wall_s)
+    """Record a replacement analysis, retaining slower evidence behind R36 reviewed rows.
+
+    judged_wall_s is one continuous first-decode-to-final-write interval; attempt_wall_s
+    belongs to this latest attempt. No disconnected VLM or selection spans are added.
+    duration_s is the latest probe; judged_duration_s describes the retained analysis.
+    """
+    _check_wall(judged_wall_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
-    rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
-    if wall_s is not None:
-        rows[video]["wall_s"] = wall_s
+    duration_s = _probed_duration(duration_s)
+    entry = {"duration_s": duration_s, "judged_duration_s": duration_s,
+             "processing_s": processing_s}
+    old_wall = (retained or {}).get("judged_wall_s")
+    if judged_wall_s is not None:
+        entry["attempt_wall_s"] = judged_wall_s
+        entry["judged_wall_s"] = judged_wall_s
+    if old_wall is not None:
+        _check_wall(old_wall)
+        if judged_wall_s is None or old_wall > judged_wall_s:
+            entry["judged_wall_s"] = old_wall
+            entry["judged_duration_s"] = retained.get("judged_duration_s")
     if source_video is not None:
-        rows[video]["source_video"] = str(source_video)
+        entry["source_video"] = str(source_video)
+    rows[video] = entry
     _write_json(path, rows)
 
 
-def _check_wall(wall_s) -> None:
-    if wall_s is not None and not (
-        isinstance(wall_s, (int, float)) and not isinstance(wall_s, bool)
-        and math.isfinite(wall_s) and wall_s >= 0
-    ):
-        raise ValueError(f"invalid wall_s: {wall_s!r}")
-
-
-# Ruling R68: the outcome of a video's latest analysis attempt, recorded explicitly so the
-# evaluation never infers it (e.g. from ``calibration: null``).
-ANALYSIS_STATUSES = ("ok", "recalibrate", "decode_error", "analysis_error")
-# Transient failures: a previously judged video keeps its rows on these (R68).
-TRANSIENT_FAILURES = frozenset({"decode_error", "analysis_error"})
-
-
 def record_video_status(
-    out_dir: Path, video: str, status: str, *, wall_s: float | None = None
+    out_dir: Path, video: str, status: str, *,
+    attempt_wall_s: float | None = None,
+    judged_wall_s: float | None = None,
 ) -> None:
-    """Record ``videos.json[video]["analysis_status"]`` (one of ``ANALYSIS_STATUSES``) without
-    touching anything else in the entry, so a failed rerun that keeps a video's rows can say
-    so while the timing and calibration of those rows stay as they were (ruling R68). Call
-    after ``record_video_timing``, which replaces the entry.
-
-    ``wall_s`` (ruling R66): the observed wall time of this latest attempt, written with its
-    status, so a failed attempt's time is never hidden behind the kept ``processing_s``."""
+    """Update latest attempt evidence without replacing the retained analysis provenance."""
     if status not in ANALYSIS_STATUSES:
         raise ValueError(f"unknown analysis_status {status!r}; expected one of {ANALYSIS_STATUSES}")
-    _check_wall(wall_s)
+    _check_wall(attempt_wall_s)
+    _check_wall(judged_wall_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     entry = rows.setdefault(video, {})
     entry["analysis_status"] = status
-    if wall_s is not None:
-        entry["wall_s"] = wall_s
+    if attempt_wall_s is not None:
+        entry["attempt_wall_s"] = attempt_wall_s
+    if judged_wall_s is not None:
+        entry["judged_wall_s"] = judged_wall_s
     _write_json(path, rows)
 
 

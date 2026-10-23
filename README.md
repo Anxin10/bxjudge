@@ -395,18 +395,28 @@ uv run bxjudge eval results/20261001-try2 --truth results/20261001
   分母為 0 的指標顯示 unverified，一律不算達標。
 - 速度以「核心 + VLM」計（R59）；核心時間不含一次性的模型載入與掃描 / probe，核心-only
   比值另列為診斷。影片長度用 videos.json 記錄的播放秒數，慢動作不換算。
-- 實際牆鐘時間（R61）：每次 `bxjudge run` 從開始（含設定與模型載入、probe）到 VLM 階段
-  結束的 `wall_s`，以及其中的 VLM 階段 `vlm_wall_s`，追加到 `runs.json`；單獨的
-  `bxjudge vlm` 也記一筆（不增加影片長度）。端到端同時列「每支影片 核心+VLM 加總」與
-  「批次牆鐘 / 影片總長」（分母只算與加總相同條件的影片：有真實回合、已量測、
-  ≤ 300 秒，每支只算一次；不合格影片的量測時間從牆鐘扣除），兩者都只是診斷。
-  VLM 時間只算一次；加總大於牆鐘時會明列，不隱藏。
-- 速度達標判定（R66，取代 R61 的判定規則）：每支有真實回合且 ≤ 300 秒的影片，其最近一次
-  嘗試的實測 `wall_s`（從該影片第一次解碼、含校準選擇，到結果寫完；`ok` 時再加該次的
-  `vlm_s`）÷ 播放長度，最大值必須 ≤ 1.0；報告與 CLI 列出最慢的影片。最近一次嘗試失敗
-  （`analysis_status` 非 `ok`、保留舊回合）時用該次嘗試自己的 `wall_s`，不被舊的
-  `processing_s` 掩蓋。任何一支真實影片缺 `wall_s`（例如舊版結果）→ 速度 unverified，
-  重跑 `bxjudge run` 即可。批次牆鐘比與每支比值中位數只作診斷。
+- 實際牆鐘時間（R66a）：每次 `bxjudge run` 從開始（含設定、模型載入、probe）到
+  VLM 與釋放資源結束的 `wall_s` 追加到 `runs.json`。批次速度門檻使用完整 invocation
+  牆鐘／實測影片總播放秒數；設定、模型、probe、等待與釋放資源的時間都保留，不能扣除。
+  單獨的 `bxjudge vlm` 牆鐘也加入，不增加影片長度；同一批的 VLM 時間只算一次。
+- 每支影片速度使用 `max(judged_wall_s, attempt_wall_s) / duration_s`。
+  `judged_wall_s` 是目前保留回合的分析實測時間，`attempt_wall_s` 是最新嘗試；各次以單一
+  連續計時器量測，從首次解碼（含校準選擇）到最後結果寫入，包含中間等待與 after_run VLM，
+  不加總不連續片段。失敗重跑保留舊回合與分析成本；R36 保留已覆核列時也保留較慢的既有
+  成本。`duration_s` 每次使用目前來源最新 probe 的播放秒數；`judged_duration_s` 記錄
+  保留分析的原始長度。probe 失敗不借用舊長度。
+- 速度達標（R66a）需要「最慢影片比」及「完整批次比」同時 ≤ evaluation.yaml 的目標；
+  `speed_ratio` 顯示兩者最大值，報告與 CLI 另列最慢影片與批次比。中位數、核心與
+  core+VLM 加總仍為診斷。最新嘗試失敗、pending（例如 Ctrl+C 中斷）、缺少任何實測欄位
+  或批次紀錄都為 unverified，不能 PASS。清理資源與本次批次紀錄持久化完成後才清除 pending；清理或寫入中斷不借用舊批次證據。
+- 舊結果缺少觀測時間時，使用實際的強制重判旗標：
+  `bxjudge run <folder> --out <dir> --calib <calib> --rejudge`。它忽略 processed cache，
+  重新分析所有影片，仍依 R36 保留人工覆核列；一般未變動且最新分析成功的影片保留快取效率。
+- 單獨執行 `bxjudge vlm` 並處理覆核目標時，該影片的 `attempt_wall_s` 會失效
+  （設為 null），即使回覆文字相同仍然如此：新請求／解碼／計時工作與原本判定分屬不同
+  invocation，不能加成一個連續計時。原本的 judged 成本、來源最新 probe 與 VLM 診斷仍保留，
+  整個 standalone 批次成本仍計入。沒有目標或略過失敗影片且沒有新輸出的情況保持原樣。
+  取得可驗證速度需再執行 `run --rejudge`，並使用預期的 after_run VLM 設定。
 - 未標覆核回合正確率需要隨機抽樣（R62）：只覆核被標記的回合會有選擇偏差。
 
   ```bash

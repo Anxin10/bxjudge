@@ -25,3 +25,6 @@ ecc_epsilon: 1.0e-6
 auto_review_score: 0.75
 # Acceptance threshold for the mean boundary error between auto and manual zones (inference px).
 max_boundary_error_px: 8.0
+# Snapshot input validation bounds (pixels), also used by review/VLM snapshot loading.
+snapshot_max_frame_side: 100000
+snapshot_max_coordinate: 1.0e+7

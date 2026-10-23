@@ -91,7 +91,7 @@ def test_video_timing_updates_one_key(tmp_path):
     output.record_video_timing(tmp_path, "b.mp4", 20, 3)
     output.record_video_timing(tmp_path, "a.mp4", 10, 1)
     data = json.loads((tmp_path / "videos.json").read_text())
-    assert len(data) == 2 and data["a.mp4"] == {"duration_s": 10, "processing_s": 1}
+    assert len(data) == 2 and data["a.mp4"] == {"duration_s": 10, "judged_duration_s": 10, "processing_s": 1}
 
 
 def test_trajectory_all_zones_source_indices_and_scaled_reference(

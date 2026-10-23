@@ -783,9 +783,9 @@ def test_vlm_never_sends_vetoed_zones_and_other_rows_continue(tmp_path, monkeypa
     drawn = []
     real_frames = vlm.event_frames
 
-    def frames(source, t, snapshot, config, th_):
+    def frames(source, t, snapshot, config, th_, **kwargs):
         drawn.append(snapshot.id)
-        return real_frames(source, t, snapshot, config, th_)
+        return real_frames(source, t, snapshot, config, th_, **kwargs)
 
     monkeypatch.setattr(vlm, "event_frames", frames)
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"over_left","reason":"r"}'))

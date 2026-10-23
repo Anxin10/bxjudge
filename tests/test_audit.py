@@ -174,7 +174,8 @@ def test_unchanged_sample_behaves_as_before(tmp_path, rules):
     _review_all(out, rules)
     rows, timings, runs = read_results(out)
     with_meta = evaluate(rows, timings, runs=runs, audit=read_audit(out))
-    assert with_meta == evaluate(rows, timings, runs=runs)
+    with pytest.raises(ValueError, match="audit"):
+        evaluate(rows, timings, runs=runs)
     assert with_meta.finish_accuracy_unflagged_method == "audit_sample"
     assert passes(with_meta)["finish_accuracy_unflagged"] == "INCONCLUSIVE"  # R64: n < min
 

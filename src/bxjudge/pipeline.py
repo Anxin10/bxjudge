@@ -51,6 +51,7 @@ from .manifest import (
 )
 from .output import (
     TRANSIENT_FAILURES,
+    begin_video_attempt,
     read_rounds,
     record_run_timing,
     record_video_calibration,
@@ -482,6 +483,7 @@ def run_batch(
     vlm_config: Path | None = None,
     autocalib_config: Path = Path("config/autocalib.yaml"),
     autocalib: AutoCalibConfig | None = None,
+    rejudge: bool = False,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -551,12 +553,15 @@ def run_batch(
     # Rulings T4-1/T4-3: a vetoed auto snapshot is never selected again; a video recorded with
     # one keeps its rows until selection yields a non-vetoed snapshot (then it is reanalysed).
     vetoed = vetoed_ids(out_dir)
+    timing_path = out_dir / "videos.json"
+    latest = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     preselected: dict[Path, Snapshot | None] = {}
-    # Ruling R66: a reanalysed video's selection pass is its first decode, so its time is
-    # part of that video's observed wall_s.
-    selection_s: dict[Path, float] = {}
+    # R66a: keep the first-decode timestamp, not a sum of disconnected stage durations.
+    attempt_starts: dict[Path, float] = {}
     for info in processed_videos(folder, db, on_error=on_error):
-        selecting = time.perf_counter()
+        attempt_starts[info.path] = time.perf_counter()
+        previous = latest.get(info.path.name, {})
+        begin_video_attempt(out_dir, info.path.name, info.duration)
         try:
             frame = first_second_frame(info, th)
             snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
@@ -564,26 +569,32 @@ def run_batch(
             # e.g. an unreadable first second: the normal per-video flow handles it.
             log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
             infos.append(info)
-            selection_s[info.path] = time.perf_counter() - selecting
             continue
         current = snap.id if snap is not None else None
-        if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
+        if (rejudge or previous.get("analysis_status") != "ok"
+                or needs_reanalysis(processed_calibration(db, info.path), current, vetoed)):
             infos.append(info)
             preselected[info.path] = snap
-            selection_s[info.path] = time.perf_counter() - selecting
         else:
-            # Unchanged and readable again: its rows stand for the current calibration, so an
-            # earlier transient failure (R68) has cleared without re-judging.
-            record_video_status(out_dir, info.path.name, "ok")
+            # Selection alone cannot clear an earlier failure or manufacture timing.
+            record_video_status(out_dir, info.path.name, "ok",
+                                attempt_wall_s=previous.get("attempt_wall_s"))
+            attempt_starts.pop(info.path)
     # Ruling R68: "previously judged" = at least one real (non-placeholder) row on disk.
+    previous_rows = read_rounds(out_dir)
     judged_before = {
-        r["video"] for r in read_rounds(out_dir) if not is_not_a_round(r["review_reasons"])
+        r["video"] for r in previous_rows if not is_not_a_round(r["review_reasons"])
     }
+    reviewed_before = {r["video"] for r in previous_rows if r.get("reviewed") is True}
+    completed: dict[str, tuple[Path, str]] = {}
     entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
     if limit is not None:
         entries = entries[:limit]
     for path, info in entries:
         began = time.perf_counter()
+        if path not in attempt_starts:
+            attempt_starts[path] = began if info is not None else run_began
+            begin_video_attempt(out_dir, path.name, info.duration if info is not None else None)
         chosen: list[Snapshot | None] = []
         if info is None:
             results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
@@ -610,18 +621,19 @@ def run_batch(
                 )
         snap = chosen[-1] if chosen else None
         status = analysis_status(results)
-        if status in TRANSIENT_FAILURES and path.name in judged_before:
+        protected_veto = (status == "recalibrate"
+                          and processed_calibration(db, path) in vetoed)
+        if (status in TRANSIENT_FAILURES or protected_veto) and path.name in judged_before:
             # Ruling R68: a transient failure (decode, probe, analysis) of a previously judged
             # video is no replacement analysis. Its rows (predictions, audit flags, calibration
-            # ids; vetoed ones too, T4-3), its videos.json timing/calibration and its processed
-            # record stay as they are; only the status changes. With the record left as it
-            # was (or still mismatching the changed file), the next run retries the video.
-            # R66: the failed attempt's own wall time is recorded with its status, so the
-            # kept processing_s of the old rows cannot hide it.
+            # ids; vetoed ones too, T4-3), judged timing/calibration and processed record
+            # stay as they are. Current duration/status/attempt evidence changes; leaving the
+            # old processed identity (or its file mismatch) makes the next run retry.
+            # T4-3 also protects a vetoed group's raw rows when no usable replacement exists.
             log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
             record_video_status(
                 out_dir, path.name, status,
-                wall_s=selection_s.get(path, 0.0) + time.perf_counter() - began,
+                attempt_wall_s=time.perf_counter() - attempt_starts[path],
             )
             continue
         write_results(results, out_dir, rules)
@@ -632,10 +644,15 @@ def run_batch(
             info.duration if info else 0.0,
             processing,
             source_video=path.resolve(),
-            wall_s=selection_s.get(path, 0.0) + processing,
+            judged_wall_s=(time.perf_counter() - attempt_starts[path]) if status == "ok" else None,
+            retained=latest.get(path.name) if path.name in reviewed_before else None,
         )
         record_video_calibration(out_dir, path.name, snap)
-        record_video_status(out_dir, path.name, status)
+        if info is None:
+            begin_video_attempt(out_dir, path.name, None)
+        record_video_status(out_dir, path.name, "pending" if status == "ok" else status,
+                            attempt_wall_s=time.perf_counter() - attempt_starts[path])
+        completed[path.name] = (path, status)
         # Placeholder-only videos await corrected input and are retried (R56): their record
         # is removed, never left stale with an earlier success's id (ruling T4-5).
         if all(is_not_a_round(r.review_reasons) for r in results):
@@ -651,7 +668,12 @@ def run_batch(
             info.duration if info else 0.0,
         )
     vlm_wall_s = None
-    if vlm is not None and entries:
+    if vlm is not None and any(status == "ok" for _, status in completed.values()):
+        active = {video: attempt_starts[path] for video, (path, status) in completed.items()
+                  if status == "ok"}
+        for video in active:
+            current_duration = next(info.duration for path, info in entries if path.name == video)
+            begin_video_attempt(out_dir, video, current_duration)
         # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
         vlm_began = time.perf_counter()
         del detector
@@ -662,11 +684,24 @@ def run_batch(
             rules=rules,
             config=vlm,
             videos={path.name for path, _ in entries},
+            attempt_starts=active,
         )
         # R65: an unreachable server skips the phase (bounded preflight, still inside the
         # honest batch wall_s) and records no VLM phase.
         if not (summary or {}).get("skipped"):
             vlm_wall_s = time.perf_counter() - vlm_began
+    elif entries:
+        # Release work belongs to this invocation even when its VLM phase is disabled.
+        del detector
+        _release_gpu_memory()
+    if vlm is not None:
+        for video, (path, status) in completed.items():
+            if status == "ok":
+                elapsed = time.perf_counter() - attempt_starts[path]
+                retained_wall = (latest.get(video, {}).get("judged_wall_s")
+                                 if video in reviewed_before else None)
+                record_video_status(out_dir, video, "pending", attempt_wall_s=elapsed,
+                                    judged_wall_s=max(elapsed, retained_wall or 0.0))
     if entries:  # nothing judged = no judgment wall-clock to report
         record_run_timing(
             out_dir,
@@ -676,6 +711,11 @@ def run_batch(
             vlm_wall_s=vlm_wall_s,
             videos={path.name: info.duration if info else 0.0 for path, info in entries},
         )
+        # Certify only after cleanup and the current batch record are durably complete.
+        # Interruption before here keeps pending; an older runs.json entry cannot substitute.
+        for video, (_, status) in completed.items():
+            if status == "ok":
+                record_video_status(out_dir, video, "ok")
 
 
 def _release_gpu_memory() -> None:

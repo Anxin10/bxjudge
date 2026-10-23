@@ -610,3 +610,14 @@ class FakeDetector:
         return [Detection(frame, "bey", (cx - self.half, cy - self.half, cx + self.half,
                                          cy + self.half), 0.9)
                 for cx, cy in self.centers]
+
+
+def audit_record(rows):
+    """Explicit current-schema draw for tests that construct sampled rows in memory."""
+    from bxjudge.audit import audit_population
+
+    selection = sorted([r["video"], r["round"]] for r in rows if r.get("audit_sample") is True)
+    if not selection:
+        return None
+    return {"seed": 0, "n": len(selection), "population": audit_population(rows),
+            "selection": selection, "at": "2026-10-24T00:00:00+08:00"}

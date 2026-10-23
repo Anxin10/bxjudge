@@ -26,7 +26,7 @@ from bxjudge.evaluate import (
     spin_dir_check,
     thresholds_diff,
 )
-from tests.helpers import placeholder, rev, row, videos_with_calibration
+from tests.helpers import audit_record, placeholder, rev, row, videos_with_calibration
 
 ROOT = Path(__file__).resolve().parents[1]
 EVAL_CONFIG = ROOT / "config" / "evaluation.yaml"
@@ -157,8 +157,8 @@ def test_speed_without_timings_is_unverified_and_fails():
 def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     rows = _rows_of_videos("a.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0,
-                         "wall_s": 50.0, "analysis_status": "ok"}}
-    m = evaluate(rows, timings)
+                         "judged_wall_s": 120.0, "attempt_wall_s": 120.0, "analysis_status": "ok"}}
+    m = evaluate(rows, timings, runs=[_run(120.0, {"a.mp4": 100.0})])
     assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66: wall + VLM
     assert m.speed_ratio_core == pytest.approx(0.5)
     assert m.n_speed_videos == 1 and m.n_vlm_videos == 1
@@ -167,9 +167,9 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
 
 def test_speed_median_is_diagnostic_and_the_worst_video_decides():
     rows = _rows_of_videos("a.mp4", "b.mp4", "c.mp4")
-    timings = {v: {"duration_s": 100.0, "processing_s": s, "wall_s": s, "analysis_status": "ok"}
+    timings = {v: {"duration_s": 100.0, "processing_s": s, "judged_wall_s": s, "attempt_wall_s": s, "analysis_status": "ok"}
                for v, s in (("a.mp4", 50.0), ("b.mp4", 80.0), ("c.mp4", 200.0))}
-    m = evaluate(rows, timings)
+    m = evaluate(rows, timings, runs=[_run(330.0, {v: 100.0 for v in timings})])
     assert m.speed_ratio_sum == pytest.approx(0.8) == m.speed_ratio_core  # was the R61 pass
     assert m.speed_ratio == pytest.approx(2.0) and m.speed_slowest_video == "c.mp4"
     assert m.n_vlm_videos == 0
@@ -461,7 +461,7 @@ def _results(dirpath, rows, timings):
     marked = [[r["video"], r["round"]] for r in rows if r.get("audit_sample") is True]
     if marked:  # R69: marks come with their frozen draw
         (dirpath / "audit_sample.json").write_text(json.dumps(
-            {"seed": 0, "n": len(marked), "population": marked, "selection": marked}),
+            audit_record(rows)),
             encoding="utf-8")
     return dirpath
 
@@ -791,14 +791,14 @@ def _wilson(k, n, level):
 def test_unflagged_accuracy_from_reviewed_audit_sample_with_wilson_interval():
     rows = _unflagged(20, sampled={1, 2, 3, 4, 5, 6}, reviewed={1, 2, 3, 4, 5, 15, 16, 17},
                       wrong={2})
-    u = report_metrics(rows, None, _cfg()).unflagged
+    u = report_metrics(rows, None, _cfg(), audit=audit_record(rows)).unflagged
     assert u["method"] == "audit_sample" and u["n_sampled"] == 6 and u["n_used"] == 5
     assert u["estimate"] == pytest.approx(0.8)
     lo, hi = _wilson(4, 5, _cfg().audit_confidence_level)
     assert (u["low"], u["high"]) == (pytest.approx(lo), pytest.approx(hi))
     # reviewed but not randomly sampled: reported separately as biased
     assert u["biased"] == {"n": 3, "correct": 3, "accuracy": 1.0}
-    m = evaluate(rows)
+    m = evaluate(rows, audit=audit_record(rows))
     assert m.finish_accuracy_unflagged == pytest.approx(0.8)
     assert m.finish_accuracy_unflagged_method == "audit_sample"
 
@@ -848,7 +848,7 @@ def test_tradeoff_block_side_by_side_without_a_weighted_score():
 
 def test_tradeoff_intervals_propagate_the_audit_interval():
     rows = _unflagged(20, sampled={1, 2, 3, 4, 5}, reviewed={1, 2, 3, 4, 5}, wrong={2})
-    r = report_metrics(rows, None, _cfg())
+    r = report_metrics(rows, None, _cfg(), audit=audit_record(rows))
     a = r.tradeoff["auto_accuracy"]
     assert a["estimate"] == pytest.approx(0.8)
     assert (a["low"], a["high"]) == (pytest.approx(r.unflagged["low"]),
@@ -860,15 +860,15 @@ def test_tradeoff_intervals_propagate_the_audit_interval():
 def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
     rows = _rows_of_videos("a.mp4", "b.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
-               "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "wall_s": 50.0,
+               "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "judged_wall_s": 50.0, "attempt_wall_s": 50.0,
                          "analysis_status": "ok"}}
     runs = [_run(80.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s["basis"] == "unverified" and math.isnan(s["ratio"])  # a.mp4 has no wall_s
     assert s["pass_rate"] == 0.5 and s["slowest"] == "b.mp4"
-    timings["a.mp4"].update(wall_s=150.0, analysis_status="ok")
+    timings["a.mp4"].update(judged_wall_s=150.0, attempt_wall_s=150.0, analysis_status="ok")
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
-    assert s == {"basis": "worst-video", "ratio": 1.5, "pass_rate": 0.5, "slowest": "a.mp4"}
+    assert s == {"basis": "worst-video+batch", "ratio": 1.5, "pass_rate": 0.5, "slowest": "a.mp4"}
 
 
 def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):
@@ -902,7 +902,7 @@ def test_wall_clock_excludes_gate_video_duration_probe():
                "g.mp4": {"duration_s": 200.0, "processing_s": 1.0}}
     runs = [_run(151.0, {"a.mp4": 100.0, "g.mp4": 200.0})]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_ratio_wall == pytest.approx(1.5)  # gate work and duration both left out
+    assert m.speed_ratio_wall == pytest.approx(1.51)  # whole invocation, no work subtracted
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert w["duration_s"] == 100.0 and w["excluded"] == ["g.mp4"]
 
@@ -913,7 +913,7 @@ def test_wall_clock_excludes_over_limit_video_work_and_duration():
                "long.mp4": {"duration_s": 900.0, "processing_s": 400.0, "vlm_s": 10.0}}
     runs = [_run(560.0, {"a.mp4": 100.0, "long.mp4": 900.0})]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_ratio_wall == pytest.approx(1.5)  # (560 - 410) / 100, not 560 / 1000
+    assert m.speed_ratio_wall == pytest.approx(5.6)  # whole invocation / eligible playback
 
 
 def test_wall_clock_counts_a_retried_gate_video_once():
@@ -977,19 +977,19 @@ def test_audit_confidence_level_comes_from_yaml(tmp_path):
     path = tmp_path / "evaluation.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     cfg = load_eval_config(path)
-    u = report_metrics(rows, None, cfg).unflagged
+    u = report_metrics(rows, None, cfg, audit=audit_record(rows)).unflagged
     lo, hi = _wilson(4, 5, 0.80)
     assert u["level"] == 0.80
     assert (u["low"], u["high"]) == (pytest.approx(lo), pytest.approx(hi))
     lo95, hi95 = _wilson(4, 5, 0.95)
     assert u["low"] > lo95 + 0.01 and u["high"] < hi95  # narrower than the 0.95 default
-    m = evaluate(rows, config=cfg)
+    m = evaluate(rows, config=cfg, audit=audit_record(rows))
     assert m.finish_accuracy_unflagged == pytest.approx(0.8)
 
 
 def test_partly_reviewed_audit_sample_reports_coverage_and_warns(tmp_path):
     rows = _unflagged(20, sampled={1, 2, 3}, reviewed={1})
-    u = report_metrics(rows, None, _cfg()).unflagged
+    u = report_metrics(rows, None, _cfg(), audit=audit_record(rows)).unflagged
     assert u["method"] == "audit_sample" and u["coverage"] == pytest.approx(1 / 3)
     res = _results(tmp_path / "res", rows, None)
     report = tmp_path / "eval.md"
@@ -997,7 +997,7 @@ def test_partly_reviewed_audit_sample_reports_coverage_and_warns(tmp_path):
     text = report.read_text(encoding="utf-8")
     assert "WARNING: audit sample only partly reviewed (1/3" in text
     full = _unflagged(20, sampled={1, 2}, reviewed={1, 2})
-    assert report_metrics(full, None, _cfg()).unflagged["coverage"] == 1.0
+    assert report_metrics(full, None, _cfg(), audit=audit_record(full)).unflagged["coverage"] == 1.0
 
 
 # ---- R64: the unflagged-accuracy target needs statistical support ---------------
@@ -1018,7 +1018,7 @@ def _eval_cfg(tmp_path, **change):
 def test_r64_one_of_thirty_reviewed_audit_rounds_is_inconclusive_not_pass():
     # final review probe: 100 unflagged, sample of 30, one reviewed (correct)
     rows = _unflagged(100, sampled=set(range(1, 31)), reviewed={1})
-    m = evaluate(rows, config=_cfg())
+    m = evaluate(rows, config=_cfg(), audit=audit_record(rows))
     assert m.finish_accuracy_unflagged == 1.0 and m.finish_accuracy_unflagged_method == "audit_sample"
     assert m.finish_accuracy_unflagged_coverage == pytest.approx(1 / 30)
     assert passes(m, _cfg())["finish_accuracy_unflagged"] == "INCONCLUSIVE"
@@ -1026,7 +1026,7 @@ def test_r64_one_of_thirty_reviewed_audit_rounds_is_inconclusive_not_pass():
 
 def test_r64_fully_reviewed_five_of_five_is_inconclusive_under_lower_bound_rule():
     rows = _unflagged(100, sampled=set(range(1, 6)), reviewed=set(range(1, 6)))
-    m = evaluate(rows, config=_cfg())
+    m = evaluate(rows, config=_cfg(), audit=audit_record(rows))
     assert m.finish_accuracy_unflagged == 1.0
     assert m.finish_accuracy_unflagged_low == pytest.approx(_wilson(5, 5, 0.95)[0])  # ~0.566
     assert m.finish_accuracy_unflagged_coverage == 1.0
@@ -1035,7 +1035,7 @@ def test_r64_fully_reviewed_five_of_five_is_inconclusive_under_lower_bound_rule(
 
 def test_r64_large_clean_fully_reviewed_sample_clears_lower_bound_and_passes():
     rows = _unflagged(200, sampled=set(range(1, 81)), reviewed=set(range(1, 81)))
-    m = evaluate(rows, config=_cfg())
+    m = evaluate(rows, config=_cfg(), audit=audit_record(rows))
     assert m.finish_accuracy_unflagged_low == pytest.approx(_wilson(80, 80, 0.95)[0])
     assert m.finish_accuracy_unflagged_low >= 0.95 and m.n_unflagged_reviewed == 80
     assert passes(m, _cfg())["finish_accuracy_unflagged"] == "PASS"
@@ -1045,15 +1045,15 @@ def test_r64_audit_min_n_comes_from_yaml(tmp_path):
     rows = _unflagged(100, sampled=set(range(1, 6)), reviewed=set(range(1, 6)))
     # target 0.5: Wilson low ~0.566 clears it, so only audit_min_n decides
     low_target = _eval_cfg(tmp_path, accuracy_min=0.5, audit_min_n=5)
-    assert passes(evaluate(rows, config=low_target), low_target)["finish_accuracy_unflagged"] == "PASS"
+    assert passes(evaluate(rows, config=low_target, audit=audit_record(rows)), low_target)["finish_accuracy_unflagged"] == "PASS"
     strict = _eval_cfg(tmp_path, accuracy_min=0.5, audit_min_n=6)
-    assert passes(evaluate(rows, config=strict), strict)["finish_accuracy_unflagged"] == "INCONCLUSIVE"
+    assert passes(evaluate(rows, config=strict, audit=audit_record(rows)), strict)["finish_accuracy_unflagged"] == "INCONCLUSIVE"
 
 
 def test_r64_point_estimate_below_target_fails():
     rows = _unflagged(200, sampled=set(range(1, 81)), reviewed=set(range(1, 81)),
                       wrong=set(range(1, 11)))
-    m = evaluate(rows, config=_cfg())
+    m = evaluate(rows, config=_cfg(), audit=audit_record(rows))
     assert passes(m, _cfg())["finish_accuracy_unflagged"] == "FAIL"
 
 
@@ -1119,7 +1119,7 @@ def test_veto_does_not_change_the_audit_sample_population():
     rows = [row(video="a.mp4", round=n, calibration_id="S1") for n in (1, 2, 3)]
     rows[0]["audit_sample"] = True
     rows[0]["reviewed"], rows[0]["reviewer_fix"] = True, {}
-    m_plain, m_veto = evaluate(rows), evaluate(rows, vetoed={"S1"})
+    m_plain, m_veto = evaluate(rows, audit=audit_record(rows)), evaluate(rows, vetoed={"S1"}, audit=audit_record(rows))
     assert m_veto.finish_accuracy_unflagged == m_plain.finish_accuracy_unflagged == 1.0
     assert m_veto.finish_accuracy_unflagged_method == "audit_sample"
     assert m_veto.finish_accuracy_unflagged_coverage == m_plain.finish_accuracy_unflagged_coverage
@@ -1228,8 +1228,8 @@ def test_report_tradeoff_is_consistent_with_review_ratio_under_a_veto():
         r["audit_sample"] = True
     rows.append(row(video="b.mp4", round=1, calibration_id="S1"))  # vetoed, unreviewed
     cfg, vetoed = _cfg(), {"S1"}
-    m = evaluate(rows, config=cfg, vetoed=vetoed)
-    extra = report_metrics(rows, None, cfg, vetoed=vetoed)
+    m = evaluate(rows, config=cfg, vetoed=vetoed, audit=audit_record(rows))
+    extra = report_metrics(rows, None, cfg, vetoed=vetoed, audit=audit_record(rows))
     t = extra.tradeoff
     assert m.review_ratio == pytest.approx(0.25)
     assert t["automation_rate"] == pytest.approx(1 - m.review_ratio)
@@ -1244,5 +1244,5 @@ def test_report_tradeoff_is_consistent_with_review_ratio_under_a_veto():
     assert "| 自動化率 Automation Rate | 0.750 |" in text
     assert "Auto Accuracy (all real rounds) | 0.750 (" in text
     assert "Final Accuracy after review | 0.750 (" in text
-    plain = report_metrics(rows, None, cfg).tradeoff  # without vetoes: the old definition
+    plain = report_metrics(rows, None, cfg, audit=audit_record(rows)).tradeoff  # without vetoes: the old definition
     assert plain["automation_rate"] == 1.0

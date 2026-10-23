@@ -30,10 +30,17 @@ def _entry(duration, wall, *, processing=None, status="ok", vlm=None):
     e = {"duration_s": duration, "processing_s": processing if processing is not None else wall,
          "analysis_status": status}
     if wall is not None:
-        e["wall_s"] = wall
+        e["judged_wall_s"] = wall + (vlm or 0.0)
+        e["attempt_wall_s"] = wall + (vlm or 0.0)
     if vlm is not None:
         e["vlm_s"] = vlm
     return e
+
+
+def _runs(timings):
+    return [{"kind": "run", "started_at": "t",
+             "wall_s": sum(e.get("attempt_wall_s", 1.0) for e in timings.values()),
+             "vlm_wall_s": None, "videos": {v: e["duration_s"] for v, e in timings.items()}}]
 
 
 def _rows(*videos):
@@ -53,7 +60,7 @@ def test_one_slow_video_among_fast_ones_fails_and_is_named():
     runs = [{"kind": "run", "started_at": "t", "wall_s": 600.0, "vlm_wall_s": None,
              "videos": {v: 100.0 for v in timings}}]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_basis == "worst-video"
+    assert m.speed_basis == "worst-video+batch"
     assert m.speed_ratio == pytest.approx(1.3)
     assert m.speed_slowest_video == "v9.mp4"
     assert m.n_wall_videos == 10 and m.n_wall_missing == 0
@@ -66,8 +73,8 @@ def test_one_slow_video_among_fast_ones_fails_and_is_named():
 def test_every_video_within_playback_passes_boundary_inclusive():
     rows = _rows("a.mp4", "b.mp4")
     timings = {"a.mp4": _entry(100.0, 100.0), "b.mp4": _entry(50.0, 10.0)}
-    m = evaluate(rows, timings)
-    assert m.speed_basis == "worst-video" and m.speed_ratio == pytest.approx(1.0)
+    m = evaluate(rows, timings, runs=_runs(timings))
+    assert m.speed_basis == "worst-video+batch" and m.speed_ratio == pytest.approx(1.0)
     assert m.speed_slowest_video == "a.mp4"
     assert passes(m)["speed_ratio"] == "PASS"
 
@@ -75,18 +82,18 @@ def test_every_video_within_playback_passes_boundary_inclusive():
 def test_a_real_video_without_wall_s_makes_speed_unverified():
     rows = _rows("a.mp4", "b.mp4")
     timings = {"a.mp4": _entry(100.0, 10.0), "b.mp4": _entry(100.0, None, processing=10.0)}
-    m = evaluate(rows, timings)
+    m = evaluate(rows, timings, runs=_runs(timings))
     assert m.speed_basis == "unverified"
     assert m.n_wall_videos == 1 and m.n_wall_missing == 1
     assert passes(m)["speed_ratio"] == "FAIL"  # unverified never passes
-    r = report_metrics(rows, timings, _cfg())
+    r = report_metrics(rows, timings, _cfg(), runs=_runs(timings))
     assert r.observed["missing"] == ["b.mp4"]
 
 
 def test_a_real_video_without_analysis_status_is_unverified():
     timings = {"a.mp4": _entry(100.0, 10.0)}
     del timings["a.mp4"]["analysis_status"]
-    m = evaluate(_rows("a.mp4"), timings)
+    m = evaluate(_rows("a.mp4"), timings, runs=_runs(timings))
     assert m.speed_basis == "unverified" and passes(m)["speed_ratio"] == "FAIL"
 
 
@@ -102,16 +109,16 @@ def test_failed_latest_attempt_counts_its_own_wall_not_the_old_timing():
         "a.mp4": _entry(100.0, 150.0, processing=20.0, status="decode_error", vlm=5.0),
         "b.mp4": _entry(100.0, 30.0),
     }
-    m = evaluate(rows, timings)
-    assert m.speed_basis == "worst-video"
-    assert m.speed_ratio == pytest.approx(1.5)  # the attempt's wall, without the old VLM time
+    m = evaluate(rows, timings, runs=_runs(timings))
+    assert m.speed_basis == "unverified"  # failed current attempt never certifies speed
+    assert m.speed_ratio_worst_observed == pytest.approx(1.55)  # the attempt's wall, without the old VLM time
     assert m.speed_slowest_video == "a.mp4"
     assert passes(m)["speed_ratio"] == "FAIL"
 
 
 def test_ok_video_observed_time_includes_its_vlm_phase():
     timings = {"a.mp4": _entry(100.0, 60.0, vlm=50.0)}
-    m = evaluate(_rows("a.mp4"), timings)
+    m = evaluate(_rows("a.mp4"), timings, runs=_runs(timings))
     assert m.speed_ratio == pytest.approx(1.1) and passes(m)["speed_ratio"] == "FAIL"
 
 
@@ -120,8 +127,8 @@ def test_placeholder_only_and_over_limit_videos_are_not_required():
         rev(video="gate.mp4", finish=None, winner=None, review_reasons=["recalibrate"])]
     timings = {"a.mp4": _entry(100.0, 50.0), "long.mp4": _entry(900.0, None, processing=5.0),
                "gate.mp4": _entry(100.0, None, processing=1.0, status="recalibrate")}
-    m = evaluate(rows, timings)
-    assert m.speed_basis == "worst-video" and m.speed_ratio == pytest.approx(0.5)
+    m = evaluate(rows, timings, runs=_runs(timings))
+    assert m.speed_basis == "worst-video+batch" and m.speed_ratio == pytest.approx(0.52)
     assert m.n_wall_videos == 1 and m.n_wall_missing == 0
 
 
@@ -131,17 +138,18 @@ def test_report_and_cli_name_the_slowest_video(tmp_path, capsys):
     res.mkdir()
     (res / "rounds.json").write_text(json.dumps(rows), encoding="utf-8")
     (res / "videos.json").write_text(json.dumps(timings), encoding="utf-8")
+    (res / "runs.json").write_text(json.dumps(_runs(timings)), encoding="utf-8")
     report = tmp_path / "eval.md"
     assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
     summary = report.read_text(encoding="utf-8").split("\n## ", 1)[0]
-    assert "worst-video" in summary and "v9.mp4" in summary
+    assert "worst-video+batch" in summary and "v9.mp4" in summary
     assert "slowest" in capsys.readouterr().out
 
 
 def test_record_video_timing_stores_wall_s(tmp_path):
-    record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=3.0)
+    record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, judged_wall_s=3.0)
     entry = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
-    assert entry["wall_s"] == 3.0 and entry["processing_s"] == 2.0
+    assert entry["judged_wall_s"] == entry["attempt_wall_s"] == 3.0 and entry["processing_s"] == 2.0
 
 
 # --------------------------------------------------------------------------- run_batch
@@ -184,7 +192,7 @@ def test_run_batch_records_wall_s_for_each_video(tmp_path, monkeypatch, th, rule
     monkeypatch.setattr(pipeline, "processed_videos", lambda *a, **k: [])
     run()
     _, timings, _ = read_results(out)
-    assert timings["a.mp4"]["wall_s"] == 2.0 and timings["b.mp4"]["wall_s"] == 3.0
+    assert timings["a.mp4"]["judged_wall_s"] == 2.0 and timings["b.mp4"]["judged_wall_s"] == 3.0
 
     # Rerun: a.mp4 is due for reanalysis; its selection pass (1 s) counts in its wall.
     def first_second(info, th):
@@ -198,8 +206,8 @@ def test_run_batch_records_wall_s_for_each_video(tmp_path, monkeypatch, th, rule
     work["a.mp4"] = 4.0
     run()
     _, timings, _ = read_results(out)
-    assert timings["a.mp4"]["wall_s"] == 5.0
-    assert timings["b.mp4"]["wall_s"] == 3.0  # not attempted: untouched
+    assert timings["a.mp4"]["judged_wall_s"] == 5.0
+    assert timings["b.mp4"]["judged_wall_s"] == 3.0  # not attempted: untouched
 
     # A transient failure keeps the old rows and processing_s but records the attempt's wall.
     fail.add("a.mp4")
@@ -210,5 +218,5 @@ def test_run_batch_records_wall_s_for_each_video(tmp_path, monkeypatch, th, rule
     entry = timings["a.mp4"]
     assert entry["analysis_status"] == "analysis_error"
     assert entry["processing_s"] == old_processing
-    assert entry["wall_s"] == 7.0
-    assert math.isfinite(entry["wall_s"])
+    assert entry["attempt_wall_s"] == 7.0 and entry["judged_wall_s"] == 5.0
+    assert math.isfinite(entry["judged_wall_s"])

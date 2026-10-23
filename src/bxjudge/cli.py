@@ -138,7 +138,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   selection=Path(args.selection).expanduser(),
                   thresholds=Path(args.thresholds).expanduser(),
                   rules_path=Path(args.rules).expanduser(),
-                  detection_config=Path(args.config).expanduser(), limit=args.limit,
+                  detection_config=Path(args.config).expanduser(), limit=args.limit, rejudge=args.rejudge,
                   vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser(),
                   autocalib_config=Path(args.autocalib).expanduser())
     except (ValueError, OSError, RuntimeError) as error:
@@ -159,7 +159,8 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--config", default="config/detection.yaml")
-    p.add_argument("--limit", type=int, help="maximum new/changed videos")
+    p.add_argument("--limit", type=int, help="maximum videos to judge")
+    p.add_argument("--rejudge", action="store_true", help="reanalyse every video, ignoring processed cache")
     p.add_argument("--vlm-config", default="config/vlm.yaml",
                    help="local VLM second opinion after judging (its after_run key enables it)")
     p.add_argument("--no-vlm", action="store_true", help="skip the VLM phase")
@@ -419,9 +420,11 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if metrics.speed_slowest_video is not None:  # R66: name the video that decides speed
         print(f"speed [{metrics.speed_basis}]: slowest video {metrics.speed_slowest_video} "
               f"at {metrics.speed_ratio_worst_observed:.3f} x playback")
-    if metrics.n_wall_missing:
-        print(f"speed unverified: {metrics.n_wall_missing} real video(s) without wall_s "
-              "(rerun bxjudge run)")
+    print(f"speed batch gate: {shown('speed_ratio_wall')} x playback")
+    if metrics.speed_basis == "unverified":
+        print(f"speed unverified: missing/failed current attempt or batch evidence "
+              f"({metrics.n_wall_missing} real video(s) missing timing); "
+              "run bxjudge run <folder> --out <dir> --calib <calib> --rejudge")
     if metrics.finish_accuracy_unflagged_method == "invalidated":
         print("INVALIDATED: sampled rounds changed since the audit sample was drawn; run `"
               f"{ev.audit_remedy(results, audit['n'], audit['seed'])}`")

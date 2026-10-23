@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from .audit import audit_population, validate_audit
 from .config import config_loader
 from .output import ANALYSIS_STATUSES, effective, matches_for, row_to_result
 from .rules import SIDES, Rules, group_matches, is_not_a_round
@@ -148,9 +149,8 @@ class Metrics:
     touch_recall: float
     air_recall: float
     review_ratio: float
-    # Ruling R66 (replaces R61's pass rule): the WORST observed per-video wall / playback
-    # duration over every measured real video; nan (unverified) when any of them lacks an
-    # observed wall_s. Batch wall-clock and median ratios are diagnostics only.
+    # R66a: max(worst observed per-video ratio, pooled whole-batch ratio).
+    # Missing, failed or pending evidence is unverified (nan), never PASS.
     speed_ratio: float
     n_reviewed: int
     n_rounds: int = 0
@@ -162,9 +162,9 @@ class Metrics:
     n_vlm_videos: int = 0
     speed_ratio_core: float = NAN  # diagnostic: median core-only ratio
     speed_ratio_sum: float = NAN  # median per-video (core + VLM) / duration
-    speed_ratio_wall: float = NAN  # diagnostic: batch wall_s / video duration (R61)
+    speed_ratio_wall: float = NAN  # required whole-batch wall / current playback (R66a)
     speed_ratio_median: float = NAN  # diagnostic: median observed per-video wall ratio (R66)
-    speed_basis: str = "unverified"  # worst-video | unverified (R66)
+    speed_basis: str = "unverified"  # worst-video+batch | unverified
     speed_slowest_video: str | None = None  # highest observed ratio (even when unverified)
     speed_ratio_worst_observed: float = NAN  # its ratio
     n_wall_videos: int = 0  # required real videos with an observed wall_s
@@ -191,7 +191,7 @@ class Metrics:
     n_analysis_error_videos: int | None = None  # latest attempt: unexpected analysis error
 
 
-_FAILURE_STATUSES = ("recalibrate", "decode_error", "analysis_error")
+_FAILURE_STATUSES = ("recalibrate", "decode_error", "analysis_error", "pending")
 STATUS_UNVERIFIED = "unverified (no analysis_status; rerun bxjudge run)"
 
 
@@ -224,7 +224,7 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
     def status(entry) -> str | None:
         return entry.get("analysis_status") if isinstance(entry, dict) else None
 
-    status_known = timings is not None and all(status(e) is not None for e in timings.values())
+    status_known = timings is not None and all(status(e) in ANALYSIS_STATUSES for e in timings.values())
     failures: dict[str, list[str] | None] = {s: None for s in _FAILURE_STATUSES}
     covered: list[str] | None = None
     total = 0
@@ -324,36 +324,36 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
 
 
 def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dict:
-    """Ruling R66: the observed per-video wall of every measured real video.
+    """R66a: max(retained judgment interval, latest attempt interval) / current probe.
 
-    Required: each video with at least one real round whose playback duration is not over
-    ``max_s`` (an unknown duration stays required). Its observed time is the ``wall_s`` of
-    its LATEST attempt (``analysis_status``, R68): for ``ok`` plus that analysis's ``vlm_s``
-    (VLM latency is never hidden, R59); for a failed attempt that kept older rows, the
-    attempt's own ``wall_s`` alone (the kept ``processing_s``/``vlm_s`` belong to the older
-    attempt and can neither hide nor inflate it). A required video without a positive
-    ``wall_s``, a valid duration or an ``analysis_status`` is ``missing`` -> unverified."""
-    videos, missing = [], []
+    Failed or pending attempts remain unverified. Their valid observations are retained
+    as diagnostics, so a cheap failure cannot hide the slow rows it preserved.
+    """
+    videos, missing, failed = [], [], []
     for video in sorted({r["video"] for r in real_rows(rows)}):
         entry = (timings or {}).get(video)
         entry = entry if isinstance(entry, dict) else {}
-        duration, wall = entry.get("duration_s"), entry.get("wall_s")
-        status, vlm = entry.get("analysis_status"), entry.get("vlm_s", 0.0)
+        duration = entry.get("duration_s")
+        judged, attempt = entry.get("judged_wall_s"), entry.get("attempt_wall_s")
+        status = entry.get("analysis_status")
+        core, vlm = entry.get("processing_s"), entry.get("vlm_s", 0.0)
         if _number(duration) and duration > max_s:
             continue
-        if not (_number(duration) and duration > 0 and _number(wall) and wall > 0
-                and status in ANALYSIS_STATUSES and _number(vlm) and vlm >= 0):
+        if not (_number(duration) and duration > 0 and _number(judged) and judged > 0
+                and _number(attempt) and attempt > 0 and status in ANALYSIS_STATUSES
+                and _number(core) and core > 0 and _number(vlm) and vlm >= 0):
             missing.append(video)
             continue
-        vlm = vlm if status == "ok" else 0.0
-        videos.append({"video": video, "duration_s": duration, "wall_s": wall, "vlm_s": vlm,
-                       "observed_s": wall + vlm, "ratio": (wall + vlm) / duration,
-                       "status": status})
+        if status != "ok":
+            failed.append(video)
+        wall = max(judged, attempt)
+        videos.append({"video": video, "duration_s": duration,
+                       "judged_wall_s": judged, "attempt_wall_s": attempt,
+                       "observed_s": wall, "ratio": wall / duration, "status": status})
     slowest = max(videos, key=lambda v: v["ratio"]) if videos else None
     return {
-        "videos": videos,
-        "missing": missing,
-        "complete": bool(videos) and not missing,
+        "videos": videos, "missing": missing, "failed": failed,
+        "complete": bool(videos) and not missing and not failed,
         "slowest": slowest["video"] if slowest else None,
         "worst": slowest["ratio"] if slowest else NAN,
         "median": statistics.median(v["ratio"] for v in videos) if videos else NAN,
@@ -362,68 +362,58 @@ def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dic
 
 def _wall(rows: list[dict], timings: dict | None, runs: list[dict] | None,
           max_s: float) -> dict:
-    """Batch wall-clock basis from ``runs.json`` records (R61).
+    """Whole invocation wall over current eligible playback, each video in its last run.
 
-    The denominator is the playback duration of the videos eligible on the same terms as
-    the sum-based basis (``_speed_videos``: a real round, measured, ≤ ``max_s``), each
-    counted ONCE, in the last ``run`` record that lists it (the run that produced its
-    current result; a gated video retried later is not counted twice). A ``run`` record
-    is used when it is that last listing for at least one eligible video. Its ``wall_s``
-    already contains its own VLM phase, so ``vlm_wall_s`` is only a breakdown and never
-    added again; standalone ``vlm`` records add waiting time but no video duration.
-
-    So the numerator stays comparable, the measured core + VLM of ineligible videos
-    (gates, over-limit) whose last listing is a used run is subtracted; any other
-    overhead (init, probe, earlier gate attempts) stays in, which is conservative.
-    ``sum_s`` is the per-video core + VLM sum over the counted videos, reported next to
-    the wall-clock: it can exceed wall-clock (e.g. parallel videos) and is never hidden.
+    No work or overhead is subtracted. Every required measured video must have a valid
+    run record; standalone VLM invocations add wall without adding playback duration.
     """
     eligible = {v["video"]: v for v in _speed_videos(rows, timings, max_s)[0]}
-    run_records = [r for r in runs or [] if r["kind"] == "run"]
-    last: dict[str, int] = {}
-    for i, r in enumerate(run_records):
-        for video in r["videos"]:
-            last[video] = i
+    valid = isinstance(runs, list) and bool(runs) and all(
+        isinstance(r, dict) and r.get("kind") in {"run", "vlm"}
+        and _number(r.get("wall_s")) and r["wall_s"] > 0
+        and (r.get("vlm_wall_s") is None or (
+            _number(r["vlm_wall_s"]) and 0 <= r["vlm_wall_s"] <= r["wall_s"]))
+        and isinstance(r.get("videos"), dict)
+        and all(isinstance(v, str) and _number(d) and d >= 0 for v, d in r["videos"].items())
+        for r in runs or []
+    )
+    run_records = [r for r in runs or [] if isinstance(r, dict) and r.get("kind") == "run"] if valid else []
+    last = {v: i for i, r in enumerate(run_records) for v in r["videos"]}
     counted = sorted(v for v in eligible if v in last)
     used_ids = {last[v] for v in counted}
-    excluded = sorted(v for v, i in last.items() if i in used_ids and v not in eligible)
-    if not runs:
-        reason = "no run records"
-    elif not counted:
-        reason = "no eligible video in run records"
-    else:
-        reason = None
     used = [run_records[i] for i in sorted(used_ids)]
     if used:
         used += [r for r in runs if r["kind"] == "vlm"]
-    timings = timings or {}
-
-    def work(video: str) -> float:
-        e = timings.get(video)
-        if not isinstance(e, dict) or not _number(e.get("processing_s")):
-            return 0.0
-        vlm = e.get("vlm_s", 0.0)
-        return e["processing_s"] + (vlm if _number(vlm) else 0.0)
-
-    raw_wall = sum(r["wall_s"] for r in used)
-    wall = max(0.0, raw_wall - sum(work(v) for v in excluded))
-    vlm_wall = sum(r["vlm_wall_s"] or 0.0 for r in used)
+    excluded = sorted(v for v, i in last.items() if i in used_ids and v not in eligible)
+    if not valid:
+        reason = "missing or invalid run records"
+    elif not eligible:
+        reason = "no eligible video in run records"
+    elif set(counted) != set(eligible):
+        reason = "missing batch evidence for measured videos"
+    elif any(run_records[last[v]]["videos"][v] <= 0 for v in counted):
+        reason = "invalid measured playback in run records"
+    else:
+        reason = None
+    wall = sum(r["wall_s"] for r in used)
     duration = sum(eligible[v]["duration_s"] for v in counted)
     sum_s = sum(eligible[v]["total_s"] for v in counted) if counted else NAN
     return {
-        "n_runs": len(used),
-        "n_videos": len(counted),
-        "excluded": excluded,
-        "reason": reason,
-        "wall_s": wall if used else NAN,
-        "raw_wall_s": raw_wall if used else NAN,
-        "vlm_wall_s": vlm_wall if used else NAN,
+        "n_runs": len(used), "n_videos": len(counted), "excluded": excluded,
+        "reason": reason, "wall_s": wall if used else NAN,
+        "raw_wall_s": wall if used else NAN,
+        "vlm_wall_s": sum(r["vlm_wall_s"] or 0.0 for r in used) if used else NAN,
         "duration_s": duration if used else NAN,
-        "ratio": wall / duration if used and duration > 0 else NAN,
+        "ratio": wall / duration if reason is None and duration > 0 else NAN,
         "sum_s": sum_s,
         "sum_ratio": sum_s / duration if counted and duration > 0 else NAN,
         "sum_exceeds_wall": bool(used and counted and sum_s > wall),
     }
+
+
+def _speed_gate(observed: dict, wall: dict) -> tuple[str, float]:
+    complete = observed["complete"] and math.isfinite(wall["ratio"])
+    return ("worst-video+batch", max(observed["worst"], wall["ratio"])) if complete else ("unverified", NAN)
 
 
 def _wilson(correct: int, n: int, level: float) -> tuple[float, float]:
@@ -442,8 +432,13 @@ def audit_invalidation(rows: list[dict], audit: dict | None) -> str | None:
     unreviewed rows (dropping their marks), which is what this detects.
     """
     if audit is None:
+        if any(r.get("audit_sample") is True for r in rows):
+            raise ValueError("audit metadata required for audit_sample marks; pass read_audit(results_dir)")
         return None
-    selection = {tuple(k) for k in audit.get("selection", audit.get("keys", []))}
+    validate_audit(audit)
+    if audit_population(rows) != sorted(audit["population"]):
+        return "unflagged population changed since the frozen audit draw"
+    selection = {tuple(k) for k in audit["selection"]}
     marked = {(r["video"], r["round"]) for r in rows if r.get("audit_sample") is True}
     missing = selection - {(r["video"], r["round"]) for r in rows}
     unmarked = (selection - missing) - marked
@@ -503,9 +498,8 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
     and ``runs.json`` wall-clock records).
 
-    Speed (R66) is the worst observed per-video wall ratio, unverified without ``timings`` or
-    when a measured real video lacks ``wall_s``; batch and median ratios are diagnostics
-    (R11/R61). ``config`` defaults to
+    Speed (R66a) gates both the worst continuous per-video interval and whole-batch ratio.
+    Missing/failed current attempt evidence or missing batch records is unverified. ``config`` defaults to
     ``config/evaluation.yaml``. ``vetoed`` calibration snapshot ids (spec 6.6b): their rounds
     stay in every population with their original predictions; the unreviewed ones also count
     as needing human work in ``review_ratio``; the calibration fields summarise coverage.
@@ -524,12 +518,12 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
             speed = (statistics.median(v["total_ratio"] for v in videos),
                      statistics.median(v["core_ratio"] for v in videos))
         n_speed, n_vlm = len(videos), sum(v["has_vlm"] for v in videos)
-        wall = _wall(rows, timings, runs, cfg.speed_max_video_s)["ratio"]
+        wall = _wall(rows, timings, runs, cfg.speed_max_video_s)
         observed = _observed_speed(rows, timings, cfg.speed_max_video_s)
     else:
-        wall = NAN  # no videos.json: no eligible videos, so no wall-clock denominator
+        wall = {"ratio": NAN}  # no videos.json: no valid batch denominator
         observed = _observed_speed(rows, None, math.inf)  # every real video is missing
-    basis = "worst-video" if observed["complete"] else "unverified"
+    basis, speed_gate = _speed_gate(observed, wall)
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level,
                            audit)
     cal = calibration_coverage(rows, timings, vetoed)
@@ -540,7 +534,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         review_ratio=_ratio(
             sum(r["needs_review"] is True or _vetoed_pending(r, vetoed) for r in real), len(real)
         ),
-        speed_ratio=observed["worst"] if basis == "worst-video" else NAN,
+        speed_ratio=speed_gate,
         n_reviewed=len(truth),
         n_rounds=len(real),
         n_placeholders=len(rows) - len(real),
@@ -551,7 +545,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         n_vlm_videos=n_vlm,
         speed_ratio_core=speed[1],
         speed_ratio_sum=speed[0],
-        speed_ratio_wall=wall,
+        speed_ratio_wall=wall["ratio"],
         speed_ratio_median=observed["median"],
         speed_basis=basis,
         speed_slowest_video=observed["slowest"],
@@ -730,8 +724,9 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
     # R66: the pass basis is the worst video; the pass rate is the share of required real
     # videos whose observed wall meets the limit (a missing one counts as not verified).
     seen = observed["videos"]
-    speed = {"basis": "worst-video" if observed["complete"] else "unverified",
-             "ratio": observed["worst"] if observed["complete"] else NAN,
+    basis, gate_ratio = _speed_gate(observed, wall)
+    speed = {"basis": basis,
+             "ratio": gate_ratio,
              "pass_rate": _ratio(sum(v["ratio"] <= limit for v in seen),
                                  len(seen) + len(observed["missing"])),
              "slowest": observed["slowest"]}
@@ -1087,11 +1082,10 @@ def read_audit(results_dir: str | Path) -> dict | None:
     rounds = Path(results_dir) / "rounds.json"
     if path.is_file():
         meta = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(meta, dict) or not isinstance(
-            meta.get("selection", meta.get("keys")), list
-        ):
-            raise ValueError(f"{path}: malformed audit sample record")
-        return meta
+        try:
+            return validate_audit(meta)
+        except ValueError as error:
+            raise ValueError(f"{path}: {error}") from None
     rows = json.loads(rounds.read_text(encoding="utf-8")) if rounds.is_file() else []
     if any(r.get("audit_sample") is True for r in rows):
         raise ValueError(f"{path}: rows are marked audit_sample but audit_sample.json is "
@@ -1153,26 +1147,24 @@ _SMOKE = (
     "and say nothing about real-video accuracy or spec section 11 compliance."
 )
 _TIMING_NOTE = (
-    "Timing definitions: **core** = `processing_s` per video (judge, trajectories and result "
-    "export; excludes the one-time detector/model init and the scan/probe of the batch; "
-    "includes first-inference warm-up). **VLM** = `vlm_s`, the separate VLM phase (frame "
-    "decoding + requests; absent = no VLM phase for that video). **End-to-end** = core + VLM "
-    "per video (sum-based). **Batch wall-clock** = runs.json `wall_s` of each `bxjudge run` "
-    "from start to end (config + model init, probe, every video, its VLM phase once) plus "
-    "standalone `bxjudge vlm` phases, minus the measured work of ineligible videos, over "
-    "the playback duration of the speed-eligible videos (real round, measured, "
-    "≤ speed_max_video_s; each once, in its last run) (R61). **Observed per-video wall** "
-    "= videos.json `wall_s` of the video's latest attempt (`analysis_status`): from its "
-    "first decode (incl. its calibration selection pass) through its result write, plus "
-    "its `vlm_s` when that attempt is `ok`; a failed attempt that kept older rows counts "
-    "its own `wall_s` only. Speed pass/fail (R66) = the WORST observed per-video wall / "
-    "playback duration over every real video ≤ speed_max_video_s, which must be ≤ the "
-    "target; a real video without `wall_s` makes speed unverified. Batch wall-clock, the "
-    "median per-video ratio, the sum-based median and core-only are diagnostics "
-    "(R59/R61). VLM request latency "
-    "is per request actually sent (`vlm_requests`); *cold* = first answer by that model in "
-    "the phase (models are unloaded at phase end). Durations are the playback seconds "
-    "recorded in videos.json; slow-motion capture is NOT rescaled."
+    "Timing definitions: **core** = processing_s (judge and exports, without batch config/model "
+    "init/probe); **VLM** = vlm_s (frame decoding and requests), reported separately as diagnostics. "
+    "**Observed per-video wall** uses max(judged_wall_s, attempt_wall_s): one continuous timer "
+    "from first decode/selection through final result writing, including waiting and after_run "
+    "VLM, without adding disconnected spans. judged_wall_s preserves evidence behind retained "
+    "rows, including slower R36 reviewed rows; attempt_wall_s belongs to the latest attempt. "
+    "duration_s is the latest probe of the CURRENT source; judged_duration_s describes the "
+    "retained analysis. Failed/pending attempts, missing or invalid timing/probe evidence and "
+    "missing batch records are unverified and never PASS. **Batch wall-clock** is the complete "
+    "runs.json wall_s for each used invocation, including config/model/probe/release overhead "
+    "and its VLM phase exactly once, plus standalone VLM invocations. No work is subtracted; "
+    "each eligible video's current playback duration is counted once in its last run. "
+    "Speed (R66a) requires BOTH the worst per-video ratio and pooled batch ratio to meet the "
+    "YAML target; speed_ratio is their maximum. Median/core/sum-based ratios remain diagnostic. "
+    "Use bxjudge run <folder> --out <dir> --calib <calib> --rejudge to obtain new timing "
+    "evidence while keeping reviewed rows. VLM request latency is per request actually sent "
+    "(vlm_requests); cold = first answer by that model in the phase. Playback seconds are "
+    "never rescaled for slow-motion capture."
 )
 
 
@@ -1202,7 +1194,7 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     u, w, t, o = x.unflagged, x.wall, x.tradeoff, x.observed
     slowest = (f"slowest video {o['slowest']} at {_f(o['worst'])}" if o["slowest"]
                else "no observed video")
-    missing = (f"; UNVERIFIED: no wall_s for {', '.join(o['missing'])} (rerun bxjudge run)"
+    missing = (f"; UNVERIFIED: missing current timing for {', '.join(o['missing'])} (run bxjudge run --rejudge)"
                if o["missing"] else "")
     wall_ok = sum(v["ratio"] <= limit for v in o["videos"])
     if u["method"] == "audit_sample":
@@ -1236,7 +1228,9 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         ("處理速度比 speed_ratio", "speed_ratio",
          (f"{_f(m.speed_ratio)} [{m.speed_basis}: max observed wall / duration; {slowest}; "
           f"{m.n_wall_videos}/{m.n_wall_videos + m.n_wall_missing} real video(s) with "
-          f"wall_s{missing}]; diagnostics: batch wall-clock {_f(m.speed_ratio_wall)}, "
+          f"current timing{missing}]; pooled batch gate {_f(m.speed_ratio_wall)}; "
+          f"failed/pending attempts: {', '.join(o['failed']) or 'none'}; "
+          f"batch evidence: {w['reason'] or 'complete'}; diagnostics: "
           f"median per-video wall {_f(m.speed_ratio_median)}, "
           f"sum-based median (core+VLM) {_f(m.speed_ratio_sum)} over {m.n_speed_videos} "
           f"video(s), core-only {_f(m.speed_ratio_core)}")),
@@ -1326,12 +1320,12 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         out += ["No videos.json: speed and latency are unverified (R11).", ""]
     if o["videos"] or o["missing"]:
         out += [(f"Observed per-video wall (R66): {len(o['videos'])} measured, "
-                 f"missing wall_s: {', '.join(o['missing']) or 'none'}; slowest first."), ""]
+                 f"missing timing: {', '.join(o['missing']) or 'none'}; slowest first."), ""]
     if o["videos"]:
-        out += ["| video | status | duration s | wall s | VLM s | observed / duration |",
+        out += ["| video | status | current duration s | judged wall s | attempt wall s | observed / duration |",
                 "|---|---|---|---|---|---|"]
-        out += [f"| {v['video']} | {v['status']} | {v['duration_s']:.2f} | {v['wall_s']:.2f} | "
-                f"{v['vlm_s']:.2f} | {v['ratio']:.3f} |"
+        out += [f"| {v['video']} | {v['status']} | {v['duration_s']:.2f} | {v['judged_wall_s']:.2f} | "
+                f"{v['attempt_wall_s']:.2f} | {v['ratio']:.3f} |"
                 for v in sorted(o["videos"], key=lambda v: -v["ratio"])]
         out.append("")
     if x.videos:
