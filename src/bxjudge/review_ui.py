@@ -92,16 +92,26 @@ def status(row: dict) -> str:
     return "待覆核" if row.get("needs_review") else "未標記"
 
 
-def filter_rows(rows: list[dict], choice: str, out_dir: Path) -> list[dict]:
+def row_states(
+    out_dir: Path, rows: list[dict], vetoed: set[str], videos: dict
+) -> list[str]:
+    """``calibration_status`` of every row, from the vetoes and ``videos.json`` read once."""
+    return [calibration_status(out_dir, r, vetoed=vetoed, videos=videos) for r in rows]
+
+
+def needs_human(row: dict, state: str) -> bool:
+    """Flagged-unreviewed, a diagnostic, or an unreviewed round of a vetoed calibration (which
+    needs human work even when unflagged; same rule as ``evaluate.review_ratio``)."""
+    return status(row) in ("待覆核", "分析診斷") or state == "vetoed"
+
+
+def filter_rows(rows: list[dict], choice: str, states: list[str]) -> list[dict]:
+    """``states``: ``row_states`` of ``rows`` (same order)."""
+    pairs = list(zip(rows, states, strict=True))
     if choice == "需覆核":
-        # a vetoed unreviewed round needs human work even when it was not flagged
-        # (same rule as evaluate.review_ratio)
-        return [
-            r for r in rows
-            if status(r) in ("待覆核", "分析診斷") or calibration_status(out_dir, r) == "vetoed"
-        ]
+        return [r for r, c in pairs if needs_human(r, c)]
     if choice == "校準被否決":
-        return [r for r in rows if calibration_status(out_dir, r) == "vetoed"]
+        return [r for r, c in pairs if c == "vetoed"]
     if choice == "已覆核":
         return [r for r in rows if status(r) == "已覆核"]
     if choice == "抽樣稽核":
@@ -109,13 +119,18 @@ def filter_rows(rows: list[dict], choice: str, out_dir: Path) -> list[dict]:
     return list(rows)
 
 
-def counts(rows: list[dict]) -> dict[str, int]:
-    states = [status(r) for r in rows]
+def counts(rows: list[dict], states: list[str]) -> dict[str, int]:
+    """Header metrics; 待覆核 counts what the 需覆核 list shows minus the diagnostics."""
+    labels = [status(r) for r in rows]
+    pending = sum(
+        1 for r, label, c in zip(rows, labels, states, strict=True)
+        if label != "分析診斷" and needs_human(r, c)
+    )
     return {
-        "回合": len(rows) - states.count("分析診斷"),
-        "待覆核": states.count("待覆核"),
-        "已覆核": states.count("已覆核"),
-        "分析診斷": states.count("分析診斷"),
+        "回合": len(rows) - labels.count("分析診斷"),
+        "待覆核": pending,
+        "已覆核": labels.count("已覆核"),
+        "分析診斷": labels.count("分析診斷"),
     }
 
 
@@ -178,12 +193,17 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
     return [*steps, rerun]
 
 
-def _video_calibration_record(out_dir: Path, video: str) -> dict | None:
-    """``videos.json[video]["calibration"]`` (the snapshot the video's latest run used)."""
-    path = Path(out_dir) / "videos.json"
-    if not path.is_file():
-        return None
-    entry = json.loads(path.read_text(encoding="utf-8")).get(video)
+def _video_calibration_record(
+    out_dir: Path, video: str, videos: dict | None = None
+) -> dict | None:
+    """``videos.json[video]["calibration"]`` (the snapshot the video's latest run used);
+    ``videos`` is the already parsed file, read from ``out_dir`` when omitted."""
+    if videos is None:
+        path = Path(out_dir) / "videos.json"
+        if not path.is_file():
+            return None
+        videos = json.loads(path.read_text(encoding="utf-8"))
+    entry = videos.get(video)
     record = entry.get("calibration") if isinstance(entry, dict) else None
     return record if isinstance(record, dict) else None
 
@@ -210,20 +230,24 @@ def row_calibration(out_dir: Path, row: dict) -> Snapshot | None:
     return snap
 
 
-def calibration_status(out_dir: Path, row: dict) -> str:
+def calibration_status(
+    out_dir: Path, row: dict, *, vetoed: set[str] | None = None, videos: dict | None = None
+) -> str:
     """``"no_record"`` (no snapshot), ``"changed_since_review"`` (a reviewed row whose snapshot
     is vetoed or is no longer the video's current ``videos.json`` calibration), ``"vetoed"``
-    (an unreviewed row of a vetoed snapshot: excluded from the scores) or ``"ok"``."""
+    (an unreviewed row of a vetoed snapshot: excluded from the scores) or ``"ok"``.
+    ``vetoed`` / ``videos`` are the vetoed ids and parsed ``videos.json`` when the caller already
+    holds them (one read per rerun instead of one per row)."""
     sid = row.get("calibration_id")
     if not sid or not (Path(out_dir) / "calibrations" / f"{sid}.json").is_file():
         return "no_record"
-    vetoed = sid in vetoed_ids(Path(out_dir))
+    is_vetoed = sid in (vetoed_ids(Path(out_dir)) if vetoed is None else vetoed)
     if row.get("reviewed") is True:
-        record = _video_calibration_record(out_dir, row["video"]) or {}
-        if vetoed or record.get("id") != sid:
+        record = _video_calibration_record(out_dir, row["video"], videos) or {}
+        if is_vetoed or record.get("id") != sid:
             return "changed_since_review"
         return "ok"
-    return "vetoed" if vetoed else "ok"
+    return "vetoed" if is_vetoed else "ok"
 
 
 def calibration_line(snap: Snapshot) -> str:

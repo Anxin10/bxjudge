@@ -269,16 +269,20 @@ def main() -> None:
     st.caption(f"結果資料夾：{out}")
     if "flash" in st.session_state:
         st.success(st.session_state.pop("flash"))
-    for col, (label, value) in zip(st.columns(4), ui.counts(rows).items(), strict=True):
+    states = ui.row_states(out, rows, vetoed, videos)
+    state_of = {id(r): c for r, c in zip(rows, states, strict=True)}
+    for col, (label, value) in zip(
+        st.columns(4), ui.counts(rows, states).items(), strict=True
+    ):
         col.metric(label, value)
 
     choice = st.sidebar.radio("篩選", ui.FILTERS, key="filter")
-    shown = ui.filter_rows(rows, choice, out)
+    shown = ui.filter_rows(rows, choice, states)
     if not shown:
         st.info(f"沒有「{choice}」的回合。")
         return
     labels = {
-        _row_key(r): (f"{ui.VETOED_PREFIX} · " if ui.calibration_status(out, r) == "vetoed" else "")
+        _row_key(r): (f"{ui.VETOED_PREFIX} · " if state_of[id(r)] == "vetoed" else "")
         + f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}"
         + (" · 抽樣稽核" if r.get("audit_sample") is True else "")
         for r in shown

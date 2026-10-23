@@ -76,14 +76,15 @@ def test_filters_and_counts():
     ]
     assert review_ui.FILTERS == ("全部", "需覆核", "已覆核", "抽樣稽核", "校準被否決")
     out = Path("/nonexistent")  # no calibration records: nothing is vetoed
-    assert review_ui.filter_rows(rows, "全部", out) == rows
-    assert review_ui.filter_rows(rows, "抽樣稽核", out) == []
+    states = review_ui.row_states(out, rows, set(), {})
+    assert review_ui.filter_rows(rows, "全部", states) == rows
+    assert review_ui.filter_rows(rows, "抽樣稽核", states) == []
     rows[2]["audit_sample"] = True  # R62: random audit sample of unflagged rounds
-    assert review_ui.filter_rows(rows, "抽樣稽核", out) == [rows[2]]
-    assert review_ui.filter_rows(rows, "需覆核", out) == [rows[0], rows[3]]
-    assert review_ui.filter_rows(rows, "已覆核", out) == [rows[1]]
-    assert review_ui.filter_rows(rows, "校準被否決", out) == []
-    assert review_ui.counts(rows) == {"回合": 3, "待覆核": 1, "已覆核": 1, "分析診斷": 1}
+    assert review_ui.filter_rows(rows, "抽樣稽核", states) == [rows[2]]
+    assert review_ui.filter_rows(rows, "需覆核", states) == [rows[0], rows[3]]
+    assert review_ui.filter_rows(rows, "已覆核", states) == [rows[1]]
+    assert review_ui.filter_rows(rows, "校準被否決", states) == []
+    assert review_ui.counts(rows, states) == {"回合": 3, "待覆核": 1, "已覆核": 1, "分析診斷": 1}
 
 
 def test_synthetic_detector_rows_are_flagged():
@@ -491,10 +492,33 @@ def test_needs_review_filter_includes_vetoed_unreviewed_round(tmp_path, rules):
     out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
     veto_calibration(out, SNAP_ID, rules=rules)
     rows = [{**find_row(out, "clip.mp4", n), "needs_review": False} for n in (1, 2)]
-    assert [r["round"] for r in review_ui.filter_rows(rows, "需覆核", out)] == [1, 2]
+
+    def view(choice):
+        states = review_ui.row_states(out, rows, vetoed_ids(out), {})
+        return [r["round"] for r in review_ui.filter_rows(rows, choice, states)]
+
+    assert view("需覆核") == [1, 2]
     rows[1]["reviewed"] = True  # reviewed under a veto: changed_since_review, not vetoed
-    assert [r["round"] for r in review_ui.filter_rows(rows, "需覆核", out)] == [1]
-    assert [r["round"] for r in review_ui.filter_rows(rows, "校準被否決", out)] == [1]
+    assert view("需覆核") == [1]
+    assert view("校準被否決") == [1]
+
+
+def test_header_count_and_needs_review_list_agree_on_vetoed_unflagged_round(
+    tmp_path, monkeypatch, rules
+):
+    out = results_with_auto_snapshot(tmp_path, rounds=(1,))
+    rounds = json.loads((out / "rounds.json").read_text(encoding="utf-8"))
+    rounds[0]["needs_review"] = False
+    rounds[0]["review_reasons"] = []
+    (out / "rounds.json").write_text(json.dumps(rounds), encoding="utf-8")
+    veto_calibration(out, SNAP_ID, rules=rules)
+    at = app_test(out, monkeypatch).run()
+    assert not at.exception, at.exception
+    assert {m.label: m.value for m in at.metric}["待覆核"] == "1"
+    widget(at.sidebar.radio, "篩選").set_value("需覆核").run()
+    assert not at.exception, at.exception
+    options = widget(at.sidebar.selectbox, "回合").options
+    assert len(options) == 1 and options[0].startswith("⛔ 校準被否決")
 
 
 # ----------------------------------------------------------------------------- cli
