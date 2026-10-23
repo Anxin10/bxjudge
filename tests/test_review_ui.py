@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from bxjudge import review_ui, vlm
+from bxjudge import review_ui
 from bxjudge.corrections import Correction, load_corrections
 from bxjudge.output import effective, read_rounds, record_video_timing, write_results
 from tests.helpers import make_calibration, make_video, rr
@@ -104,8 +104,7 @@ def test_repair_steps_are_concrete(tmp_path, reason):
 
 def test_evidence_frame_draws_scaled_zones_at_playback_time(tmp_path, monkeypatch, th):
     video = make_video(tmp_path / "v.mp4", seconds=3, fps=30, size=(320, 180))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: make_calibration())
-    calibration = review_ui.video_calibration(video, tmp_path, th)
+    calibration = make_calibration()
     image, t, index = review_ui.evidence_frame(video, 1.5, calibration, th)
     assert index == 45 and t == pytest.approx(1.5)
     assert image.shape == (180, 320, 3)
@@ -117,11 +116,9 @@ def test_evidence_frame_draws_scaled_zones_at_playback_time(tmp_path, monkeypatc
     assert last == 89
 
 
-def test_missing_calibration_is_reported_not_invented(tmp_path, monkeypatch, th):
-    video = make_video(tmp_path / "v.mp4", seconds=1, fps=30, size=(320, 180))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: None)
-    with pytest.raises(review_ui.ReviewMediaError, match="calibration"):
-        review_ui.video_calibration(video, tmp_path, th)
+def test_missing_calibration_is_reported_not_invented(tmp_path):
+    assert review_ui.row_calibration(tmp_path, row()) is None
+    assert review_ui.calibration_status(tmp_path, row()) == "no_record"
 
 
 # ----------------------------------------------------------------------------- app
@@ -145,8 +142,7 @@ def batch(tmp_path, rules, monkeypatch):
     import cv2
 
     cv2.imwrite(str(out / "trajectories" / "a_r1.png"), np.zeros((18, 32, 3), np.uint8))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: make_calibration())
-    monkeypatch.setattr(sys, "argv", ["review_app.py", str(out), "--calib", str(tmp_path)])
+    monkeypatch.setattr(sys, "argv", ["review_app.py", str(out)])
     return out
 
 
@@ -276,6 +272,7 @@ def test_review_cli_launches_loopback_streamlit_without_telemetry(tmp_path, monk
     assert flags["--server.headless"] == "true"
     assert argv[argv.index("--") + 1] == str(tmp_path.resolve())
     assert kw["env"]["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] == "false"
+    assert "--calib" not in argv
 
 
 def test_review_cli_rejects_folder_without_results(tmp_path, capsys):
@@ -283,3 +280,195 @@ def test_review_cli_rejects_folder_without_results(tmp_path, capsys):
 
     assert cli.main(["review", str(tmp_path / "missing")]) == 2
     assert "error:" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------- recorded calibration
+
+
+def auto_snapshot(out, *, name="recorded", kind="auto", score=0.875):
+    from dataclasses import replace
+
+    from bxjudge.calibration_store import save_snapshot
+
+    return save_snapshot(out, kind, replace(make_calibration(), name=name),
+                         np.zeros((360, 640, 3), np.uint8), score=score)
+
+
+def record_snapshot(out, snap, rules):
+    from bxjudge.output import record_video_calibration, save_rounds
+
+    rows = read_rounds(out)
+    rows[0]["calibration_id"] = snap.id
+    save_rounds(rows, out, rules)
+    record_video_calibration(out, rows[0]["video"], snap)
+
+
+def test_overlay_uses_recorded_snapshot_after_template_removed(batch, rules, tmp_path):
+    import shutil
+
+    snap = auto_snapshot(batch)
+    record_snapshot(batch, snap, rules)
+    template = tmp_path / "calib"
+    template.mkdir()
+    (template / "scene.json").write_text("edited template")
+    shutil.rmtree(template)
+    recorded = review_ui.row_calibration(batch, read_rounds(batch)[0])
+    assert recorded == snap
+    assert recorded.kind == "auto"
+
+
+def test_no_record_banner_and_no_overlay(batch, monkeypatch):
+    seen = []
+    original = review_ui.evidence_frame
+
+    def evidence(source, t, calibration, th):
+        seen.append(calibration)
+        return original(source, t, calibration, th)
+
+    monkeypatch.setattr(review_ui, "evidence_frame", evidence)
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any(m.value == "此結果沒有校準紀錄，請用新版重新執行 bxjudge run" for m in at.warning)
+    assert seen and all(c is None for c in seen)
+    widget(at.button, "確認無誤")
+
+
+def test_veto_button_round_trip_preserves_rows_and_refreshes_matches(batch, rules):
+    from bxjudge.calibration_store import vetoed_ids
+
+    snap = auto_snapshot(batch)
+    record_snapshot(batch, snap, rules)
+    before = read_rounds(batch)
+    matches = (batch / "matches.csv").read_bytes()
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any(c.value == "校準：auto（recorded）分數 0.875" for c in at.caption)
+    at.button(key=f"veto-{snap.id}").click().run()
+    assert not at.exception, at.exception
+    assert snap.id in vetoed_ids(batch)
+    assert read_rounds(batch) == before
+    assert (batch / "matches.csv").read_bytes() != matches
+    assert any("校準被否決，需重新校準" in w.value for w in at.warning)
+    # Both selected-round scoring and the sidebar must use the current veto set.
+    from bxjudge.output import matches_for
+
+    expected = matches_for(before, rules, vetoed={snap.id})
+    assert list(at.sidebar.dataframe[0].value["回合數"]) == [len(m.rounds) for m in expected]
+    assert not any("本回合：" in m.value for m in at.markdown)
+    at.button(key=f"unveto-{snap.id}").click().run()
+    assert not at.exception, at.exception
+    assert snap.id not in vetoed_ids(batch)
+    assert read_rounds(batch) == before
+    assert (batch / "matches.csv").read_bytes() == matches
+    assert any("本回合：" in m.value for m in at.markdown)
+
+
+def test_historical_row_identity_and_status(batch, rules):
+    from bxjudge.calibration_store import veto_calibration
+    from bxjudge.corrections import confirm_reviewed
+    from bxjudge.output import record_video_calibration
+
+    old = auto_snapshot(batch)
+    record_snapshot(batch, old, rules)
+    assert review_ui.calibration_status(batch, read_rounds(batch)[0]) == "ok"
+    confirm_reviewed(batch, "a.mp4", 1, rules=rules)
+    historical = read_rounds(batch)[0]
+    veto_calibration(batch, old.id, rules=rules)
+    assert review_ui.calibration_status(batch, historical) == "changed_since_review"
+    current = auto_snapshot(batch, name="replacement")
+    record_video_calibration(batch, "a.mp4", current)
+    assert review_ui.row_calibration(batch, historical).id == old.id
+    assert review_ui.calibration_status(batch, historical) == "changed_since_review"
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any(w.value == "覆核當時使用的校準已被否決／更換，請確認是否需要重新覆核" for w in at.warning)
+    assert any("auto（recorded）" in c.value for c in at.caption)
+
+
+def test_missing_snapshot_is_no_record_and_manual_has_no_veto_button(batch, rules):
+    snap = auto_snapshot(batch, kind="manual")
+    record_snapshot(batch, snap, rules)
+    at = app().run()
+    assert not at.exception, at.exception
+    assert not any(b.label in ("不採用此組校準", "恢復採用此組校準") for b in at.button)
+    (batch / "calibrations" / f"{snap.id}.json").unlink()
+    assert review_ui.row_calibration(batch, read_rounds(batch)[0]) is None
+    assert review_ui.calibration_status(batch, read_rounds(batch)[0]) == "no_record"
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any("此結果沒有校準紀錄" in w.value for w in at.warning)
+
+
+@pytest.mark.parametrize("command", ["review", "vlm"])
+def test_obsolete_calib_cli_option_rejected(command, tmp_path):
+    from bxjudge.cli import main
+
+    with pytest.raises(SystemExit) as error:
+        main([command, str(tmp_path), "--calib", "calib"])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("reviewed,vetoed,changed,expected", [
+    (False, False, False, "ok"),
+    (False, True, False, "vetoed"),
+    (True, True, False, "changed_since_review"),
+    (True, False, True, "changed_since_review"),
+    (True, False, False, "ok"),
+])
+def test_calibration_status_uses_historical_and_current_ids(batch, rules, reviewed, vetoed, changed, expected):
+    from bxjudge.calibration_store import veto_calibration
+    from bxjudge.output import record_video_calibration
+
+    old = auto_snapshot(batch)
+    record_snapshot(batch, old, rules)
+    if changed:
+        record_video_calibration(batch, "a.mp4", auto_snapshot(batch, name="current"))
+    if vetoed:
+        veto_calibration(batch, old.id, rules=rules)
+    item = {**read_rounds(batch)[0], "reviewed": reviewed}
+    assert review_ui.calibration_status(batch, item) == expected
+    assert review_ui.row_calibration(batch, item).id == old.id
+
+
+def test_app_overlay_and_frame_cache_follow_row_snapshot_identity(batch, rules, monkeypatch):
+    old = auto_snapshot(batch, name="old")
+    record_snapshot(batch, old, rules)
+    seen = []
+    original = review_ui.evidence_frame
+
+    def evidence(source, t, calibration, th):
+        seen.append(calibration.name)
+        return original(source, t, calibration, th)
+
+    monkeypatch.setattr(review_ui, "evidence_frame", evidence)
+    at = app().run()
+    assert not at.exception, at.exception
+    assert seen == ["old", "old"]
+    current = auto_snapshot(batch, name="current")
+    record_snapshot(batch, current, rules)
+    at.run()
+    assert not at.exception, at.exception
+    assert seen == ["old", "old", "current", "current"]
+    # A retained reviewed row still overlays its historical zones after the video changed.
+    from bxjudge.output import save_rounds
+
+    rows = read_rounds(batch)
+    rows[0].update(calibration_id=old.id, reviewed=True)
+    save_rounds(rows, batch, rules)
+    at.run()
+    assert not at.exception, at.exception
+    assert any("auto（old）" in c.value for c in at.caption)
+    assert any("覆核當時使用的校準已被否決／更換" in w.value for w in at.warning)
+
+
+def test_manual_info_uses_recorded_per_video_similarity(batch, rules):
+    from dataclasses import replace
+
+    from bxjudge.output import record_video_calibration
+
+    snapshot = auto_snapshot(batch, kind="manual")
+    record_snapshot(batch, snapshot, rules)
+    record_video_calibration(batch, "a.mp4", replace(snapshot, score=0.823))
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any(c.value == "校準：manual（recorded）分數 0.823" for c in at.caption)

@@ -30,7 +30,8 @@ import cv2
 import numpy as np
 import yaml
 
-from .calibration import ZONES, find_calibration, scale_calibration
+from .calibration import ZONES, scale_calibration
+from .calibration_store import Snapshot, load_snapshot
 from .config import Thresholds, config_loader
 from .manifest import probe
 from .output import record_vlm_timing, row_to_result, write_results
@@ -584,44 +585,20 @@ def overlay_zones(frame: np.ndarray, c: Calibration, t: float) -> np.ndarray:
     return image
 
 
-def select_calibration(source: Path, fps: float, calib_dir: Path, th: Thresholds) -> Calibration:
-    """The same calibration choice as the judge: first-second frame at inference size."""
-    last = None
-    with closing(iter_frames(source, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel)) as frames:
-        for idx, frame in frames:
-            last = frame
-            if idx >= round(fps):
-                break
-    if last is None:
-        raise VlmFramesError(f"{source}: no frames decoded")
-    c = find_calibration(last, calib_dir, th.calibration_min_similarity)
-    if c is None:
-        raise VlmFramesError(f"{source}: no matching calibration in {calib_dir}")
-    return c
-
-
 def event_frames(
     source: Path,
     t: float,
-    calib_dir: Path,
+    snapshot: Snapshot,
     config: VlmConfig,
     th: Thresholds,
-    *,
-    calibrations: dict | None = None,
 ) -> list[np.ndarray]:
     """``config.frames`` frames spread over ``t +- event_window_s`` playback seconds.
 
     Each frame carries all 8 calibration polygons scaled to the decoded size and its
-    playback time. ``calibrations`` caches the per-source calibration choice.
+    playback time, using only the immutable snapshot recorded at judging time.
     """
     source = Path(source)
     info = probe(source)
-    if calibrations is not None and source in calibrations:
-        c = calibrations[source]
-    else:
-        c = select_calibration(source, info.fps, calib_dir, th)
-        if calibrations is not None:
-            calibrations[source] = c
     lo = max(0.0, t - config.event_window_s)
     hi = max(lo, min(t + config.event_window_s, info.duration))
     wanted = sorted({round(x * info.fps) for x in np.linspace(lo, hi, config.frames)})
@@ -643,7 +620,7 @@ def event_frames(
     if not picked:
         raise VlmFramesError(f"{source}: no frames decoded in [{lo:.2f}, {hi:.2f}] s")
     first = next(iter(picked.values()))
-    scaled = scale_calibration(c, (first.shape[1], first.shape[0]))
+    scaled = scale_calibration(snapshot.calibration, (first.shape[1], first.shape[0]))
     return [overlay_zones(frame, scaled, idx / info.fps) for idx, frame in sorted(picked.items())]
 
 
@@ -672,7 +649,7 @@ def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None
             continue
         r = row_to_result(row)
         note = asked.get((r.video, r.round))
-        if note is not None and not r.reviewed and note[1] == (r.t_launch, r.t_end):
+        if note is not None and not r.reviewed and note[1] == (r.t_launch, r.t_end, r.calibration_id):
             r.vlm_note = note[0]
         snapshot.append(r)
     if snapshot:
@@ -682,7 +659,6 @@ def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None
 def review_results_dir(
     out_dir: Path,
     *,
-    calib_dir: Path,
     th: Thresholds,
     rules: Rules,
     config: VlmConfig | None = None,
@@ -707,36 +683,51 @@ def review_results_dir(
     summary = {"asked": 0, "answered": 0, "unavailable": 0}
     targets = [video for video, results in sorted(by_video.items())
                if (videos is None or video in videos) and any(map(needs_vlm, results))]
-    reason = preflight(session.config) if targets else None
+    has_record = any(r.calibration_id for video in targets for r in by_video[video] if needs_vlm(r))
+    reason = preflight(session.config) if has_record else None
     if reason is not None:
         # R65: skip the phase before any calibration/frame work; one warning, explicit notes
         log.warning("VLM phase skipped: %s. Start the local Ollama (README 完整流程) and "
                     "rerun `bxjudge vlm`", reason)
         note = f"{UNAVAILABLE_PREFIX}{reason}"
         for video in targets:
-            asked = {(r.video, r.round): (note, (r.t_launch, r.t_end))
+            asked = {(r.video, r.round): (note if r.calibration_id else f"{UNAVAILABLE_PREFIX}no calibration record",
+                                                (r.t_launch, r.t_end, r.calibration_id))
                      for r in by_video[video] if needs_vlm(r)}
             _persist_notes(out_dir, video, asked, rules)
             summary["unavailable"] += len(asked)
         return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
-    calibrations: dict = {}
+    snapshots: dict[str, Snapshot | None] = {}
     try:
         for video in targets:
             results = by_video[video]
             began = time.perf_counter()
             source = recorded_source(timing.get(video))
 
-            def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
+            def get_frames(r: RoundResult, snapshot: Snapshot, source=source) -> list[np.ndarray]:
                 if isinstance(source, str):
                     raise VlmFramesError(source)
-                return event_frames(
-                    source, event_time(r), calib_dir, session.config, th, calibrations=calibrations
-                )
+                return event_frames(source, event_time(r), snapshot, session.config, th)
 
             sent = len(session.requests)
-            reviewed = review_low_confidence(results, get_frames, session=session)
+            reviewed = []
+            for r in results:
+                if not needs_vlm(r):
+                    reviewed.append(r)
+                    continue
+                sid = r.calibration_id
+                if sid and sid not in snapshots:
+                    try:
+                        snapshots[sid] = load_snapshot(out_dir, sid)
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        log.warning("calibration record unavailable for %s: %s", sid, error)
+                        snapshots[sid] = None
+                snapshot = snapshots.get(sid)
+                note = (f"{UNAVAILABLE_PREFIX}no calibration record" if snapshot is None
+                        else _note(r, lambda r, snapshot=snapshot: get_frames(r, snapshot), session))
+                reviewed.append(replace(r, vlm_note=note))
             asked = {
-                (r.video, r.round): (r.vlm_note, (r.t_launch, r.t_end))
+                (r.video, r.round): (r.vlm_note, (r.t_launch, r.t_end, r.calibration_id))
                 for r, before in zip(reviewed, results)
                 if r is not before
             }

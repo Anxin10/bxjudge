@@ -6,6 +6,7 @@ Kept free of Streamlit so it can be unit-tested; all writes go through
 
 from __future__ import annotations
 
+import json
 from contextlib import closing
 from pathlib import Path
 
@@ -13,13 +14,14 @@ import cv2
 import numpy as np
 
 from .calibration import scale_calibration
+from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds
 from .corrections import Correction, current_value
 from .manifest import probe
 from .rules import is_not_a_round
 from .types import Calibration
 from .video import VideoDecodeError, iter_frames
-from .vlm import VlmFramesError, overlay_zones, recorded_source, select_calibration
+from .vlm import overlay_zones, recorded_source
 
 FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核")  # 抽樣稽核 = R62 random audit sample
 
@@ -158,13 +160,32 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
     return [*steps, rerun]
 
 
-def video_calibration(source: Path, calib_dir: Path, th: Thresholds) -> Calibration:
-    """The calibration the judge would choose for ``source`` (first-second frame)."""
+def row_calibration(out_dir: Path, row: dict) -> Snapshot | None:
+    """The immutable snapshot used for this row, including retained historical reviews.
+
+    A missing or unreadable record is unavailable; never choose a replacement.
+    """
+    snapshot_id = row.get("calibration_id")
+    if not snapshot_id:
+        return None
     try:
-        info = probe(source)
-        return select_calibration(source, info.fps, Path(calib_dir), th)
-    except (VlmFramesError, VideoDecodeError, ValueError, OSError, RuntimeError) as e:
-        raise ReviewMediaError(str(e)) from e
+        return load_snapshot(out_dir, snapshot_id)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def calibration_status(out_dir: Path, row: dict) -> str:
+    """Calibration availability and whether a human review used an obsolete snapshot."""
+    snapshot = row_calibration(out_dir, row)
+    if snapshot is None:
+        return "no_record"
+    path = Path(out_dir) / "videos.json"
+    videos = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    current = (videos.get(row["video"], {}).get("calibration") or {}).get("id")
+    vetoed = snapshot.id in vetoed_ids(out_dir)
+    if row.get("reviewed") and (vetoed or snapshot.id != current):
+        return "changed_since_review"
+    return "vetoed" if vetoed else "ok"
 
 
 def evidence_frame(

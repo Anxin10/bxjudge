@@ -585,7 +585,7 @@ def test_sticky_fallback_spans_videos_in_one_results_dir_phase(tmp_path, monkeyp
 
     monkeypatch.setattr(vlm, "_post", fake)
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules)
     assert _chat_models(calls) == [PRIMARY, FALLBACK, FALLBACK, FALLBACK]
     assert summary["models"] == {FALLBACK: 3}
 
@@ -656,9 +656,9 @@ def test_ask_vlm_rejects_unencodable_frame_before_any_request(monkeypatch):
 
 def test_event_frames_decode_playback_window_with_scaled_zone_overlay(tmp_path, monkeypatch, th):
     video = make_video(tmp_path / "v.mp4", seconds=3, fps=30, size=(320, 180))
-    c = make_calibration()  # 640x360 calibration -> 320x180 decoded
-    seen = []
-    monkeypatch.setattr(vlm, "find_calibration", lambda frame, d, s: seen.append(frame.shape) or c)
+    from bxjudge.calibration_store import save_snapshot
+
+    snapshot = save_snapshot(tmp_path, "auto", make_calibration(), blank(), score=0.9)
     windows = []
     real = vlm.iter_frames
 
@@ -668,13 +668,12 @@ def test_event_frames_decode_playback_window_with_scaled_zone_overlay(tmp_path, 
 
     monkeypatch.setattr(vlm, "iter_frames", recording)
     config = cfg(frames=5, event_window_s=0.5)
-    frames = vlm.event_frames(video, 1.5, tmp_path, config, th)
+    frames = vlm.event_frames(video, 1.5, snapshot, config, th)
     assert len(frames) == 5
     assert all(f.shape == (180, 320, 3) for f in frames)
-    assert seen and seen[0][:2] == (180, 320)
-    # calibration chosen on the first-second frame, then one bounded event window
-    assert windows[0][0] == 0.0
-    start, end, kw = windows[1]
+    # Only the bounded event window is decoded; no calibration is selected.
+    assert len(windows) == 1
+    start, end, kw = windows[0]
     assert start == pytest.approx(1.0) and end == pytest.approx(2.0 + 1 / 30)
     assert kw["long_edge"] == config.image_long_edge
     # battle_area of the 640x360 calibration is (120,60)-(520,280): at 320x180 its
@@ -683,21 +682,24 @@ def test_event_frames_decode_playback_window_with_scaled_zone_overlay(tmp_path, 
     assert (edge[:, 1] - edge[:, 2] > 60).any()
 
 
-def test_event_frames_without_matching_calibration_is_unavailable(tmp_path, monkeypatch, th):
-    video = make_video(tmp_path / "v.mp4", seconds=1, fps=30, size=(320, 180))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: None)
-    with pytest.raises(vlm.VlmFramesError, match="calibration"):
-        vlm.event_frames(video, 0.5, tmp_path, cfg(), th)
+@pytest.mark.parametrize("template_change", ["edit", "delete"])
+def test_event_frames_use_snapshot_after_original_template_changes(tmp_path, th, template_change):
+    from bxjudge.calibration_store import load_snapshot, save_snapshot
 
-
-def test_event_frames_reuse_cached_calibration(tmp_path, monkeypatch, th):
     video = make_video(tmp_path / "v.mp4", seconds=2, fps=30, size=(320, 180))
-    calls = []
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a: calls.append(1) or make_calibration())
-    cache = {}
-    vlm.event_frames(video, 0.5, tmp_path, cfg(frames=3), th, calibrations=cache)
-    vlm.event_frames(video, 1.5, tmp_path, cfg(frames=3), th, calibrations=cache)
-    assert calls == [1]
+    template = tmp_path / "manual.json"
+    template.write_text("original template")
+    snapshot = save_snapshot(tmp_path, "manual", make_calibration(), blank(), score=0.9,
+                             source_path=template)
+    expected = vlm.event_frames(video, 0.5, snapshot, cfg(frames=3), th)
+    if template_change == "delete":
+        template.unlink()
+    else:
+        template.write_text("edited template")
+    recorded = load_snapshot(tmp_path, snapshot.id)
+    actual = vlm.event_frames(video, 0.5, recorded, cfg(frames=3), th)
+    assert recorded.id == snapshot.id
+    assert all(np.array_equal(a, b) for a, b in zip(actual, expected, strict=True))
 
 
 # --------------------------------------------------------------------------- results directory
@@ -714,6 +716,11 @@ def _results(tmp_path, rules, source):
     a4 = res("a.mp4", 4, finish="burst", winner="X", needs_review=True, t_launch=60.0)
     b1 = res("b.mp4", 1, finish="xtreme", winner="B", needs_review=True)
     c1 = res("c.mp4", 1, needs_review=True, reasons=["recalibrate"], launch=False)
+    from bxjudge.calibration_store import save_snapshot
+
+    snapshot = save_snapshot(out, "auto", make_calibration(), blank(), score=0.9)
+    for r in (a1, a2, a3, a4, b1):
+        r.calibration_id = snapshot.id
     output.write_results([a1, a2, a3, a4], out, rules)
     output.write_results([b1], out, rules)
     output.write_results([c1], out, rules)
@@ -724,6 +731,7 @@ def _results(tmp_path, rules, source):
     output.write_results([], out, rules)  # refresh CSV/matches exports after the review
     for video, src in (("a.mp4", source), ("b.mp4", None), ("c.mp4", source)):
         output.record_video_timing(out, video, 10.0, 2.5, source_video=src)
+        output.record_video_calibration(out, video, snapshot if video != "c.mp4" else None)
     return out
 
 
@@ -736,12 +744,12 @@ def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypat
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"lid-answer-7","reason":"r"}'))
     asked = []
 
-    def frames(path, t, calib_dir, config, th_, **kw):
+    def frames(path, t, snapshot, config, th_):
         asked.append((Path(path), t))
         return [blank()]
 
     monkeypatch.setattr(vlm, "event_frames", frames)
-    summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules)
     after = json.loads((out / "rounds.json").read_text())
     assert [(r["video"], r["round"]) for r in after] == [(r["video"], r["round"]) for r in before]
     changed = {(r["video"], r["round"]) for r, o in zip(after, before) if r != o}
@@ -772,7 +780,7 @@ def test_results_dir_relative_or_missing_source_is_unavailable(tmp_path, monkeyp
     out = _results(tmp_path, rules, Path("relative/a.mp4"))
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"x","reason":"r"}'))
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("must not guess paths"))
-    vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules)
     notes = [r["vlm_note"] for r in json.loads((out / "rounds.json").read_text()) if r["vlm_note"]]
     assert notes and all(n.startswith(vlm.UNAVAILABLE_PREFIX) for n in notes)
 
@@ -785,7 +793,7 @@ def test_results_dir_rerun_only_retries_unavailable_and_respects_concurrent_revi
     out = _results(tmp_path, rules, source.resolve())
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"first","reason":"r"}'))
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules, videos={"a.mp4"})
+    vlm.review_results_dir(out, th=th, rules=rules, videos={"a.mp4"})
     rows = json.loads((out / "rounds.json").read_text())
     assert rows[4]["vlm_note"] is None  # b.mp4 outside the requested videos
     asked = []
@@ -802,7 +810,7 @@ def test_results_dir_rerun_only_retries_unavailable_and_respects_concurrent_revi
     record = {k: v for k, v in json.loads((out / "videos.json").read_text()).items()}
     record["b.mp4"]["source_video"] = str(source.resolve())
     (out / "videos.json").write_text(json.dumps(record))
-    vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules)
     rows = json.loads((out / "rounds.json").read_text())
     assert len(asked) == 1  # a.mp4 rows already have notes
     assert rows[4]["reviewed"] is True and rows[4]["reviewer_fix"] == {"winner": "X"}
@@ -817,7 +825,7 @@ def test_results_dir_validates_endpoint_before_reading_frames(tmp_path, monkeypa
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("frames before validation"))
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: pytest.fail("request before validation"))
     with pytest.raises(VlmConfigError):
-        vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules, config=cfg(host="http://192.0.2.4:1"))
+        vlm.review_results_dir(out, th=th, rules=rules, config=cfg(host="http://192.0.2.4:1"))
 
 
 def test_results_dir_releases_models_once_per_phase(tmp_path, monkeypatch, rules, th):
@@ -835,7 +843,7 @@ def test_results_dir_releases_models_once_per_phase(tmp_path, monkeypatch, rules
 
     monkeypatch.setattr(vlm, "_post", fake)
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules)
     assert paths == ["/api/chat"] * 3 + ["/api/generate"] * 2
 
 
@@ -851,9 +859,9 @@ def test_vlm_cli_runs_results_dir_and_reports_errors(tmp_path, monkeypatch, caps
         "review_results_dir",
         lambda out, **kw: calls.append((out, kw)) or {"asked": 1, "answered": 1, "unavailable": 0, "models": {}},
     )
-    assert main(["vlm", str(tmp_path), "--calib", "calib"]) == 0
+    assert main(["vlm", str(tmp_path)]) == 0
     out, kw = calls[0]
-    assert out == tmp_path and kw["calib_dir"] == Path("calib")
+    assert out == tmp_path and "calib_dir" not in kw
     assert kw["config"].host == "http://127.0.0.1:11435"
     assert "answered" in capsys.readouterr().out
     # R61: the standalone VLM phase records its own wall-clock (no video durations)
@@ -985,14 +993,13 @@ def test_unreachable_vlm_skips_phase_before_any_frame_work(
     before = json.loads((out / "rounds.json").read_text())
     timing_before = json.loads((out / "videos.json").read_text())
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("frames decoded"))
-    monkeypatch.setattr(vlm, "find_calibration", lambda *a, **k: pytest.fail("calibration read"))
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: pytest.fail("chat request sent"))
     silent = _Silent() if server == "hung" else None
     url = silent.url if silent else _closed_port_url()
     try:
         began = time.perf_counter()
         with caplog.at_level("WARNING"):
-            summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules,
+            summary = vlm.review_results_dir(out, th=th, rules=rules,
                                              config=cfg(host=url, preflight_timeout_s=0.3))
         assert time.perf_counter() - began < 2.0  # bounded by preflight_timeout_s
     finally:
@@ -1016,7 +1023,7 @@ def test_no_review_required_rows_needs_no_preflight(tmp_path, monkeypatch, rules
     monkeypatch.setattr(vlm, "preflight", lambda c: pytest.fail("preflight without work"))
     out = tmp_path / "out"
     output.write_results([res("a.mp4", 1, finish="spin", winner="X")], out, rules)
-    summary = vlm.review_results_dir(out, calib_dir=tmp_path, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules)
     assert summary["asked"] == 0 and "skipped" not in summary
 
 
@@ -1029,3 +1036,78 @@ def test_vlm_cli_unreachable_server_warns_and_records_no_vlm_run(tmp_path, monke
     captured = capsys.readouterr()
     assert "warning:" in captured.err and "11435" in captured.err
     assert not (tmp_path / "runs.json").exists()
+
+
+@pytest.mark.parametrize("server_down", [False, True])
+def test_vlm_missing_record_exact_note_and_valid_rows_continue(tmp_path, monkeypatch, rules, th, server_down):
+    from bxjudge.calibration_store import save_snapshot
+
+    source = make_video(tmp_path / "clip.mp4", seconds=1, size=(320, 180))
+    out = tmp_path / "out"
+    snap = save_snapshot(out, "auto", make_calibration(), blank(), score=0.9)
+    new = res("new.mp4", 1, finish="spin", winner="X", needs_review=True)
+    new.calibration_id = snap.id
+    old = res("old.mp4", 1, finish="spin", winner="B", needs_review=True)
+    output.write_results([old, new], out, rules)
+    for r in (old, new):
+        output.record_video_timing(out, r.video, 1.0, 0.2, source_video=source)
+    output.record_video_calibration(out, new.video, snap)
+    seen = []
+    monkeypatch.setattr(vlm, "event_frames", lambda src, t, snapshot, *a: seen.append(snapshot.id) or [blank()])
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"yes","reason":"r"}'))
+    if server_down:
+        monkeypatch.setattr(vlm, "preflight", lambda c: "server unreachable")
+    before = output.read_rounds(out)
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg())
+    after = output.read_rounds(out)
+    notes = {r["video"]: r["vlm_note"] for r in after}
+    assert notes["old.mp4"] == "vlm_unavailable: no calibration record"
+    assert notes["new.mp4"] and ("unreachable" in notes["new.mp4"] if server_down else notes["new.mp4"].startswith("["))
+    assert seen == ([] if server_down else [snap.id])
+    assert summary["unavailable"] == (2 if server_down else 1)
+    for a, b in zip(after, before):
+        assert {k: v for k, v in a.items() if k != "vlm_note"} == {k: v for k, v in b.items() if k != "vlm_note"}
+
+
+@pytest.mark.parametrize("change", ["missing_snapshot", "different_current", "concurrent_reanalysis"])
+def test_vlm_snapshot_identity_and_missing_records(tmp_path, monkeypatch, rules, th, change):
+    from dataclasses import replace
+
+    from bxjudge.calibration_store import save_snapshot
+
+    source = tmp_path / "a.mp4"
+    source.touch()
+    out = _results(tmp_path, rules, source)
+    rows = output.read_rounds(out)
+    old_id = rows[0]["calibration_id"]
+    current = save_snapshot(out, "auto", replace(make_calibration(), name="current"), blank(), score=0.8)
+    output.record_video_calibration(out, "a.mp4", current)
+    if change == "missing_snapshot":
+        (out / "calibrations" / f"{old_id}.json").unlink()
+    elif change == "different_current":
+        rows[2]["calibration_id"] = current.id
+        output.save_rounds(rows, out, rules)
+    seen = []
+
+    def frames(source, t, snapshot, config, th):
+        seen.append(snapshot.id)
+        if change == "concurrent_reanalysis":
+            fresh = output.read_rounds(out)
+            fresh[0]["calibration_id"] = current.id
+            output.save_rounds(fresh, out, rules)
+        return [blank()]
+
+    monkeypatch.setattr(vlm, "event_frames", frames)
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"yes","reason":"r"}'))
+    vlm.review_results_dir(out, th=th, rules=rules, config=cfg(), videos={"a.mp4"})
+    after = output.read_rounds(out)
+    if change == "missing_snapshot":
+        assert not seen
+        assert after[0]["vlm_note"] == after[2]["vlm_note"] == "vlm_unavailable: no calibration record"
+    elif change == "different_current":
+        assert seen == [old_id, current.id]
+        assert after[0]["vlm_note"].startswith("[") and after[2]["vlm_note"].startswith("[")
+    else:
+        assert after[0]["calibration_id"] == current.id and after[0]["vlm_note"] is None
+        assert after[2]["vlm_note"].startswith("[")
+    assert after[3] == rows[3]  # reviewed truth and its historical snapshot stay intact

@@ -866,7 +866,7 @@ def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     )
     [(out_dir, kw)] = phases
     assert out_dir == out and kw["videos"] == {"a.mp4"}
-    assert kw["calib_dir"] == tmp_path and kw["config"].model == "qwen3.8:27b"
+    assert "calib_dir" not in kw and kw["config"].model == "qwen3.8:27b"
 
 
 def test_detector_freed_then_gpu_cache_released_before_first_vlm_work(
