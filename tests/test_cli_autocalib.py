@@ -183,3 +183,21 @@ def test_boundary_error_at_limit_or_nonfinite_fails(inputs, capsys, monkeypatch,
     monkeypatch.setattr(autocalib, "mean_boundary_error", lambda *args: error)
     assert main(argv(inputs)) == 1
     assert f"boundary_error_px={error:.2f} FAIL" in capsys.readouterr().out
+
+
+def test_output_symlink_to_source_descendant_cannot_change_source_subtree(inputs, capsys):
+    calib, video, truth, out = inputs
+    generated = calib / "generated"
+    generated.mkdir()
+    (generated / "keep.txt").write_bytes(b"preserve existing source descendant bytes")
+    out.mkdir()
+    (out / "calibrations").symlink_to(generated, target_is_directory=True)
+    before = {p.relative_to(calib): p.read_bytes() for p in calib.rglob("*") if p.is_file()}
+
+    code = main(argv((calib, video, truth, out)))
+
+    after = {p.relative_to(calib): p.read_bytes() for p in calib.rglob("*") if p.is_file()}
+    assert after.keys() == before.keys()
+    assert after == before
+    assert code == 2
+    assert capsys.readouterr().err.startswith("error: ")

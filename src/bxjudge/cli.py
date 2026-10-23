@@ -53,7 +53,9 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
         raise ValueError(f"{calib}: expected a calibration directory")
     if out.exists() and not out.is_dir():
         raise ValueError(f"{out}: expected an output directory")
-    if out.is_relative_to(calib) or calib.is_relative_to((out / "calibrations").resolve()):
+    snapshot_dir = (out / "calibrations").resolve()
+    if (out.is_relative_to(calib) or snapshot_dir.is_relative_to(calib)
+            or calib.is_relative_to(snapshot_dir)):
         raise ValueError("--out must keep generated snapshots outside --calib")
     cfg = load_autocalib_config(Path(args.autocalib).expanduser())
     th = load_thresholds()
