@@ -166,6 +166,69 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_run)
 
 
+def _cmd_autocalib(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import manifest
+    from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
+    from bxjudge.calibration import load_calibration
+    from bxjudge.calibration_store import select_snapshot, write_preview
+    from bxjudge.config import load_thresholds
+    from bxjudge.pipeline import first_second_frame
+    from bxjudge.video import VideoDecodeError
+
+    th = load_thresholds(Path(args.thresholds).expanduser())
+    cfg = load_autocalib_config(Path(args.autocalib).expanduser())
+    calib_dir = Path(args.calib).expanduser()
+    out_dir = Path(args.out).expanduser()  # scratch results folder: --calib is only ever read
+    truth = load_calibration(Path(args.truth).expanduser()) if args.truth else None
+    failed = errors = 0
+    for video in map(Path, args.videos):
+        video = video.expanduser()
+        try:
+            info = manifest.probe(video)
+            frame = first_second_frame(info, th)
+            snap = select_snapshot(frame, calib_dir, out_dir, th, cfg)
+            if snap is not None:
+                write_preview(out_dir, snap)
+        except (ValueError, OSError, VideoDecodeError) as error:
+            errors += 1
+            print(f"error: {video}: {error}", file=sys.stderr)
+            continue
+        if snap is None:
+            line = f"{video.name}: recalibrate name=- score=-"
+        else:
+            line = f"{video.name}: {snap.kind} name={snap.calibration.name} score={snap.score:.3f}"
+        if truth is not None:
+            if snap is None:  # a rejected video is the correct conservative outcome, not a FAIL
+                line += " boundary_error_px=- n/a"
+            else:
+                err = mean_boundary_error(snap.calibration, truth, th.infer_long_edge)
+                passed = err <= cfg.max_boundary_error_px
+                failed += not passed
+                line += f" boundary_error_px={err:.2f} {'PASS' if passed else 'FAIL'}"
+        print(line)
+    if errors:
+        return 2
+    return 1 if failed else 0
+
+
+def _add_autocalib(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "autocalib",
+        help="preview/accept auto-calibration per video: manual | auto | recalibrate "
+             "(read-only on --calib; snapshots and previews go to --out)")
+    p.add_argument("videos", nargs="+", help="video files (first-second frame is judged)")
+    p.add_argument("--calib", default="calib", help="manual calibrations (read only)")
+    p.add_argument("--out", required=True,
+                   help="scratch results-style folder for calibrations/<id>.json|png|preview.jpg")
+    p.add_argument("--truth", help="manual calibration JSON for these videos; prints "
+                                   "boundary_error_px and exits 1 above max_boundary_error_px")
+    p.add_argument("--autocalib", default="config/autocalib.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.set_defaults(func=_cmd_autocalib)
+
+
 def _cmd_vlm(args: argparse.Namespace) -> int:
     import json
     import logging
@@ -395,7 +458,7 @@ def _add_audit_sample(sub: argparse._SubParsersAction) -> None:
 
 
 _REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
-               _add_vlm, _add_review, _add_eval, _add_tune, _add_audit_sample]
+               _add_autocalib, _add_vlm, _add_review, _add_eval, _add_tune, _add_audit_sample]
 
 
 def build_parser() -> argparse.ArgumentParser:
