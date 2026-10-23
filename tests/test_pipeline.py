@@ -1639,7 +1639,9 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     assert kept[0]["audit_sample"] is True and kept[0]["calibration_id"] == old_id
     assert (out / "processed_videos.json").read_bytes() == before_db  # left for retry
     entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
-    assert entry == {**before_entry, "analysis_status": status}
+    # R66: only the status and the failed attempt's own wall_s change; old timing stays.
+    assert entry == {**before_entry, "analysis_status": status, "wall_s": entry["wall_s"]}
+    assert entry["wall_s"] > 0 and entry["processing_s"] == before_entry["processing_s"]
     spy = _JudgeSpy(monkeypatch)
     _run(videos, calib, out, rules)  # the failure has cleared: retried
     assert spy.videos == {"clip.mp4"}

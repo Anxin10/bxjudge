@@ -23,7 +23,7 @@ import numpy as np
 import yaml
 
 from .config import config_loader
-from .output import effective, matches_for, row_to_result
+from .output import ANALYSIS_STATUSES, effective, matches_for, row_to_result
 from .rules import SIDES, Rules, group_matches, is_not_a_round
 from .vlm import UNAVAILABLE_PREFIX
 
@@ -148,8 +148,9 @@ class Metrics:
     touch_recall: float
     air_recall: float
     review_ratio: float
-    # Pass/fail basis (R59/R61): batch wall-clock ratio when run records exist, else the
-    # median per-video (core + VLM) / duration ("sum-based"); see speed_basis.
+    # Ruling R66 (replaces R61's pass rule): the WORST observed per-video wall / playback
+    # duration over every measured real video; nan (unverified) when any of them lacks an
+    # observed wall_s. Batch wall-clock and median ratios are diagnostics only.
     speed_ratio: float
     n_reviewed: int
     n_rounds: int = 0
@@ -161,8 +162,13 @@ class Metrics:
     n_vlm_videos: int = 0
     speed_ratio_core: float = NAN  # diagnostic: median core-only ratio
     speed_ratio_sum: float = NAN  # median per-video (core + VLM) / duration
-    speed_ratio_wall: float = NAN  # batch wall_s / video duration (R61)
-    speed_basis: str = "unverified"  # wall-clock | sum-based | unverified
+    speed_ratio_wall: float = NAN  # diagnostic: batch wall_s / video duration (R61)
+    speed_ratio_median: float = NAN  # diagnostic: median observed per-video wall ratio (R66)
+    speed_basis: str = "unverified"  # worst-video | unverified (R66)
+    speed_slowest_video: str | None = None  # highest observed ratio (even when unverified)
+    speed_ratio_worst_observed: float = NAN  # its ratio
+    n_wall_videos: int = 0  # required real videos with an observed wall_s
+    n_wall_missing: int = 0  # required real videos without one (-> unverified)
     finish_accuracy_unflagged_method: str = "unverified"  # exact | audit_sample | unverified
     # R64 support for the verdict: Wilson bounds of the audit estimate (= the value when
     # exact) and the reviewed share of the audit sample.
@@ -317,6 +323,43 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
     return videos, excluded
 
 
+def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dict:
+    """Ruling R66: the observed per-video wall of every measured real video.
+
+    Required: each video with at least one real round whose playback duration is not over
+    ``max_s`` (an unknown duration stays required). Its observed time is the ``wall_s`` of
+    its LATEST attempt (``analysis_status``, R68): for ``ok`` plus that analysis's ``vlm_s``
+    (VLM latency is never hidden, R59); for a failed attempt that kept older rows, the
+    attempt's own ``wall_s`` alone (the kept ``processing_s``/``vlm_s`` belong to the older
+    attempt and can neither hide nor inflate it). A required video without a positive
+    ``wall_s``, a valid duration or an ``analysis_status`` is ``missing`` -> unverified."""
+    videos, missing = [], []
+    for video in sorted({r["video"] for r in real_rows(rows)}):
+        entry = (timings or {}).get(video)
+        entry = entry if isinstance(entry, dict) else {}
+        duration, wall = entry.get("duration_s"), entry.get("wall_s")
+        status, vlm = entry.get("analysis_status"), entry.get("vlm_s", 0.0)
+        if _number(duration) and duration > max_s:
+            continue
+        if not (_number(duration) and duration > 0 and _number(wall) and wall > 0
+                and status in ANALYSIS_STATUSES and _number(vlm) and vlm >= 0):
+            missing.append(video)
+            continue
+        vlm = vlm if status == "ok" else 0.0
+        videos.append({"video": video, "duration_s": duration, "wall_s": wall, "vlm_s": vlm,
+                       "observed_s": wall + vlm, "ratio": (wall + vlm) / duration,
+                       "status": status})
+    slowest = max(videos, key=lambda v: v["ratio"]) if videos else None
+    return {
+        "videos": videos,
+        "missing": missing,
+        "complete": bool(videos) and not missing,
+        "slowest": slowest["video"] if slowest else None,
+        "worst": slowest["ratio"] if slowest else NAN,
+        "median": statistics.median(v["ratio"] for v in videos) if videos else NAN,
+    }
+
+
 def _wall(rows: list[dict], timings: dict | None, runs: list[dict] | None,
           max_s: float) -> dict:
     """Batch wall-clock basis from ``runs.json`` records (R61).
@@ -460,7 +503,9 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
     and ``runs.json`` wall-clock records).
 
-    Without ``timings`` or run records speed is unverified (R11). ``config`` defaults to
+    Speed (R66) is the worst observed per-video wall ratio, unverified without ``timings`` or
+    when a measured real video lacks ``wall_s``; batch and median ratios are diagnostics
+    (R11/R61). ``config`` defaults to
     ``config/evaluation.yaml``. ``vetoed`` calibration snapshot ids (spec 6.6b): their rounds
     stay in every population with their original predictions; the unreviewed ones also count
     as needing human work in ``review_ratio``; the calibration fields summarise coverage.
@@ -480,10 +525,11 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
                      statistics.median(v["core_ratio"] for v in videos))
         n_speed, n_vlm = len(videos), sum(v["has_vlm"] for v in videos)
         wall = _wall(rows, timings, runs, cfg.speed_max_video_s)["ratio"]
+        observed = _observed_speed(rows, timings, cfg.speed_max_video_s)
     else:
         wall = NAN  # no videos.json: no eligible videos, so no wall-clock denominator
-    basis = ("wall-clock" if math.isfinite(wall)
-             else "sum-based" if math.isfinite(speed[0]) else "unverified")
+        observed = _observed_speed(rows, None, math.inf)  # every real video is missing
+    basis = "worst-video" if observed["complete"] else "unverified"
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level,
                            audit)
     cal = calibration_coverage(rows, timings, vetoed)
@@ -494,7 +540,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         review_ratio=_ratio(
             sum(r["needs_review"] is True or _vetoed_pending(r, vetoed) for r in real), len(real)
         ),
-        speed_ratio=wall if basis == "wall-clock" else speed[0],
+        speed_ratio=observed["worst"] if basis == "worst-video" else NAN,
         n_reviewed=len(truth),
         n_rounds=len(real),
         n_placeholders=len(rows) - len(real),
@@ -506,7 +552,12 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         speed_ratio_core=speed[1],
         speed_ratio_sum=speed[0],
         speed_ratio_wall=wall,
+        speed_ratio_median=observed["median"],
         speed_basis=basis,
+        speed_slowest_video=observed["slowest"],
+        speed_ratio_worst_observed=observed["worst"],
+        n_wall_videos=len(observed["videos"]),
+        n_wall_missing=len(observed["missing"]),
         finish_accuracy_unflagged_method=u["method"],
         finish_accuracy_unflagged_low=u["low"],
         finish_accuracy_unflagged_high=u["high"],
@@ -590,7 +641,8 @@ class ReportMetrics:
     flagged_vlm: dict
     referee: dict
     match_agreement: dict | None
-    wall: dict  # R61 batch wall-clock basis
+    wall: dict  # R61 batch wall-clock (diagnostic since R66)
+    observed: dict  # R66 observed per-video wall (_observed_speed)
     unflagged: dict  # R62 unbiased unflagged accuracy
     tradeoff: dict  # R63 joint block
 
@@ -674,15 +726,15 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
     wall = _wall(rows, timings, runs, config.speed_max_video_s)
     u = unflagged_accuracy(rows, config.audit_confidence_level, audit)
     pass_rate = _ratio(sum(v["total_ratio"] <= limit for v in videos), len(videos))
-    if math.isfinite(wall["ratio"]):
-        speed = {"basis": "wall-clock", "ratio": wall["ratio"],
-                 "pass_rate": 1.0 if wall["ratio"] <= limit else 0.0}
-    elif videos:
-        speed = {"basis": "sum-based",
-                 "ratio": float(statistics.median(v["total_ratio"] for v in videos)),
-                 "pass_rate": pass_rate}
-    else:
-        speed = {"basis": "unverified", "ratio": NAN, "pass_rate": NAN}
+    observed = _observed_speed(rows, timings, config.speed_max_video_s)
+    # R66: the pass basis is the worst video; the pass rate is the share of required real
+    # videos whose observed wall meets the limit (a missing one counts as not verified).
+    seen = observed["videos"]
+    speed = {"basis": "worst-video" if observed["complete"] else "unverified",
+             "ratio": observed["worst"] if observed["complete"] else NAN,
+             "pass_rate": _ratio(sum(v["ratio"] <= limit for v in seen),
+                                 len(seen) + len(observed["missing"])),
+             "slowest": observed["slowest"]}
     return ReportMetrics(
         latency_percentile=pct,
         videos=videos,
@@ -710,6 +762,7 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
         },
         match_agreement=agreement,
         wall=wall,
+        observed=observed,
         unflagged=u,
         tradeoff=_tradeoff(real, u, speed, set(vetoed or ())),
     )
@@ -1108,9 +1161,15 @@ _TIMING_NOTE = (
     "from start to end (config + model init, probe, every video, its VLM phase once) plus "
     "standalone `bxjudge vlm` phases, minus the measured work of ineligible videos, over "
     "the playback duration of the speed-eligible videos (real round, measured, "
-    "≤ speed_max_video_s; each once, in its last run) (R61). "
-    "Speed pass/fail uses wall-clock when recorded, else the sum-based median, labelled "
-    "(R59/R61); core-only is a diagnostic. VLM request latency "
+    "≤ speed_max_video_s; each once, in its last run) (R61). **Observed per-video wall** "
+    "= videos.json `wall_s` of the video's latest attempt (`analysis_status`): from its "
+    "first decode (incl. its calibration selection pass) through its result write, plus "
+    "its `vlm_s` when that attempt is `ok`; a failed attempt that kept older rows counts "
+    "its own `wall_s` only. Speed pass/fail (R66) = the WORST observed per-video wall / "
+    "playback duration over every real video ≤ speed_max_video_s, which must be ≤ the "
+    "target; a real video without `wall_s` makes speed unverified. Batch wall-clock, the "
+    "median per-video ratio, the sum-based median and core-only are diagnostics "
+    "(R59/R61). VLM request latency "
     "is per request actually sent (`vlm_requests`); *cold* = first answer by that model in "
     "the phase (models are unloaded at phase end). Durations are the playback seconds "
     "recorded in videos.json; slow-motion capture is NOT rescaled."
@@ -1140,7 +1199,12 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     out = [f"# bxjudge 評估報告 eval-{today}", "", source, ""]
     if is_synthetic(rows):
         out += [_SMOKE, ""]
-    u, w, t = x.unflagged, x.wall, x.tradeoff
+    u, w, t, o = x.unflagged, x.wall, x.tradeoff, x.observed
+    slowest = (f"slowest video {o['slowest']} at {_f(o['worst'])}" if o["slowest"]
+               else "no observed video")
+    missing = (f"; UNVERIFIED: no wall_s for {', '.join(o['missing'])} (rerun bxjudge run)"
+               if o["missing"] else "")
+    wall_ok = sum(v["ratio"] <= limit for v in o["videos"])
     if u["method"] == "audit_sample":
         how = (f"audit_sample: {u['correct']}/{u['n_used']} reviewed of {u['n_sampled']} "
                f"sampled, {u['n_unflagged']} unflagged; Wilson {u['level']:.0%} "
@@ -1170,7 +1234,10 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         ("需覆核比例 review_ratio", "review_ratio",
          _frac(m.review_ratio, _count(m.review_ratio, m.n_rounds), m.n_rounds)),
         ("處理速度比 speed_ratio", "speed_ratio",
-         (f"{_f(m.speed_ratio)} [{m.speed_basis}]; batch wall-clock {_f(m.speed_ratio_wall)}, "
+         (f"{_f(m.speed_ratio)} [{m.speed_basis}: max observed wall / duration; {slowest}; "
+          f"{m.n_wall_videos}/{m.n_wall_videos + m.n_wall_missing} real video(s) with "
+          f"wall_s{missing}]; diagnostics: batch wall-clock {_f(m.speed_ratio_wall)}, "
+          f"median per-video wall {_f(m.speed_ratio_median)}, "
           f"sum-based median (core+VLM) {_f(m.speed_ratio_sum)} over {m.n_speed_videos} "
           f"video(s), core-only {_f(m.speed_ratio_core)}")),
     ]
@@ -1219,7 +1286,8 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
          f"inside, counted once; {w['n_videos']} eligible video(s), excluded from both "
          f"terms: {', '.join(w['excluded']) or 'none'}"
          f"{'; ' + w['reason'] if w['reason'] else ''}){wall_note} | — | — |"),
-        (f"| 速度達標率 Speed Pass Rate | [{t['speed']['basis']}] {_f(t['speed']['pass_rate'])}; "
+        (f"| 速度達標率 Speed Pass Rate | [observed per-video wall] "
+         f"{_frac(t['speed']['pass_rate'], wall_ok, len(o['videos']) + len(o['missing']))}; "
          f"sum-based end-to-end {_frac(x.speed_pass_rate, e2e_ok, len(x.videos))}; core-only "
          f"{_frac(x.core_pass_rate, core_ok, len(x.videos))} (diagnostic) "
          f"| ≤ {limit:g} × duration | — |"),
@@ -1245,8 +1313,8 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         (f"| 覆核後估計正確率 Final Accuracy after review | {interval(t['final_accuracy'])} | "
          "reviewed rounds right; unreviewed unflagged at the estimate; unreviewed flagged "
          "still pending (errors) |"),
-        (f"| 速度達標 Speed Pass | {_f(t['speed']['pass_rate'])} (ratio "
-         f"{_f(t['speed']['ratio'])}) | {t['speed']['basis']} |"),
+        (f"| 速度達標 Speed Pass | {_f(t['speed']['pass_rate'])} (worst ratio "
+         f"{_f(t['speed']['ratio'])}) | {t['speed']['basis']}; {slowest} |"),
         "",
         *_calibration_section(rows, timings, m, vetoed),
         "## Timing",
@@ -1256,6 +1324,16 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     ]
     if timings is None:
         out += ["No videos.json: speed and latency are unverified (R11).", ""]
+    if o["videos"] or o["missing"]:
+        out += [(f"Observed per-video wall (R66): {len(o['videos'])} measured, "
+                 f"missing wall_s: {', '.join(o['missing']) or 'none'}; slowest first."), ""]
+    if o["videos"]:
+        out += ["| video | status | duration s | wall s | VLM s | observed / duration |",
+                "|---|---|---|---|---|---|"]
+        out += [f"| {v['video']} | {v['status']} | {v['duration_s']:.2f} | {v['wall_s']:.2f} | "
+                f"{v['vlm_s']:.2f} | {v['ratio']:.3f} |"
+                for v in sorted(o["videos"], key=lambda v: -v["ratio"])]
+        out.append("")
     if x.videos:
         out += [("| video | duration s | core s | VLM s | end-to-end s | core ratio | "
                  "end-to-end ratio |"), "|---|---|---|---|---|---|---|"]

@@ -1,4 +1,4 @@
-# Evaluation and tuning policy (spec sections 10-11; Rulings R11/R37/R40/R59/R60).
+# Evaluation and tuning policy (spec sections 10-11; Rulings R11/R37/R40/R59/R60/R66).
 # `bxjudge eval` / `bxjudge tune` read this file; nothing here changes how videos are judged.
 
 # Spec section 11 success criteria (initial values). min = at least, max = at most.
@@ -8,7 +8,7 @@ targets:
   touch_recall: {min: 0.90}               # true touches detected or flagged for review
   air_recall: {min: 0.90}                 # true air collisions detected or flagged
   review_ratio: {max: 0.30}               # share of real rounds flagged needs_review
-  speed_ratio: {max: 1.0}                 # median (core + VLM) / playback duration (R59)
+  speed_ratio: {max: 1.0}                 # WORST real video: observed wall_s (+ vlm_s) / playback (R66)
 
 # R62: unflagged accuracy is estimated from the reviewed random audit sample
 # (`bxjudge audit-sample`) with a Wilson score interval at this confidence level.

@@ -156,25 +156,24 @@ def test_speed_without_timings_is_unverified_and_fails():
 
 def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     rows = _rows_of_videos("a.mp4")
-    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0}}
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0,
+                         "wall_s": 50.0, "analysis_status": "ok"}}
     m = evaluate(rows, timings)
-    assert m.speed_ratio == pytest.approx(1.2)
+    assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66: wall + VLM
     assert m.speed_ratio_core == pytest.approx(0.5)
     assert m.n_speed_videos == 1 and m.n_vlm_videos == 1
     assert passes(m)["speed_ratio"] == "FAIL"
 
 
-def test_speed_without_vlm_phase_is_core_time():
+def test_speed_median_is_diagnostic_and_the_worst_video_decides():
     rows = _rows_of_videos("a.mp4", "b.mp4", "c.mp4")
-    timings = {
-        "a.mp4": {"duration_s": 100.0, "processing_s": 50.0},
-        "b.mp4": {"duration_s": 100.0, "processing_s": 80.0},
-        "c.mp4": {"duration_s": 100.0, "processing_s": 200.0},
-    }
+    timings = {v: {"duration_s": 100.0, "processing_s": s, "wall_s": s, "analysis_status": "ok"}
+               for v, s in (("a.mp4", 50.0), ("b.mp4", 80.0), ("c.mp4", 200.0))}
     m = evaluate(rows, timings)
-    assert m.speed_ratio == pytest.approx(0.8) == m.speed_ratio_core
+    assert m.speed_ratio_sum == pytest.approx(0.8) == m.speed_ratio_core  # was the R61 pass
+    assert m.speed_ratio == pytest.approx(2.0) and m.speed_slowest_video == "c.mp4"
     assert m.n_vlm_videos == 0
-    assert passes(m)["speed_ratio"] == "PASS"
+    assert passes(m)["speed_ratio"] == "FAIL"
 
 
 def test_speed_excludes_placeholder_only_unmeasured_and_overlong_videos():
@@ -193,8 +192,10 @@ def test_speed_excludes_placeholder_only_unmeasured_and_overlong_videos():
         "zero_core.mp4": {"duration_s": 100.0, "processing_s": 0.0},
     }
     m = evaluate(rows, timings)
-    assert m.speed_ratio == pytest.approx(0.9)
+    assert m.speed_ratio_sum == pytest.approx(0.9)
     assert m.n_speed_videos == 1
+    # R66: real videos without wall_s (vlm_only, zero_core; a too) leave speed unverified
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio)
     excluded = report_metrics(rows, timings, load_eval_config(EVAL_CONFIG)).excluded
     assert excluded == {"no_real_round": ["gate.mp4", "zero.mp4"],
                         "unmeasured": ["vlm_only.mp4", "zero_core.mp4"],
@@ -718,18 +719,17 @@ def _run(wall, videos, *, kind="run", vlm=None):
             "vlm_wall_s": vlm, "videos": videos}
 
 
-def test_speed_uses_wall_clock_when_recorded_and_never_double_counts_vlm():
+def test_batch_wall_clock_is_a_diagnostic_and_never_double_counts_vlm():
     rows = _rows_of_videos("a.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 40.0,
                          "vlm_requests": []}}
     # the run took 100 s wall-clock INCLUDING its 40 s VLM phase
     runs = [_run(100.0, {"a.mp4": 100.0}, vlm=40.0)]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_basis == "wall-clock"
-    assert m.speed_ratio == pytest.approx(1.0)  # 100 / 100, not (100 + 40) / 100
-    assert m.speed_ratio_wall == pytest.approx(1.0)
+    assert m.speed_ratio_wall == pytest.approx(1.0)  # 100 / 100, not (100 + 40) / 100
     assert m.speed_ratio_sum == pytest.approx(0.9)  # (50 + 40) / 100, VLM once per video
-    assert passes(m)["speed_ratio"] == "PASS"
+    # R66: a batch ratio never passes speed; the video has no observed wall_s
+    assert m.speed_basis == "unverified" and passes(m)["speed_ratio"] == "FAIL"
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert (w["wall_s"], w["vlm_wall_s"], w["duration_s"]) == (100.0, 40.0, 100.0)
 
@@ -738,7 +738,7 @@ def test_separate_vlm_command_wall_time_adds_without_adding_video_duration():
     rows = _rows_of_videos("a.mp4")
     runs = [_run(60.0, {"a.mp4": 100.0}), _run(30.0, {}, kind="vlm", vlm=30.0)]
     m = evaluate(rows, {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0}}, runs=runs)
-    assert m.speed_ratio_wall == pytest.approx(0.9) and m.speed_basis == "wall-clock"
+    assert m.speed_ratio_wall == pytest.approx(0.9)
 
 
 def test_sum_exceeding_wall_clock_is_reported_not_hidden():
@@ -751,9 +751,10 @@ def test_sum_exceeding_wall_clock_is_reported_not_hidden():
     assert w["ratio"] == pytest.approx(0.6) and w["sum_ratio"] == pytest.approx(0.9)
 
 
-def test_speed_without_run_records_is_labelled_sum_based():
+def test_sum_based_median_without_run_records_is_only_a_diagnostic():
     m = evaluate(_rows_of_videos("a.mp4"), {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0}})
-    assert m.speed_basis == "sum-based" and m.speed_ratio == m.speed_ratio_sum == 0.5
+    assert m.speed_ratio_sum == 0.5
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio)  # no wall_s (R66)
     assert math.isnan(m.speed_ratio_wall)
     assert evaluate(_rows_of_videos("a.mp4")).speed_basis == "unverified"
 
@@ -856,13 +857,18 @@ def test_tradeoff_intervals_propagate_the_audit_interval():
     assert f["estimate"] == pytest.approx((15 * 0.8 + 5) / 20)
 
 
-def test_tradeoff_speed_uses_wall_clock_basis_when_present():
-    rows = _rows_of_videos("a.mp4")
-    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0}}
-    sum_based = report_metrics(rows, timings, _cfg()).tradeoff["speed"]
-    assert sum_based == {"basis": "sum-based", "ratio": 1.5, "pass_rate": 0.0}
-    wall = report_metrics(rows, timings, _cfg(), runs=[_run(80.0, {"a.mp4": 100.0})])
-    assert wall.tradeoff["speed"] == {"basis": "wall-clock", "ratio": 0.8, "pass_rate": 1.0}
+def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
+    rows = _rows_of_videos("a.mp4", "b.mp4")
+    timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
+               "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "wall_s": 50.0,
+                         "analysis_status": "ok"}}
+    runs = [_run(80.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
+    s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
+    assert s["basis"] == "unverified" and math.isnan(s["ratio"])  # a.mp4 has no wall_s
+    assert s["pass_rate"] == 0.5 and s["slowest"] == "b.mp4"
+    timings["a.mp4"].update(wall_s=150.0, analysis_status="ok")
+    s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
+    assert s == {"basis": "worst-video", "ratio": 1.5, "pass_rate": 0.5, "slowest": "a.mp4"}
 
 
 def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):
@@ -896,9 +902,7 @@ def test_wall_clock_excludes_gate_video_duration_probe():
                "g.mp4": {"duration_s": 200.0, "processing_s": 1.0}}
     runs = [_run(151.0, {"a.mp4": 100.0, "g.mp4": 200.0})]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_basis == "wall-clock"
-    assert m.speed_ratio == pytest.approx(1.5)  # gate work and duration both left out
-    assert passes(m)["speed_ratio"] == "FAIL"  # was 0.503 PASS before the fix
+    assert m.speed_ratio_wall == pytest.approx(1.5)  # gate work and duration both left out
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert w["duration_s"] == 100.0 and w["excluded"] == ["g.mp4"]
 
@@ -909,8 +913,7 @@ def test_wall_clock_excludes_over_limit_video_work_and_duration():
                "long.mp4": {"duration_s": 900.0, "processing_s": 400.0, "vlm_s": 10.0}}
     runs = [_run(560.0, {"a.mp4": 100.0, "long.mp4": 900.0})]
     m = evaluate(rows, timings, runs=runs)
-    assert m.speed_ratio == pytest.approx(1.5)  # (560 - 410) / 100, not 560 / 1000
-    assert m.speed_basis == "wall-clock"
+    assert m.speed_ratio_wall == pytest.approx(1.5)  # (560 - 410) / 100, not 560 / 1000
 
 
 def test_wall_clock_counts_a_retried_gate_video_once():

@@ -261,13 +261,28 @@ def record_video_timing(
     processing_s: float,
     *,
     source_video: Path | None = None,
+    wall_s: float | None = None,
 ) -> None:
+    """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (ruling R66) is
+    the observed wall time of the attempt: from that video's first decode (including its
+    calibration selection pass) through its result write; ``None`` leaves it unrecorded."""
+    _check_wall(wall_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
+    if wall_s is not None:
+        rows[video]["wall_s"] = wall_s
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
     _write_json(path, rows)
+
+
+def _check_wall(wall_s) -> None:
+    if wall_s is not None and not (
+        isinstance(wall_s, (int, float)) and not isinstance(wall_s, bool)
+        and math.isfinite(wall_s) and wall_s >= 0
+    ):
+        raise ValueError(f"invalid wall_s: {wall_s!r}")
 
 
 # Ruling R68: the outcome of a video's latest analysis attempt, recorded explicitly so the
@@ -277,16 +292,25 @@ ANALYSIS_STATUSES = ("ok", "recalibrate", "decode_error", "analysis_error")
 TRANSIENT_FAILURES = frozenset({"decode_error", "analysis_error"})
 
 
-def record_video_status(out_dir: Path, video: str, status: str) -> None:
+def record_video_status(
+    out_dir: Path, video: str, status: str, *, wall_s: float | None = None
+) -> None:
     """Record ``videos.json[video]["analysis_status"]`` (one of ``ANALYSIS_STATUSES``) without
     touching anything else in the entry, so a failed rerun that keeps a video's rows can say
     so while the timing and calibration of those rows stay as they were (ruling R68). Call
-    after ``record_video_timing``, which replaces the entry."""
+    after ``record_video_timing``, which replaces the entry.
+
+    ``wall_s`` (ruling R66): the observed wall time of this latest attempt, written with its
+    status, so a failed attempt's time is never hidden behind the kept ``processing_s``."""
     if status not in ANALYSIS_STATUSES:
         raise ValueError(f"unknown analysis_status {status!r}; expected one of {ANALYSIS_STATUSES}")
+    _check_wall(wall_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
-    rows.setdefault(video, {})["analysis_status"] = status
+    entry = rows.setdefault(video, {})
+    entry["analysis_status"] = status
+    if wall_s is not None:
+        entry["wall_s"] = wall_s
     _write_json(path, rows)
 
 

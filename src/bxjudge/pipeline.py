@@ -552,7 +552,11 @@ def run_batch(
     # one keeps its rows until selection yields a non-vetoed snapshot (then it is reanalysed).
     vetoed = vetoed_ids(out_dir)
     preselected: dict[Path, Snapshot | None] = {}
+    # Ruling R66: a reanalysed video's selection pass is its first decode, so its time is
+    # part of that video's observed wall_s.
+    selection_s: dict[Path, float] = {}
     for info in processed_videos(folder, db, on_error=on_error):
+        selecting = time.perf_counter()
         try:
             frame = first_second_frame(info, th)
             snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
@@ -560,11 +564,13 @@ def run_batch(
             # e.g. an unreadable first second: the normal per-video flow handles it.
             log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
             infos.append(info)
+            selection_s[info.path] = time.perf_counter() - selecting
             continue
         current = snap.id if snap is not None else None
         if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
             infos.append(info)
             preselected[info.path] = snap
+            selection_s[info.path] = time.perf_counter() - selecting
         else:
             # Unchanged and readable again: its rows stand for the current calibration, so an
             # earlier transient failure (R68) has cleared without re-judging.
@@ -610,8 +616,13 @@ def run_batch(
             # ids; vetoed ones too, T4-3), its videos.json timing/calibration and its processed
             # record stay as they are; only the status changes. With the record left as it
             # was (or still mismatching the changed file), the next run retries the video.
+            # R66: the failed attempt's own wall time is recorded with its status, so the
+            # kept processing_s of the old rows cannot hide it.
             log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
-            record_video_status(out_dir, path.name, status)
+            record_video_status(
+                out_dir, path.name, status,
+                wall_s=selection_s.get(path, 0.0) + time.perf_counter() - began,
+            )
             continue
         write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
@@ -621,6 +632,7 @@ def run_batch(
             info.duration if info else 0.0,
             processing,
             source_video=path.resolve(),
+            wall_s=selection_s.get(path, 0.0) + processing,
         )
         record_video_calibration(out_dir, path.name, snap)
         record_video_status(out_dir, path.name, status)

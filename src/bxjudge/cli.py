@@ -416,6 +416,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     summary = ", ".join(f"{name}={shown(name)} {ok[name]}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
+    if metrics.speed_slowest_video is not None:  # R66: name the video that decides speed
+        print(f"speed [{metrics.speed_basis}]: slowest video {metrics.speed_slowest_video} "
+              f"at {metrics.speed_ratio_worst_observed:.3f} x playback")
+    if metrics.n_wall_missing:
+        print(f"speed unverified: {metrics.n_wall_missing} real video(s) without wall_s "
+              "(rerun bxjudge run)")
     if metrics.finish_accuracy_unflagged_method == "invalidated":
         print("INVALIDATED: sampled rounds changed since the audit sample was drawn; run `"
               f"{ev.audit_remedy(results, audit['n'], audit['seed'])}`")
