@@ -23,6 +23,17 @@ def info(path=Path("a.mp4")):
     return VideoInfo(path, 1, 1, 4, 30, 1280, 720, "h264", False, None)
 
 
+def _kw(tmp_path):
+    """judge_video's required keywords for unit tests."""
+    return {"out_dir": tmp_path / "out", "autocalib": _ac()}
+
+
+def _snapshot(c, sid="0123456789abcdef"):
+    from bxjudge.calibration_store import Snapshot
+
+    return Snapshot(sid, "manual", c, 0.95, None, "calib/test.json", "0" * 64, None)
+
+
 def calibrated(monkeypatch, tmp_path, *, tracks=None):
     c = cal_with(make_ref_img(), tmp_path)
     frame = np.zeros((720, 1280, 3), np.uint8)
@@ -34,7 +45,8 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None):
             yield f, frame
 
     monkeypatch.setattr(pipeline, "iter_frames", frames)
-    monkeypatch.setattr(pipeline, "find_calibration", lambda frame, *a: c)
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda frame, *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "write_preview", lambda out_dir, snap: None)
 
     def measured(frames, scaled, ref):
         assert scaled.frame_size == (1280, 720)
@@ -54,7 +66,7 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None):
     return calls
 
 
-def test_recalibrate_closes_single_decode(monkeypatch, th, rules):
+def test_recalibrate_closes_single_decode(monkeypatch, tmp_path, th, rules):
     closed = []
 
     def frames(*a, **k):
@@ -65,16 +77,16 @@ def test_recalibrate_closes_single_decode(monkeypatch, th, rules):
             closed.append(True)
 
     monkeypatch.setattr(pipeline, "iter_frames", frames)
-    monkeypatch.setattr(pipeline, "find_calibration", lambda *a: None)
-    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th)
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: None)
+    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th, **_kw(tmp_path))
     assert r.review_reasons == ["recalibrate"] and r.needs_review
     assert closed == [True]
 
 
 def test_no_round_one_decode_and_resolution_alignment(monkeypatch, tmp_path, th, rules):
     calls = calibrated(monkeypatch, tmp_path)
-    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
-    assert r.review_reasons == ["no_round"]
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th, **_kw(tmp_path))
+    assert r.review_reasons == ["no_round"] and r.calibration_id == "0123456789abcdef"
     assert len(calls) == 1 and calls[0]["long_edge"] == th.infer_long_edge
 
 
@@ -109,7 +121,7 @@ def test_stop_reasons_gating_motion_provenance(
         pipeline, "detect_finish", lambda *a: FinishResult("spin", "B", 70, 0.95, [])
     )
     [r] = pipeline.judge_video(
-        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out"
+        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out", autocalib=_ac()
     )
     assert r.needs_review == review and f"X_stop_{reason}" in r.review_reasons
     assert (
@@ -118,6 +130,7 @@ def test_stop_reasons_gating_motion_provenance(
         and r.winner == "X"
     )
     assert r.motion_evidence["window"] == [0, 21]
+    assert r.calibration_id == "0123456789abcdef"
     assert r.motion_evidence["displacements"]["2"] is None
     assert r.motion_evidence["impact_frames"] == [5, 6]
     assert (tmp_path / "out/trajectories/a_r1.png").exists()
@@ -177,7 +190,7 @@ def test_post_finish_notes_do_not_trigger_review(
     monkeypatch.setattr(pipeline, "orbit_direction", lambda *a: "right")
     monkeypatch.setattr(pipeline, "stop_frame", lambda *a: (stop_at, "reversed"))
     monkeypatch.setattr(pipeline, "detect_finish", lambda *a: finish)
-    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th, **_kw(tmp_path))
     assert r.needs_review == review
     assert (r.finish, r.winner) == ("xtreme", "X")
     assert stop_reasons <= set(r.review_reasons)
@@ -217,7 +230,7 @@ def _gate_round(monkeypatch, tmp_path, th, rules, **change):
         "finish", FinishResult("spin", "B", 70, change.get("confidence", 0.95), [])
     )
     monkeypatch.setattr(pipeline, "detect_finish", lambda *a: finish)
-    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th, **_kw(tmp_path))
     return r
 
 
@@ -301,7 +314,7 @@ def test_missing_side_and_synthetic_always_review(monkeypatch, tmp_path, th, rul
     )
     provenance = {"dataset": {"provenance": {"synthetic": True}}}
     [r] = pipeline.judge_video(
-        info(), tmp_path, lambda *a: [], rules, th, provenance=provenance
+        info(), tmp_path, lambda *a: [], rules, th, provenance=provenance, **_kw(tmp_path)
     )
     assert r.needs_review and "synthetic_detector" in r.review_reasons
     assert any("track_evidence_missing" in note for note in r.review_reasons)
@@ -580,12 +593,12 @@ def test_streamed_crop_seed_and_all_source_frames(monkeypatch, tmp_path, th, rul
 
     monkeypatch.setattr(pipeline, "spin_activity", activity)
     monkeypatch.setattr(pipeline, "rotation_rate", lambda crops: {})
-    pipeline.judge_video(info(), tmp_path, detector, rules, th)
+    pipeline.judge_video(info(), tmp_path, detector, rules, th, **_kw(tmp_path))
     assert observed == list(range(120))
     assert crop_frames == [set(range(120)), set(range(120))]
 
 
-def test_decode_failure_returns_review_artifact(monkeypatch, th, rules):
+def test_decode_failure_returns_review_artifact(monkeypatch, tmp_path, th, rules):
     from bxjudge.video import VideoDecodeError
 
     def broken(*a, **kw):
@@ -593,7 +606,7 @@ def test_decode_failure_returns_review_artifact(monkeypatch, th, rules):
         yield
 
     monkeypatch.setattr(pipeline, "iter_frames", broken)
-    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th)
+    [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th, **_kw(tmp_path))
     assert r.review_reasons == ["decode_error"] and r.needs_review
 
 
@@ -639,7 +652,7 @@ def test_trailing_burst_part_keeps_event_time_and_trajectory(
     ]
     calibrated(monkeypatch, tmp_path, tracks=tracks)
     [r] = pipeline.judge_video(
-        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out"
+        info(), tmp_path, lambda *a: [], rules, th, out_dir=tmp_path / "out", autocalib=_ac()
     )
     assert r.finish == "burst" and r.winner == "B" and r.t_end == 11 / 30
     path = tmp_path / "out/trajectories/a_r1.csv"
@@ -667,7 +680,7 @@ def test_trailing_parts_do_not_leak_from_next_round(monkeypatch, tmp_path, th, r
         return actual(bey, parts, *args)
 
     monkeypatch.setattr(pipeline, "detect_finish", finish)
-    results = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    results = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th, **_kw(tmp_path))
     assert len(results) == 2
     assert seen == [[11], [12, 20]]
     assert results[0].finish == "burst" and results[0].t_end == 11 / 30
@@ -694,7 +707,7 @@ def test_trailing_part_window_and_video_end_are_bounded(
         return actual(bey, parts, *args)
 
     monkeypatch.setattr(pipeline, "detect_finish", finish)
-    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th)
+    [r] = pipeline.judge_video(info(), tmp_path, lambda *a: [], rules, th, **_kw(tmp_path))
     assert captured == [] and r.finish is None
 
 
@@ -986,3 +999,228 @@ def test_unreachable_vlm_phase_records_no_vlm_wall_but_keeps_batch_wall(tmp_path
                        vlm_config=_vlm_config(tmp_path))
     [run] = json.loads((out / "runs.json").read_text())
     assert run["vlm_wall_s"] is None and run["wall_s"] > 0  # R65
+
+
+# --------------------------------------------------------------------------- calibration snapshots (auto-calibration Task 3)
+
+
+def _ac():
+    from bxjudge.autocalib import load_autocalib_config
+
+    return load_autocalib_config()
+
+
+def _cpu_th():
+    from dataclasses import replace
+
+    from bxjudge.config import load_thresholds
+
+    return replace(load_thresholds(), decode_hwaccel="cpu")
+
+
+def _clip_setup(tmp_path, *, shift=(45, 20), fps=30, seconds=3.0):
+    """videos/clip.mp4 rendered from stadium_scene(shift); calib/ holds only the unshifted manual."""
+    from tests.helpers import add_manual_calibration, stadium_scene, write_scene_video
+
+    videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
+    videos.mkdir()
+    write_scene_video(videos / "clip.mp4", stadium_scene(shift=shift)[0], seconds=seconds, fps=fps)
+    add_manual_calibration(calib, stadium_scene())
+    return videos, calib, out
+
+
+class _JudgeSpy:
+    """Records which videos ``judge_video`` analysed (and still runs the real one)."""
+
+    def __init__(self, monkeypatch):
+        self.videos: set[str] = set()
+        real = pipeline.judge_video
+
+        def spy(info, *a, **k):
+            self.videos.add(info.path.name)
+            return real(info, *a, **k)
+
+        monkeypatch.setattr(pipeline, "judge_video", spy)
+
+
+def _run(videos, calib, out, rules, detector=None, **kw):
+    from tests.helpers import FakeDetector
+
+    pipeline.run_batch(videos, calib, out, detector=detector or FakeDetector(),
+                       th=kw.pop("th", _cpu_th()), rules=rules, autocalib=_ac(), **kw)
+
+
+def _confirm_reviewed(out, video, round_no, rules):
+    from bxjudge.output import read_rounds, save_rounds
+
+    rows = read_rounds(out)
+    for r in rows:
+        if r["video"] == video and r["round"] == round_no:
+            r["reviewed"] = True
+    save_rounds(rows, out, rules)
+
+
+def test_moved_camera_is_judged_with_auto_snapshot_and_recorded(tmp_path, rules):
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    v = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert v["calibration"]["kind"] == "auto"
+    assert v["calibration"]["name"] == "auto-scene" and v["calibration"]["template_id"]
+    assert v["calibration"]["score"] >= _ac().min_score
+    rows = json.loads((out / "rounds.json").read_text())
+    assert rows and not any("recalibrate" in r["review_reasons"] for r in rows)
+    assert {r["calibration_id"] for r in rows} == {v["calibration"]["id"]}
+    assert (out / "calibrations" / f"{v['calibration']['id']}.preview.jpg").is_file()
+    db = json.loads((out / "processed_videos.json").read_text())
+    assert [rec["calibration_id"] for rec in db.values()] == [v["calibration"]["id"]]
+    assert not list(calib.glob("auto*"))  # auto results never go into calib/
+
+
+def test_adding_a_manual_calibration_reanalyses_an_auto_video(tmp_path, rules, monkeypatch):
+    from tests.helpers import add_manual_calibration, stadium_scene
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+    spy = _JudgeSpy(monkeypatch)
+    selections = []
+    real_select = pipeline.select_snapshot
+    monkeypatch.setattr(pipeline, "select_snapshot",
+                        lambda *a, **k: selections.append(1) or real_select(*a, **k))
+    _run(videos, calib, out, rules)
+    assert spy.videos == {"clip.mp4"}
+    assert len(selections) == 1  # the pre-run selection is reused by judging, not repeated
+    v = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert v["calibration"]["kind"] == "manual" and v["calibration"]["name"] == "moved"
+    assert v["calibration"]["template_id"] is None and v["calibration"]["score"] >= 0.8
+    rows = json.loads((out / "rounds.json").read_text())
+    assert {r["calibration_id"] for r in rows} == {v["calibration"]["id"]}
+
+
+def test_unchanged_calibration_is_not_reanalysed(tmp_path, rules, monkeypatch):
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)
+    assert spy.videos == set()
+
+
+def test_reanalysis_keeps_reviewed_rows(tmp_path, rules):
+    from tests.helpers import add_manual_calibration, stadium_scene
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    first_id = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]["id"]
+    _confirm_reviewed(out, "clip.mp4", 1, rules)
+    add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+    _run(videos, calib, out, rules)
+    v = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert v["calibration"]["id"] != first_id
+    row = next(r for r in json.loads((out / "rounds.json").read_text()) if r["round"] == 1)
+    assert row["reviewed"] is True and row["calibration_id"] == first_id
+
+
+def test_template_at_1080p_scales_to_720p_decode_and_keeps_120fps_timing(
+    tmp_path, rules, monkeypatch
+):
+    from bxjudge.calibration import scale_calibration
+    from bxjudge.calibration_store import load_snapshot
+    from tests.helpers import (
+        FakeDetector,
+        add_manual_calibration,
+        stadium_scene,
+        write_scene_video,
+    )
+
+    videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
+    videos.mkdir()
+    write_scene_video(videos / "clip.mp4", stadium_scene()[0], seconds=2.5, fps=120)
+    add_manual_calibration(calib, stadium_scene(size=(1920, 1080)))
+    used = []
+    real = pipeline.analyze_launch
+    monkeypatch.setattr(pipeline, "analyze_launch",
+                        lambda tracks, launchers, disp, c, *a: used.append(c)
+                        or real(tracks, launchers, disp, c, *a))
+    detector = FakeDetector(launch_frame=150)
+    _run(videos, calib, out, rules, detector=detector)
+    vid = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    snap = load_snapshot(out, vid["calibration"]["id"])
+    assert snap.kind == "manual" and snap.calibration.frame_size == (1920, 1080)
+    expected = scale_calibration(snap.calibration, (1280, 720))
+    assert expected.frame_size == (1280, 720)
+    assert detector.shapes == {(1280, 720)}
+    assert used and all(c.frame_size == (1280, 720) for c in used)
+    assert used[0].battle_area == pytest.approx(expected.battle_area)
+    rows = json.loads((out / "rounds.json").read_text())
+    assert rows[0]["t_launch"] == pytest.approx(150 / 120.0, abs=1e-6)
+    assert rows[0]["calibration_id"] == snap.id
+
+
+def test_selection_failing_after_a_previous_success_reanalyses(tmp_path, rules, monkeypatch):
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    (calib / "scene.json").unlink()  # no template left -> selection returns None
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)
+    assert spy.videos == {"clip.mp4"}
+    assert json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"] is None
+    rows = json.loads((out / "rounds.json").read_text())
+    assert [r["review_reasons"] for r in rows] == [["recalibrate"]]
+    assert rows[0]["calibration_id"] is None
+
+
+def test_unreadable_first_second_in_preselection_falls_back_to_normal_flow(
+    tmp_path, rules, monkeypatch
+):
+    from bxjudge.video import VideoDecodeError
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+
+    def broken(info, th):
+        raise VideoDecodeError(f"{info.path}: corrupt")
+
+    monkeypatch.setattr(pipeline, "first_second_frame", broken)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)  # must not crash the batch
+    assert spy.videos == {"clip.mp4"}
+
+
+@pytest.mark.parametrize(
+    "recorded,current,vetoed,expected",
+    [
+        ("a", "a", set(), False),
+        ("a", "b", set(), True),  # new manual / edited template / better template
+        ("a", None, set(), True),  # selection now fails after a previous success
+        (None, None, set(), False),  # never succeeded, still failing
+        (None, "a", set(), True),
+        ("a", "a", {"a"}, True),  # vetoed (Task 4 fills the set)
+    ],
+)
+def test_needs_reanalysis_rules(recorded, current, vetoed, expected):
+    assert pipeline.needs_reanalysis(recorded, current, vetoed) is expected
+
+
+def test_row_calibration_id_round_trips(rules, tmp_path):
+    from bxjudge.output import read_rounds, row_to_result, write_results
+
+    r = rr("spin", "X", video="a.mp4")
+    r.calibration_id = "0123456789abcdef"
+    write_results([r], tmp_path, rules)
+    [row] = read_rounds(tmp_path)
+    assert row["calibration_id"] == "0123456789abcdef"
+    assert row_to_result(row).calibration_id == "0123456789abcdef"
+    assert "calibration_id" not in (tmp_path / "rounds.csv").read_text().splitlines()[0]
+    with pytest.raises(ValueError, match="calibration_id"):
+        row_to_result({**row, "calibration_id": 7})
+
+
+def test_run_cli_passes_autocalib_config(tmp_path, monkeypatch):
+    from bxjudge.cli import main
+
+    calls = []
+    monkeypatch.setattr(pipeline, "run_batch", lambda *a, **kw: calls.append(kw))
+    assert main(["run", str(tmp_path)]) == 0
+    assert calls[-1]["autocalib_config"] == Path("config/autocalib.yaml")
+    assert main(["run", str(tmp_path), "--autocalib", "x/ac.yaml"]) == 0
+    assert calls[-1]["autocalib_config"] == Path("x/ac.yaml")

@@ -9,6 +9,7 @@ import math
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime
@@ -18,7 +19,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .calibration import find_calibration, scale_calibration
+from .autocalib import AutoCalibConfig, load_autocalib_config
+from .calibration import scale_calibration
+from .calibration_store import Snapshot, select_snapshot, write_preview
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -32,9 +35,16 @@ from .finish import (
     stop_frame,
 )
 from .launch_check import analyze_launch
-from .manifest import VideoInfo, mark_processed, scan
+from .manifest import (
+    VideoInfo,
+    mark_processed,
+    processed_calibration,
+    processed_videos,
+    scan,
+)
 from .output import (
     record_run_timing,
+    record_video_calibration,
     record_video_timing,
     write_results,
     write_trajectory,
@@ -68,6 +78,12 @@ def _provenance(
     return results
 
 
+def _calibrated(results: list[RoundResult], snap: Snapshot) -> list[RoundResult]:
+    for r in results:
+        r.calibration_id = snap.id
+    return results
+
+
 def _crop(frame: np.ndarray, box) -> np.ndarray | None:
     h, w = frame.shape[:2]
     x0, y0, x1, y1 = box
@@ -78,6 +94,34 @@ def _crop(frame: np.ndarray, box) -> np.ndarray | None:
     return cv2.resize(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), (64, 64))
 
 
+def _first_second(
+    frames: Iterable[tuple[int, np.ndarray]], fps: float
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Frames of ``frames`` up to and including source index ``round(fps)`` (fewer for a short
+    clip); its last frame is the one a calibration is selected on. Pulls no frame beyond it."""
+    for idx, frame in frames:
+        yield idx, frame
+        if idx >= round(fps):
+            return
+
+
+def first_second_frame(info: VideoInfo, th: Thresholds) -> np.ndarray:
+    """The calibration-selection frame of ``info``, decoded exactly as ``judge_video`` decodes
+    it (inference size, same frame index). Raises ``VideoDecodeError``."""
+    last = None
+    with closing(
+        iter_frames(info.path, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel)
+    ) as frames:
+        for _, last in _first_second(frames, info.fps):
+            pass
+    if last is None:
+        raise VideoDecodeError(f"{info.path}: no frames decoded")
+    return last
+
+
+_SELECT = object()  # judge_video default: select the snapshot from the decoded first second
+
+
 def judge_video(
     info: VideoInfo,
     calib_dir: Path,
@@ -85,13 +129,21 @@ def judge_video(
     rules: Rules,
     th: Thresholds,
     *,
-    out_dir: Path | None = None,
+    out_dir: Path,
     provenance: dict | None = None,
     detection_config: Path | str = "config/detection.yaml",
+    autocalib: AutoCalibConfig,
+    snapshot: Snapshot | None | object = _SELECT,
+    on_snapshot: Callable[[Snapshot | None], None] | None = None,
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
-    Only the first second is buffered to select a calibration. Subsequent frames
+    Only the first second is buffered to select a calibration snapshot
+    (``select_snapshot``: manual, else reused/new auto, else ``None`` = ``recalibrate``),
+    unless the caller already selected one on that same frame (``snapshot``, may be ``None``).
+    The chosen snapshot (or ``None``) is reported to ``on_snapshot``. Its polygons are scaled to
+    the decoded frame size; its reference image (any size) is the stadium-displacement
+    reference; every result carries its id and its preview is written. Subsequent frames
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
     """
@@ -101,21 +153,23 @@ def judge_video(
                 info.path, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel
             )
         ) as frames:
-            prefix = []
-            for idx, frame in frames:
-                prefix.append((idx, frame))
-                if idx >= round(info.fps):
-                    break
+            prefix = list(_first_second(frames, info.fps))
             if not prefix:
                 raise VideoDecodeError(f"{info.path}: no frames decoded")
-            c = find_calibration(
-                prefix[-1][1], calib_dir, th.calibration_min_similarity
+            first = prefix[-1][1]
+            snap = (
+                select_snapshot(first, calib_dir, out_dir, th, autocalib)
+                if snapshot is _SELECT
+                else snapshot
             )
-            if c is None:
+            if on_snapshot is not None:
+                on_snapshot(snap)
+            if snap is None:
                 return _provenance(
                     [_review(info.path.name, info.duration, "recalibrate")], provenance
                 )
-            c = scale_calibration(c, (prefix[-1][1].shape[1], prefix[-1][1].shape[0]))
+            write_preview(out_dir, snap)
+            c = scale_calibration(snap.calibration, (first.shape[1], first.shape[0]))
             ref = cv2.imread(c.ref_frame)
             if ref is None:
                 raise FileNotFoundError(c.ref_frame)
@@ -145,8 +199,11 @@ def judge_video(
         bey_tracks = [t for t in tracks if t.cls == "bey"]
         rounds = segment_rounds(bey_tracks, info.fps, th)
         if not rounds:
-            return _provenance(
-                [_review(info.path.name, info.duration, "no_round")], provenance
+            return _calibrated(
+                _provenance(
+                    [_review(info.path.name, info.duration, "no_round")], provenance
+                ),
+                snap,
             )
         results = []
         last_decoded_frame = max(disp)
@@ -279,27 +336,26 @@ def judge_video(
                 "impact_frames": sorted(analysis.impacts),
             }
             results.append(r)
-            if out_dir is not None:
-                write_trajectory(
-                    out_dir,
-                    r,
-                    bey,
-                    parts,
-                    c,
-                    info.fps,
-                    {
-                        "landing_X": launch.landing_frame["X"],
-                        "landing_B": launch.landing_frame["B"],
-                        "air_collision": analysis.air_collision_frame,
-                        "finish": finish.frame,
-                    },
-                    unassigned=[
-                        t
-                        for t in current
-                        if t.track_id not in {v.track_id for v in bey.values()}
-                    ],
-                )
-        return _provenance(results, provenance)
+            write_trajectory(
+                out_dir,
+                r,
+                bey,
+                parts,
+                c,
+                info.fps,
+                {
+                    "landing_X": launch.landing_frame["X"],
+                    "landing_B": launch.landing_frame["B"],
+                    "air_collision": analysis.air_collision_frame,
+                    "finish": finish.frame,
+                },
+                unassigned=[
+                    t
+                    for t in current
+                    if t.track_id not in {v.track_id for v in bey.values()}
+                ],
+            )
+        return _calibrated(_provenance(results, provenance), snap)
     except VideoDecodeError:
         log.exception("cannot decode %s", info.path)
         return _provenance(
@@ -356,6 +412,16 @@ def _validate_thresholds(th: Thresholds) -> None:
             raise ValueError(f"threshold {name} must be in [0, 1]")
 
 
+def needs_reanalysis(
+    recorded: str | None, current: str | None, vetoed: set[str]
+) -> bool:
+    """Spec section 6.3b items 3-4 for an unchanged, already processed video: reanalyse when the
+    calibration snapshot selected now (``current``, ``None`` = selection fails) differs from the
+    one it was judged with (``recorded``) — a new manual calibration, an edited or new template,
+    or a failure after a previous success — or when the recorded snapshot is vetoed."""
+    return current != recorded or recorded in vetoed
+
+
 def run_batch(
     folder: Path,
     calib_dir: Path,
@@ -370,6 +436,8 @@ def run_batch(
     rules: Rules | None = None,
     th: Thresholds | None = None,
     vlm_config: Path | None = None,
+    autocalib_config: Path = Path("config/autocalib.yaml"),
+    autocalib: AutoCalibConfig | None = None,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -396,6 +464,8 @@ def run_batch(
     th = load_thresholds(thresholds) if th is None else th
     rules = load_rules(rules_path) if rules is None else rules
     _validate_thresholds(th)
+    if autocalib is None:
+        autocalib = load_autocalib_config(Path(autocalib_config).expanduser())
     policy = load_policy(detection_config)
     # Spec section 8: the optional VLM phase is configured (and its loopback endpoint
     # validated) up front; None or after_run: false keeps the run Ollama-free.
@@ -425,14 +495,35 @@ def run_batch(
         )
     db = out_dir / "processed_videos.json"
     failures = []
-    infos = scan(
-        folder, db, on_error=lambda path, error: failures.append((path, error))
-    )
+
+    def on_error(path, error):
+        failures.append((path, error))
+
+    infos = scan(folder, db, on_error=on_error)
+    # Spec section 6.3b: an unchanged processed video is reanalysed when its calibration
+    # changed. Selection needs only the first second, so it runs for every processed video;
+    # a reanalysed video is judged with this same selection (not selected twice).
+    vetoed: set[str] = set()  # Task 4 fills this with the vetoed snapshot ids
+    preselected: dict[Path, Snapshot | None] = {}
+    for info in processed_videos(folder, db, on_error=on_error):
+        try:
+            frame = first_second_frame(info, th)
+            snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib)
+        except Exception:
+            # e.g. an unreadable first second: the normal per-video flow handles it.
+            log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
+            infos.append(info)
+            continue
+        current = snap.id if snap is not None else None
+        if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
+            infos.append(info)
+            preselected[info.path] = snap
     entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
     if limit is not None:
         entries = entries[:limit]
     for path, info in entries:
         began = time.perf_counter()
+        chosen: list[Snapshot | None] = []
         if info is None:
             results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
         else:
@@ -446,12 +537,16 @@ def run_batch(
                     out_dir=out_dir,
                     provenance=provenance,
                     detection_config=detection_config,
+                    autocalib=autocalib,
+                    on_snapshot=chosen.append,
+                    **({"snapshot": preselected[path]} if path in preselected else {}),
                 )
             except Exception:
                 log.exception("analysis failed for %s; continuing batch", path)
                 results = _provenance(
                     [_review(path.name, info.duration, "analysis_error")], provenance
                 )
+        snap = chosen[-1] if chosen else None
         write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
         record_video_timing(
@@ -461,9 +556,12 @@ def run_batch(
             processing,
             source_video=path.resolve(),
         )
+        record_video_calibration(out_dir, path.name, snap)
         # Placeholder-only videos await corrected input and are retried (R56).
         if info is not None and not all(is_not_a_round(r.review_reasons) for r in results):
-            mark_processed(info, db)
+            mark_processed(
+                info, db, calibration_id=snap.id if snap is not None else None
+            )
         log.info(
             "%s: processing %.3fs / playback %.3fs",
             path.name,

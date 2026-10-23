@@ -450,3 +450,64 @@ def stadium_scene(
         ref_frame="",
     )
     return img, calib
+
+
+def write_scene_video(path, img, *, seconds: float = 3.0, fps: int = 30):
+    """Encode the static BGR frame ``img`` as a near-lossless H.264 clip of ``seconds`` at ``fps``
+    (frame size = the image size)."""
+    import subprocess
+    from pathlib import Path
+
+    import numpy as np
+
+    path = Path(path)
+    h, w = img.shape[:2]
+    n = round(seconds * fps)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+           "-s", f"{w}x{h}", "-r", str(fps), "-i", "-", "-c:v", "libx264", "-preset",
+           "ultrafast", "-crf", "10", "-pix_fmt", "yuv420p", str(path)]
+    data = np.ascontiguousarray(img, dtype=np.uint8).tobytes() * n
+    subprocess.run(cmd, input=data, check=True, capture_output=True)
+    return path
+
+
+def add_manual_calibration(calib_dir, scene, name: str = "scene"):
+    """Save ``scene`` = (image, calibration) as manual calibration ``<calib_dir>/<name>.json``
+    with its reference ``<name>.png``; returns the JSON path."""
+    from pathlib import Path
+
+    import cv2
+
+    from bxjudge.calibration import save_calibration
+
+    img, calib = scene
+    calib_dir = Path(calib_dir)
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    png = calib_dir / f"{name}.png"
+    assert cv2.imwrite(str(png), img)
+    calib.name = name
+    calib.ref_frame = str(png)
+    save_calibration(calib, calib_dir / f"{name}.json")
+    return calib_dir / f"{name}.json"
+
+
+class FakeDetector:
+    """Detector stand-in: two still tops (X left, B right of the battle-floor centre, 1280x720
+    inference pixels) on every frame ``>= launch_frame``; records the frame indices and sizes."""
+
+    def __init__(self, launch_frame: int = 40, x=(500.0, 440.0), b=(780.0, 440.0),
+                 size: float = 40.0):
+        self.launch_frame = launch_frame
+        self.centers = (x, b)
+        self.half = size / 2.0
+        self.frames: list[int] = []
+        self.shapes: set[tuple[int, int]] = set()
+
+    def __call__(self, image, frame: int) -> list[Detection]:
+        self.frames.append(frame)
+        self.shapes.add((image.shape[1], image.shape[0]))
+        if frame < self.launch_frame:
+            return []
+        return [Detection(frame, "bey", (cx - self.half, cy - self.half, cx + self.half,
+                                         cy + self.half), 0.9)
+                for cx, cy in self.centers]

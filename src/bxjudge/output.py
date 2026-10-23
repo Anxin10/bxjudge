@@ -8,6 +8,7 @@ import math
 import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -16,6 +17,9 @@ from .calibration import ZONES
 from .geometry import zone_of
 from .rules import Match, Rules, group_matches
 from .types import Calibration, LaunchCheck, RoundResult, Side, Track
+
+if TYPE_CHECKING:
+    from .calibration_store import Snapshot
 
 ROUND_FIELDS = [
     "video",
@@ -86,6 +90,8 @@ def _result_row(r: RoundResult) -> dict:
         del row["match_start"]  # sparse: absent means automatic grouping (R52)
     if not row["audit_sample"]:
         del row["audit_sample"]  # sparse: absent means not in the audit sample (R62)
+    # ``calibration_id`` stays in every JSON row (None = judged without a snapshot); it is
+    # metadata, not a ROUND_FIELDS CSV column (ruling P1).
     return row
 
 
@@ -127,10 +133,14 @@ def row_to_result(row: dict) -> RoundResult:
     audit_sample = row.get("audit_sample", False)
     if type(audit_sample) is not bool:
         raise ValueError(f"audit_sample must be a bool, got {audit_sample!r}")
+    calibration_id = row.get("calibration_id")  # absent in rows written before snapshots
+    if calibration_id is not None and type(calibration_id) is not str:
+        raise ValueError(f"calibration_id must be a string or null, got {calibration_id!r}")
     return RoundResult(
         **values,
         match_start=match_start,
         audit_sample=audit_sample,
+        calibration_id=calibration_id,
         launch=launch,
         spin_dir={s: row[f"{s.lower()}_spin_dir"] for s in ("X", "B")}
         if row["spin_dir_present"]
@@ -234,6 +244,23 @@ def record_video_timing(
     rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
+    _write_json(path, rows)
+
+
+def record_video_calibration(out_dir: Path, video: str, snap: Snapshot | None) -> None:
+    """Record in ``videos.json[video]["calibration"]`` the snapshot the video was judged with
+    (``{"id", "kind", "name", "score", "template_id"}``; ``score`` is this video's similarity
+    for a manual snapshot, the alignment score for an auto one) or ``None`` (spec section 6.4).
+    Call after ``record_video_timing``, which replaces the entry."""
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    rows.setdefault(video, {})["calibration"] = None if snap is None else {
+        "id": snap.id,
+        "kind": snap.kind,
+        "name": snap.calibration.name,
+        "score": float(snap.score),
+        "template_id": snap.template_id,
+    }
     _write_json(path, rows)
 
 

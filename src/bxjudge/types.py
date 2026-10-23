@@ -109,3 +109,6 @@ class RoundResult:
     match_start: bool = False
     # Member of the seeded random audit sample of unflagged rounds (R62); metadata only.
     audit_sample: bool = False
+    # Id of the calibration snapshot (<results>/calibrations/<id>.json) the round was judged
+    # with; None for a placeholder judged without one (e.g. recalibrate). JSON-only metadata.
+    calibration_id: str | None = None

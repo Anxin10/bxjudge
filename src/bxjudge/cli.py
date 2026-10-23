@@ -139,7 +139,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   thresholds=Path(args.thresholds).expanduser(),
                   rules_path=Path(args.rules).expanduser(),
                   detection_config=Path(args.config).expanduser(), limit=args.limit,
-                  vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser())
+                  vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser(),
+                  autocalib_config=Path(args.autocalib).expanduser())
     except (ValueError, OSError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -160,6 +161,8 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--vlm-config", default="config/vlm.yaml",
                    help="local VLM second opinion after judging (its after_run key enables it)")
     p.add_argument("--no-vlm", action="store_true", help="skip the VLM phase")
+    p.add_argument("--autocalib", default="config/autocalib.yaml",
+                   help="auto-calibration policy for videos no manual calibration matches")
     p.set_defaults(func=_cmd_run)
 
 

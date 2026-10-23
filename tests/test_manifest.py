@@ -51,7 +51,7 @@ def test_scan_idempotent(tmp_path):  # Review Focus 5
     make_video(tmp_path / "a.mp4")
     db = tmp_path / "db.json"
     first = scan(tmp_path, db)
-    [mark_processed(i, db) for i in first]
+    [mark_processed(i, db, calibration_id=None) for i in first]
     assert len(first) == 1 and scan(tmp_path, db) == []
 
 
@@ -67,7 +67,7 @@ def test_scan_returns_changed_file_again(tmp_path):
     p = make_video(tmp_path / "a.mp4")
     db = tmp_path / "db.json"
     for i in scan(tmp_path, db):
-        mark_processed(i, db)
+        mark_processed(i, db, calibration_id=None)
     st = p.stat()
     os.utime(p, (st.st_atime, st.st_mtime + 5))  # same size, new mtime
     assert [i.path for i in scan(tmp_path, db)] == [p]
@@ -83,7 +83,7 @@ def test_scan_finds_new_files_sorted_and_recurses(tmp_path):
     assert [i.path.name for i in found] == ["b.mp4", "a.mp4"] or [i.path.name for i in found] == ["a.mp4", "b.mp4"]
     assert len(found) == 2
     for i in found[:1]:
-        mark_processed(i, db)
+        mark_processed(i, db, calibration_id=None)
     assert len(scan(tmp_path, db)) == 1
 
 
@@ -91,7 +91,7 @@ def test_db_is_json_keyed_by_absolute_path(tmp_path):
     p = make_video(tmp_path / "a.mp4", seconds=1)
     db = tmp_path / "db.json"
     (info,) = scan(tmp_path, db)
-    mark_processed(info, db)
+    mark_processed(info, db, calibration_id=None)
     data = json.loads(db.read_text(encoding="utf-8"))
     entry = data[str(p.resolve())]
     assert entry["size"] == info.size and entry["mtime"] == info.mtime
@@ -134,3 +134,44 @@ def test_cli_scan_missing_folder(tmp_path):
     from bxjudge.cli import main
 
     assert main(["scan", str(tmp_path / "nope"), "--db", str(tmp_path / "db.json")]) == 2
+
+
+# --------------------------------------------------------------------------- calibration record (auto-calibration Task 3)
+
+
+def test_mark_processed_records_calibration_id(tmp_path):
+    from bxjudge.manifest import processed_calibration
+
+    p = make_video(tmp_path / "a.mp4", seconds=1)
+    db = tmp_path / "db.json"
+    (info,) = scan(tmp_path, db)
+    assert processed_calibration(db, p) is None  # never processed
+    mark_processed(info, db, calibration_id="0123456789abcdef")
+    entry = json.loads(db.read_text(encoding="utf-8"))[str(p.resolve())]
+    assert entry["calibration_id"] == "0123456789abcdef"
+    assert processed_calibration(db, p) == "0123456789abcdef"
+    assert scan(tmp_path, db) == []
+
+
+def test_old_record_without_calibration_id_is_changed(tmp_path):
+    # Ruling P4: a record from before calibration snapshots is reanalysed once.
+    p = make_video(tmp_path / "a.mp4", seconds=1)
+    db = tmp_path / "db.json"
+    st = p.stat()
+    db.write_text(json.dumps({str(p.resolve()): {"size": st.st_size, "mtime": st.st_mtime}}))
+    assert [i.path for i in scan(tmp_path, db)] == [p]
+
+
+def test_processed_videos_lists_only_current_records(tmp_path):
+    from bxjudge.manifest import processed_videos
+
+    a = make_video(tmp_path / "a.mp4", seconds=1)
+    b = make_video(tmp_path / "b.mp4", seconds=1)
+    make_video(tmp_path / "c.mp4", seconds=1)  # never processed
+    db = tmp_path / "db.json"
+    for i in scan(tmp_path, db):
+        if i.path != tmp_path / "c.mp4":
+            mark_processed(i, db, calibration_id=None if i.path == b else "x")
+    st = b.stat()
+    os.utime(b, (st.st_atime, st.st_mtime + 5))  # changed: back in scan, not processed
+    assert [i.path for i in processed_videos(tmp_path, db)] == [a]
