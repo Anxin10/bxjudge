@@ -457,6 +457,11 @@ def _results(dirpath, rows, timings):
     dirpath.mkdir(parents=True)
     (dirpath / "rounds.json").write_text(json.dumps(rows), encoding="utf-8")
     (dirpath / "videos.json").write_text(json.dumps(timings), encoding="utf-8")
+    marked = [[r["video"], r["round"]] for r in rows if r.get("audit_sample") is True]
+    if marked:  # R69: marks come with their frozen draw
+        (dirpath / "audit_sample.json").write_text(json.dumps(
+            {"seed": 0, "n": len(marked), "population": marked, "selection": marked}),
+            encoding="utf-8")
     return dirpath
 
 

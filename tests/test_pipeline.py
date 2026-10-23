@@ -1084,6 +1084,15 @@ def _run(videos, calib, out, rules, detector=None, **kw):
                        autocalib=kw.pop("autocalib", _ac()), **kw)
 
 
+def _freeze_audit(out):
+    """R69: audit marks written by hand need their audit_sample.json record."""
+    from bxjudge.output import _write_json, read_rounds
+
+    marked = [[r["video"], r["round"]] for r in read_rounds(out) if r.get("audit_sample")]
+    _write_json(out / "audit_sample.json", {"seed": 0, "n": len(marked), "population": marked,
+                                            "selection": marked})
+
+
 def _confirm_reviewed(out, video, round_no, rules):
     from bxjudge.output import read_rounds, save_rounds
 
@@ -1434,6 +1443,7 @@ def _veto_setup(tmp_path, rules):
         if r["video"] == "clip2.mp4":
             r["audit_sample"] = True
     save_rounds(rows, out, rules)
+    _freeze_audit(out)
     veto_calibration(out, sid, rules=rules)
     return videos, calib, out, sid
 
@@ -1614,6 +1624,7 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     rows = read_rounds(out)
     rows[0]["audit_sample"] = True
     save_rounds(rows, out, rules)
+    _freeze_audit(out)
     before_rows = (out / "rounds.json").read_bytes()
     before_db = (out / "processed_videos.json").read_bytes()
     before_entry = json.loads((out / "videos.json").read_text())["clip.mp4"]

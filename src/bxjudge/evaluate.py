@@ -391,7 +391,27 @@ def _wilson(correct: int, n: int, level: float) -> tuple[float, float]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
+def audit_invalidation(rows: list[dict], audit: dict | None) -> str | None:
+    """R69: why the frozen audit sample no longer stands, else None.
+
+    Every selected (video, round) must still be a row of ``rounds.json`` that is marked
+    ``audit_sample``, and no other row may carry the mark; a successful re-analysis replaces
+    unreviewed rows (dropping their marks), which is what this detects.
+    """
+    if audit is None:
+        return None
+    selection = {tuple(k) for k in audit.get("selection", audit.get("keys", []))}
+    marked = {(r["video"], r["round"]) for r in rows if r.get("audit_sample") is True}
+    missing = selection - {(r["video"], r["round"]) for r in rows}
+    unmarked = (selection - missing) - marked
+    if not (missing or unmarked or marked - selection):
+        return None
+    return (f"{len(missing)} selected round(s) missing and {len(unmarked)} no longer marked "
+            f"(selection of {len(selection)}, {len(marked - selection)} stray mark(s))")
+
+
+def unflagged_accuracy(rows: list[dict], level: float | None = None,
+                       audit: dict | None = None) -> dict:
     """Unflagged finish+winner accuracy without selection bias (R62).
 
     ``exact`` when every unflagged real round is reviewed; else ``audit_sample``: the
@@ -402,6 +422,7 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
     unflagged = [r for r in real_rows(rows) if r["needs_review"] is False]
     reviewed = [r for r in unflagged if r.get("reviewed") is True]
     sampled = [r for r in unflagged if r.get("audit_sample") is True]
+    invalid = audit_invalidation(rows, audit)
     sampled_reviewed = [r for r in sampled if r.get("reviewed") is True]
     biased = [r for r in reviewed if r.get("audit_sample") is not True]
     out = {"n_unflagged": len(unflagged), "n_reviewed": len(reviewed),
@@ -409,6 +430,10 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
            "level": None,
            # share of the audit sample already reviewed (< 1 = warn in the report)
            "coverage": _ratio(len(sampled_reviewed), len(sampled))}
+    if invalid is not None:  # R69: never an estimate, never a PASS
+        return {**out, "method": "invalidated", "n_used": 0, "correct": 0, "estimate": NAN,
+                "low": NAN, "high": NAN, "reason": f"audit sample invalidated: {invalid}",
+                "audit_n": audit.get("n"), "audit_seed": audit.get("seed")}
     if unflagged and len(reviewed) == len(unflagged):
         k = sum(map(_finish_right, reviewed))
         p = k / len(reviewed)
@@ -430,7 +455,7 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
 
 def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
              config: EvalConfig | None = None, runs: list[dict] | None = None,
-             vetoed: set[str] | None = None) -> Metrics:
+             vetoed: set[str] | None = None, audit: dict | None = None) -> Metrics:
     """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
     and ``runs.json`` wall-clock records).
 
@@ -458,7 +483,8 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         wall = NAN  # no videos.json: no eligible videos, so no wall-clock denominator
     basis = ("wall-clock" if math.isfinite(wall)
              else "sum-based" if math.isfinite(speed[0]) else "unverified")
-    u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level)
+    u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level,
+                           audit)
     cal = calibration_coverage(rows, timings, vetoed)
     return Metrics(
         finish_accuracy_unflagged=u["estimate"],
@@ -507,6 +533,7 @@ def _meets(value: float, target: tuple[str, float]) -> bool:
 
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
+INVALIDATED = "INVALIDATED"  # R69: the frozen audit sample no longer stands (never a PASS)
 
 
 def _accuracy_verdict(m: Metrics, cfg: EvalConfig) -> str:
@@ -514,6 +541,8 @@ def _accuracy_verdict(m: Metrics, cfg: EvalConfig) -> str:
     reviewed audit sample of at least ``audit_min_n`` whose Wilson bound also meets the
     target; a point estimate that meets the target without that support is INCONCLUSIVE."""
     target = cfg.targets["finish_accuracy_unflagged"]
+    if m.finish_accuracy_unflagged_method == "invalidated":
+        return INVALIDATED
     if not _meets(m.finish_accuracy_unflagged, target):
         return FAIL
     if m.finish_accuracy_unflagged_method == "exact":
@@ -606,7 +635,8 @@ def _vlm_requests(rows, timings, percentile):
 def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: EvalConfig,
                    *, rules: Rules | None = None,
                    runs: list[dict] | None = None,
-                   vetoed: set[str] | None = None) -> ReportMetrics:
+                   vetoed: set[str] | None = None,
+                   audit: dict | None = None) -> ReportMetrics:
     """Latency, VLM and referee-accuracy metrics for the eval report (R60).
 
     Core = ``processing_s`` (excludes one-time model init and scan/probe), end-to-end =
@@ -641,7 +671,7 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
         agreement = {"n_matches": len(full), "agree": agree, "ratio": _ratio(agree, len(full)),
                      "n_partial": len(final) - len(full)}
     wall = _wall(rows, timings, runs, config.speed_max_video_s)
-    u =unflagged_accuracy(rows, config.audit_confidence_level)
+    u = unflagged_accuracy(rows, config.audit_confidence_level, audit)
     pass_rate = _ratio(sum(v["total_ratio"] <= limit for v in videos), len(videos))
     if math.isfinite(wall["ratio"]):
         speed = {"basis": "wall-clock", "ratio": wall["ratio"],
@@ -989,6 +1019,33 @@ def reversed_finish_check(rows: list[dict]) -> dict:
 # --------------------------------------------------------------------------- reports
 
 
+def audit_remedy(results_dir, n, seed) -> str:
+    return f"bxjudge audit-sample {results_dir} --n {n} --seed {seed} --replace"
+
+
+def read_audit(results_dir: str | Path) -> dict | None:
+    """The frozen audit sample record (R69), None when no sample was drawn.
+
+    Raises ValueError when rows carry ``audit_sample`` marks but ``audit_sample.json`` is
+    missing or malformed: the draw can no longer be verified.
+    """
+    path = Path(results_dir) / "audit_sample.json"
+    rounds = Path(results_dir) / "rounds.json"
+    if path.is_file():
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict) or not isinstance(
+            meta.get("selection", meta.get("keys")), list
+        ):
+            raise ValueError(f"{path}: malformed audit sample record")
+        return meta
+    rows = json.loads(rounds.read_text(encoding="utf-8")) if rounds.is_file() else []
+    if any(r.get("audit_sample") is True for r in rows):
+        raise ValueError(f"{path}: rows are marked audit_sample but audit_sample.json is "
+                         "missing; re-draw with `bxjudge audit-sample <dir> --n N --seed S "
+                         "--replace`")
+    return None
+
+
 def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None, list | None]:
     """Rows, per-video timings and batch run records of a results directory (read-only;
     absent ``videos.json`` / ``runs.json`` give None)."""
@@ -997,6 +1054,7 @@ def read_results(results_dir: str | Path) -> tuple[list[dict], dict | None, list
     if not rounds.is_file():
         raise ValueError(f"{results_dir}: no rounds.json (run `bxjudge run` first)")
     rows = json.loads(rounds.read_text(encoding="utf-8"))
+    read_audit(results_dir)  # R69: marks without audit_sample.json are an error
     videos = results_dir / "videos.json"
     timings = json.loads(videos.read_text(encoding="utf-8")) if videos.is_file() else None
     runs_path = results_dir / "runs.json"
@@ -1028,6 +1086,8 @@ def _target(t: tuple[str, float]) -> str:
 def _verdict(value: float, verdict: str) -> str:
     if verdict == PASS:
         return PASS
+    if verdict == INVALIDATED:
+        return "INVALIDATED (resample)"
     if verdict == INCONCLUSIVE:
         return "INCONCLUSIVE (樣本不足)"  # R64: meets the target without statistical support
     return "UNVERIFIED (FAIL)" if not math.isfinite(value) else FAIL
@@ -1090,6 +1150,9 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
                     "review the rest with the 抽樣稽核 filter")
         how += (f"; R64: PASS needs a fully reviewed sample of ≥ {config.audit_min_n} "
                 "with the Wilson bound meeting the target")
+    elif u["method"] == "invalidated":
+        remedy = audit_remedy(results_dir, u["audit_n"], u["audit_seed"])
+        how = f"{u['reason']}; rerun `{remedy}`"
     elif u["method"] == "exact":
         how = f"exact: all {u['n_unflagged']} unflagged rounds reviewed"
     else:

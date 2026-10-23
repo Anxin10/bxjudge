@@ -7,6 +7,7 @@ import pytest
 from bxjudge import output
 from bxjudge.cli import main
 from bxjudge.corrections import CorrectionError, confirm_reviewed, mark_audit_sample
+from bxjudge.evaluate import evaluate, passes, read_audit, read_results
 from bxjudge.output import read_rounds, row_to_result, write_results
 from tests.helpers import rr
 
@@ -37,7 +38,9 @@ def test_marks_seeded_sample_of_unflagged_real_rounds_only(tmp_path, rules):
     assert all(v.startswith("v") for v, _ in marked)  # never flagged or placeholder rows
     assert _judgments(after) == before  # judgments, reviews and fixes untouched
     meta = json.loads((out / "audit_sample.json").read_text())
-    assert (meta["seed"], meta["n"], meta["population"]) == (7, 3, 6)
+    assert (meta["seed"], meta["n"]) == (7, 3)
+    assert meta["population"] == sorted([f"v{i}.mp4", 1] for i in range(6))
+    assert meta["selection"] == [list(k) for k in picked]
 
 
 def test_same_seed_is_idempotent_and_reproducible(tmp_path, rules):
@@ -105,3 +108,84 @@ def test_run_timing_records_append_and_validate(tmp_path):
         with pytest.raises(ValueError):
             output.record_run_timing(tmp_path, **args)
     assert len(json.loads((tmp_path / "runs.json").read_text())) == 2
+
+
+# ---- R69 audit freeze ------------------------------------------------------------
+
+
+def _review_all(out, rules):
+    for r in read_rounds(out):
+        if r.get("audit_sample"):
+            confirm_reviewed(out, r["video"], r["round"], rules=rules)
+
+
+def _eval(out):
+    rows, timings, runs = read_results(out)
+    return evaluate(rows, timings, runs=runs, audit=read_audit(out))
+
+
+def test_rerun_replacing_a_sampled_row_invalidates_the_estimate(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 3, seed=7, rules=rules)
+    assert _eval(out).finish_accuracy_unflagged_method != "invalidated"
+    video = picked[0][0]  # unreviewed: a successful re-analysis replaces it
+    write_results([rr("spin", "X", video=video)], out, rules)  # successful re-analysis
+    assert not [r for r in read_rounds(out) if r["video"] == video and r.get("audit_sample")]
+    m = _eval(out)
+    assert m.finish_accuracy_unflagged_method == "invalidated"
+    assert passes(m)["finish_accuracy_unflagged"] == "INVALIDATED"
+
+
+def test_vanished_selected_row_invalidates_too(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 2, seed=7, rules=rules)
+    rows, _, _ = read_results(out)
+    rows = [r for r in rows if (r["video"], r["round"]) != picked[0]]
+    assert evaluate(rows, audit=read_audit(out)).finish_accuracy_unflagged_method == "invalidated"
+
+
+def test_remark_after_population_change_needs_replace(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 2, seed=7, rules=rules)
+    write_results([rr("spin", "X", video="new.mp4")], out, rules)  # population grows
+    with pytest.raises(ValueError, match="--replace"):
+        mark_audit_sample(out, 2, seed=7, rules=rules)
+    assert main(["audit-sample", str(out), "--n", "2", "--seed", "7"]) == 2
+    picked = mark_audit_sample(out, 2, seed=8, rules=rules, replace=True)
+    marked = {(r["video"], r["round"]) for r in read_rounds(out) if r.get("audit_sample")}
+    assert marked == set(picked)
+    meta = json.loads((out / "audit_sample.json").read_text())
+    assert ["new.mp4", 1] in meta["population"] and meta["seed"] == 8
+    assert _eval(out).finish_accuracy_unflagged_method != "invalidated"
+    assert main(["audit-sample", str(out), "--n", "2", "--seed", "9", "--replace"]) == 0
+
+
+def test_marks_without_the_meta_file_are_an_error(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 2, seed=7, rules=rules)
+    (out / "audit_sample.json").unlink()
+    with pytest.raises(ValueError, match="audit_sample.json"):
+        read_results(out)
+
+
+def test_unchanged_sample_behaves_as_before(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 3, seed=7, rules=rules)
+    _review_all(out, rules)
+    rows, timings, runs = read_results(out)
+    with_meta = evaluate(rows, timings, runs=runs, audit=read_audit(out))
+    assert with_meta == evaluate(rows, timings, runs=runs)
+    assert with_meta.finish_accuracy_unflagged_method == "audit_sample"
+    assert passes(with_meta)["finish_accuracy_unflagged"] == "INCONCLUSIVE"  # R64: n < min
+
+
+def test_eval_cli_reports_invalidated_with_remedy(tmp_path, rules, capsys):
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 3, seed=7, rules=rules)
+    write_results([rr("spin", "X", video=picked[0][0])], out, rules)
+    report = tmp_path / "r.md"
+    assert main(["eval", str(out), "--report", str(report)]) == 0
+    text = capsys.readouterr().out
+    assert "INVALIDATED" in text and "audit-sample" in text and "--n 3 --seed 7 --replace" in text
+    assert "INVALIDATED (resample)" in report.read_text(encoding="utf-8")
+    assert "--n 3 --seed 7 --replace" in report.read_text(encoding="utf-8")

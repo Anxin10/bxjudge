@@ -394,9 +394,11 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         cfg, results, rows, timings, runs, truth = _eval_inputs(args)
         rules = load_rules(Path(args.rules).expanduser())
         vetoed = vetoed_ids(results)
-        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs, vetoed=vetoed)
+        audit = ev.read_audit(results)
+        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs, vetoed=vetoed, audit=audit)
         ok = ev.passes(metrics, cfg)
-        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs, vetoed=vetoed)
+        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs, vetoed=vetoed,
+                               audit=audit)
         path, today = _report_path(args, "eval")
         _write_report(path, ev.render_eval_report(
             results, rows, timings, metrics, ok, extra, cfg, truth=truth,
@@ -414,6 +416,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     summary = ", ".join(f"{name}={shown(name)} {ok[name]}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
+    if metrics.finish_accuracy_unflagged_method == "invalidated":
+        print("INVALIDATED: sampled rounds changed since the audit sample was drawn; run `"
+              f"{ev.audit_remedy(results, audit['n'], audit['seed'])}`")
     if ev.is_synthetic(rows):
         print("SMOKE ONLY: synthetic-detector rounds are not acceptance evidence")
     print(f"report: {path}")
@@ -480,6 +485,7 @@ def _cmd_audit_sample(args: argparse.Namespace) -> int:
 
     try:
         picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
+                                   replace=args.replace,
                                    rules=load_rules(Path(args.rules).expanduser()))
     except (CorrectionError, ValueError, OSError) as error:
         if args.debug:
@@ -500,6 +506,8 @@ def _add_audit_sample(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--n", type=int, required=True, help="sample size")
     p.add_argument("--seed", type=int, required=True, help="random seed (reproducible)")
     p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing sample (required when the population changed)")
     p.set_defaults(func=_cmd_audit_sample)
 
 
