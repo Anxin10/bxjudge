@@ -1111,3 +1111,37 @@ def test_vlm_snapshot_identity_and_missing_records(tmp_path, monkeypatch, rules,
         assert after[0]["calibration_id"] == current.id and after[0]["vlm_note"] is None
         assert after[2]["vlm_note"].startswith("[")
     assert after[3] == rows[3]  # reviewed truth and its historical snapshot stay intact
+
+
+@pytest.mark.parametrize("document", [[], {"snapshot": []}])
+def test_malformed_snapshot_metadata_does_not_abort_valid_later_vlm_row(tmp_path, monkeypatch, rules, th, document):
+    from dataclasses import replace
+
+    from bxjudge.calibration_store import save_snapshot
+
+    source = tmp_path / "clip.mp4"
+    source.touch()
+    out = tmp_path / "out"
+    bad_snapshot = save_snapshot(out, "auto", make_calibration(), blank(), score=0.8)
+    valid_snapshot = save_snapshot(out, "auto", replace(make_calibration(), name="valid"), blank(), score=0.9)
+    bad = res("a-broken.mp4", 1, finish="spin", winner="X", needs_review=True)
+    bad.calibration_id = bad_snapshot.id
+    valid = res("z-valid.mp4", 1, finish="over", winner="B", needs_review=True)
+    valid.calibration_id = valid_snapshot.id
+    output.write_results([bad, valid], out, rules)
+    for result, snapshot in ((bad, bad_snapshot), (valid, valid_snapshot)):
+        output.record_video_timing(out, result.video, 1.0, 0.2, source_video=source)
+        output.record_video_calibration(out, result.video, snapshot)
+    (out / "calibrations" / f"{bad_snapshot.id}.json").write_text(json.dumps(document))
+    seen = []
+    monkeypatch.setattr(vlm, "event_frames", lambda src, t, snapshot, *a: seen.append(snapshot.id) or [blank()])
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"yes","reason":"r"}'))
+    before = output.read_rounds(out)
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg())
+    after = output.read_rounds(out)
+    assert after[0]["vlm_note"] == "vlm_unavailable: no calibration record"
+    assert after[1]["vlm_note"].startswith("[")
+    assert seen == [valid_snapshot.id]
+    assert summary["answered"] == summary["unavailable"] == 1
+    for a, b in zip(after, before, strict=True):
+        assert {k: v for k, v in a.items() if k != "vlm_note"} == {k: v for k, v in b.items() if k != "vlm_note"}

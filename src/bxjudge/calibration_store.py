@@ -142,13 +142,18 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
 
 def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
     """Read snapshot ``snapshot_id`` from ``<out_dir>/calibrations``; ``ref_frame`` is absolute.
-    Raises ``FileNotFoundError`` for an unknown id."""
+    Raises ``FileNotFoundError`` for an unknown id, ``ValueError`` for malformed JSON shapes."""
     if not snapshot_id or Path(snapshot_id).name != snapshot_id:
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}")
     jpath = _cal_dir(out_dir) / f"{snapshot_id}.json"
     if not jpath.is_file():
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}: {jpath}")
-    meta = json.loads(jpath.read_text(encoding="utf-8"))["snapshot"]
+    document = json.loads(jpath.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"{jpath}: expected a snapshot document object")  # noqa: TRY004 - malformed persisted JSON
+    meta = document.get("snapshot")
+    if not isinstance(meta, dict):
+        raise ValueError(f"{jpath}: expected a snapshot metadata object")  # noqa: TRY004 - malformed persisted JSON
     hom = meta.get("homography")
     return Snapshot(
         id=meta["id"], kind=meta["kind"], calibration=load_calibration(jpath),

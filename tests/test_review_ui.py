@@ -472,3 +472,19 @@ def test_manual_info_uses_recorded_per_video_similarity(batch, rules):
     at = app().run()
     assert not at.exception, at.exception
     assert any(c.value == "校準：manual（recorded）分數 0.823" for c in at.caption)
+
+
+@pytest.mark.parametrize("document", [[], {"snapshot": []}])
+def test_malformed_snapshot_metadata_is_unavailable_in_helpers_and_app(batch, rules, document):
+    import json
+
+    snapshot = auto_snapshot(batch)
+    record_snapshot(batch, snapshot, rules)
+    (batch / "calibrations" / f"{snapshot.id}.json").write_text(json.dumps(document))
+    item = read_rounds(batch)[0]
+    assert review_ui.row_calibration(batch, item) is None
+    assert review_ui.calibration_status(batch, item) == "no_record"
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any(w.value == "此結果沒有校準紀錄，請用新版重新執行 bxjudge run" for w in at.warning)
+    widget(at.button, "確認無誤")

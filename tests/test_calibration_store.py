@@ -253,3 +253,12 @@ def test_veto_leaves_other_positions_and_manual_selection_alone(tmp_path):
     assert select_snapshot(far, calib, out, th(), load_autocalib_config(), {a.id}).id == b.id
     manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config(), {a.id})
     assert manual.kind == "manual"
+
+
+@pytest.mark.parametrize("document", [[], None, {"snapshot": []}, {"snapshot": None}, {}])
+def test_load_snapshot_rejects_malformed_document_or_metadata_shape(tmp_path, document):
+    directory = tmp_path / "calibrations"
+    directory.mkdir()
+    (directory / "broken.json").write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="snapshot"):
+        load_snapshot(tmp_path, "broken")
