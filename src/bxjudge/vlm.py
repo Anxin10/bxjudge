@@ -259,12 +259,16 @@ def _post(host: str, payload: dict, *, path: str = "/api/chat", timeout: float) 
 
 def preflight(config: VlmConfig) -> str | None:
     """R65 reachability check: ``None`` when the local server answers ``GET /api/version``
-    within ``preflight_timeout_s``, else the reason (one cheap request, no frames)."""
+    within ``preflight_timeout_s`` with a non-empty ``version``, else the reason (one cheap
+    request, no frames). A reply without a version string is not an Ollama server."""
     url = validate_endpoint(config.host) + "/api/version"
     try:
         request = urllib.request.Request(url, method="GET")
         with _opener().open(request, timeout=config.preflight_timeout_s) as response:
-            json.loads(response.read())
+            reply = json.loads(response.read())
+        version = reply.get("version") if isinstance(reply, dict) else None
+        if not isinstance(version, str) or not version.strip():
+            raise VlmError("no version in /api/version reply")
     except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError,
             VlmError) as error:
         return f"server unreachable at {config.host}: {_short(getattr(error, 'reason', error))}"

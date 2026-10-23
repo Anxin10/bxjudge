@@ -108,21 +108,19 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
    Ollama（例如 11434）。第一次先安裝並下載模型（壓縮檔 SHA256 必須一致）：
 
    ```bash
-   sudo apt-get install -y zstd
-   mkdir -p weights/ollama-runtime weights/ollama
-   curl -L -o /tmp/ollama-linux-amd64-v0.40.7.tar.zst \
-     https://github.com/ollama/ollama/releases/download/v0.40.7/ollama-linux-amd64.tar.zst
-   echo "7f082e625b4c334df84ed1558fe282d6d8091fe3545790aef30b3a9c50d44d41  /tmp/ollama-linux-amd64-v0.40.7.tar.zst" | sha256sum -c -
-   tar --zstd -xf /tmp/ollama-linux-amd64-v0.40.7.tar.zst -C weights/ollama-runtime
+   # 安裝（只下載官方壓縮檔，驗證大小與 SHA256 後才解開到 weights/ollama-runtime；
+   # 已存在的 runtime 不會被覆蓋，除非加 --force；不會下載模型）
+   uv run --no-project --with zstandard python scripts/setup_ollama.py
    ```
 
-   每次開機後啟動（背景執行，log 寫到 `runs/ollama-11435.log`），並確認有回應：
+   每次開機後在**另一個終端機**前景啟動（Ctrl+C 停止；綁 `127.0.0.1:11435`、
+   `OLLAMA_NO_CLOUD=1`、模型目錄 `weights/ollama`；不會管理或停止其他 Ollama），
+   再確認有回應：
 
    ```bash
    cd ~/bxjudge
-   mkdir -p runs
-   OLLAMA_HOST=127.0.0.1:11435 OLLAMA_MODELS="$PWD/weights/ollama" OLLAMA_NO_CLOUD=1 \
-     nohup weights/ollama-runtime/bin/ollama serve > runs/ollama-11435.log 2>&1 &
+   scripts/serve_ollama.sh
+   # 另一個終端機：
    curl -s --max-time 5 http://127.0.0.1:11435/api/version
    ```
 
@@ -133,7 +131,7 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
    OLLAMA_HOST=127.0.0.1:11435 weights/ollama-runtime/bin/ollama pull qwen3-vl:8b
    ```
 
-   VLM 階段開始前會先以 `GET /api/version` 檢查伺服器（逾時 `preflight_timeout_s`，
+   VLM 階段開始前會先以 `GET /api/version` 檢查伺服器（回應必須含非空的 `version`，否則視為連不上）（逾時 `preflight_timeout_s`，
    在 `config/vlm.yaml`）。連不上時**不解碼任何畫面**，直接跳過 VLM 階段：需 VLM 的回合
    寫入 `vlm_unavailable: server unreachable …` 註記並印一行警告；之後啟動伺服器再執行
    第 8 步即可補問。VLM 只寫 `vlm_note`，永不改判定。
@@ -220,6 +218,10 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
    ```bash
    uv run bxjudge run ~/bx/videos/20261001 --calib calib
    ```
+
+   `--calib` 與 `--out`（預設 `results/<批次>`）必須是**各自獨立、互不包含**的資料夾（含符號連結
+   解析後）：不可把結果寫進 `calib/` 底下，也不可把 `calib/` 放進結果資料夾，否則印
+   `error:` 並以結束碼 2 結束，避免自動校準的快照被誤當成手動範本。
 
 8. **（選用）單獨補問 VLM**：對尚未覆核、需覆核且還沒有成功 VLM 註記的回合再問一次：
 

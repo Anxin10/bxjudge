@@ -142,6 +142,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser(),
                   autocalib_config=Path(args.autocalib).expanduser())
     except (ValueError, OSError, RuntimeError) as error:
+        if args.debug:
+            raise
         print(f"error: {error}", file=sys.stderr)
         return 2
     return 0
@@ -299,6 +301,8 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
             record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
                               vlm_wall_s=wall, videos={})
     except (ValueError, OSError, RuntimeError) as error:
+        if args.debug:
+            raise
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(json.dumps(summary, ensure_ascii=False))
@@ -399,6 +403,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
             truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today,
             vetoed=vetoed))
     except (ValueError, OSError, KeyError) as error:
+        if args.debug:
+            raise
         print(f"error: {error}", file=sys.stderr)
         return 2
     def shown(name: str) -> str:
@@ -446,6 +452,8 @@ def _cmd_tune(args: argparse.Namespace) -> int:
             impact_coincide_frames=th.impact_coincide_frames, thresholds_path=th_path,
             truth=truth, today=today))
     except (ValueError, OSError, KeyError) as error:
+        if args.debug:
+            raise
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(diff.rstrip() if diff else f"shake_px: no change proposed ({derivation.method})")
@@ -474,6 +482,8 @@ def _cmd_audit_sample(args: argparse.Namespace) -> int:
         picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
                                    rules=load_rules(Path(args.rules).expanduser()))
     except (CorrectionError, ValueError, OSError) as error:
+        if args.debug:
+            raise
         print(f"error: {error}", file=sys.stderr)
         return 2
     for video, number in picked:
@@ -504,7 +514,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for register in _REGISTRARS:
         register(sub)
+    _debug_anywhere(sub)
     return parser
+
+
+def _debug_anywhere(sub: argparse._SubParsersAction) -> None:
+    """Accept ``--debug`` after any (nested) subcommand too. ``SUPPRESS`` keeps a value given
+    before the subcommand from being overwritten by the subparser's default."""
+    for parser in sub.choices.values():
+        parser.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                            help="show the full traceback instead of a one-line error")
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                _debug_anywhere(action)
 
 
 def _user_errors() -> tuple[type[BaseException], ...]:
@@ -531,6 +553,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        print("cancelled", file=sys.stderr)
+        return 130
     except _user_errors() as error:
         if args.debug:
             raise

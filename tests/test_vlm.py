@@ -1099,3 +1099,34 @@ def test_vlm_cli_unreachable_server_warns_and_records_no_vlm_run(tmp_path, monke
     captured = capsys.readouterr()
     assert "warning:" in captured.err and "11435" in captured.err
     assert not (tmp_path / "runs.json").exists()
+
+
+class _BodyServer:
+    def __init__(self, body: bytes):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.parametrize("body", [b'{"version": ""}', b"{}", b'{"version": null}',
+                                  b'{"version": 7}', b"[]", b'"0.40.7"'])
+def test_preflight_without_a_version_string_is_unreachable(body):
+    srv = _BodyServer(body)
+    try:
+        reason = _REAL_PREFLIGHT(cfg(host=srv.url, preflight_timeout_s=2.0))
+    finally:
+        srv.close()
+    assert reason is not None and "unreachable" in reason and "version" in reason
