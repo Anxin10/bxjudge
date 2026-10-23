@@ -189,3 +189,18 @@ def test_eval_cli_reports_invalidated_with_remedy(tmp_path, rules, capsys):
     assert "INVALIDATED" in text and "audit-sample" in text and "--n 3 --seed 7 --replace" in text
     assert "INVALIDATED (resample)" in report.read_text(encoding="utf-8")
     assert "--n 3 --seed 7 --replace" in report.read_text(encoding="utf-8")
+
+
+def test_exact_basis_beats_invalidation_when_every_unflagged_round_is_reviewed(tmp_path, rules):
+    # C5-1: re-analysing a sampled row invalidates the *sample*, but once every unflagged round
+    # is reviewed the exact value needs no sample.
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 3, seed=7, rules=rules)
+    write_results([rr("spin", "X", video=picked[0][0])], out, rules)
+    assert _eval(out).finish_accuracy_unflagged_method == "invalidated"  # sample-based: still so
+    for r in read_rounds(out):
+        if r["video"].startswith("v"):  # the six unflagged real rounds
+            confirm_reviewed(out, r["video"], r["round"], rules=rules)
+    m = _eval(out)
+    assert m.finish_accuracy_unflagged_method == "exact"
+    assert passes(m)["finish_accuracy_unflagged"] != "INVALIDATED"

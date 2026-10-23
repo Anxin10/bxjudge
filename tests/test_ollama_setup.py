@@ -165,3 +165,107 @@ def test_serve_script_without_runtime_fails_cleanly(tmp_path):
     done = subprocess.run(["bash", str(ROOT / "scripts/serve_ollama.sh"), str(tmp_path / "none")],
                           capture_output=True, text=True, check=False)
     assert done.returncode == 2 and "setup_ollama.py" in done.stderr
+
+
+# --------------------------------------------------------------------------- symlink and size guards
+
+
+def _project(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    (root / "weights").mkdir(parents=True)
+    monkeypatch.setattr(setup, "ROOT", root)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "keep").write_text("precious")
+    return root, external
+
+
+def _run_main(monkeypatch, runtime, archive, *extra):
+    monkeypatch.setattr(sys, "argv", ["setup_ollama.py", "--runtime", str(runtime),
+                                      "--archive", str(archive), *extra])
+    with pytest.raises(SystemExit) as stop:
+        setup.main()
+    return stop.value.code
+
+
+def test_force_never_deletes_through_a_symlinked_runtime(tmp_path, pinned, monkeypatch, capsys):
+    root, external = _project(tmp_path, monkeypatch)
+    archive = _tar(tmp_path, {"bin/ollama": b"new"})
+    pinned(archive)
+    runtime = root / "weights/ollama-runtime"
+    runtime.symlink_to(external, target_is_directory=True)
+    assert _run_main(monkeypatch, runtime, archive, "--force") == 2
+    assert "symlink" in capsys.readouterr().err
+    assert (external / "keep").read_text() == "precious" and runtime.is_symlink()
+
+
+def test_force_refuses_a_symlinked_parent_inside_the_project(tmp_path, pinned, monkeypatch, capsys):
+    root, external = _project(tmp_path, monkeypatch)
+    archive = _tar(tmp_path, {"bin/ollama": b"new"})
+    pinned(archive)
+    (root / "weights/sub").symlink_to(external, target_is_directory=True)
+    (external / "ollama-runtime").mkdir()
+    assert _run_main(monkeypatch, root / "weights/sub/ollama-runtime", archive, "--force") == 2
+    assert "symlink" in capsys.readouterr().err
+    assert (external / "keep").exists() and (external / "ollama-runtime").is_dir()
+
+
+def test_symlinked_runtime_is_refused_even_without_force(tmp_path, pinned, monkeypatch, capsys):
+    root, external = _project(tmp_path, monkeypatch)
+    archive = _tar(tmp_path, {"bin/ollama": b"new"})
+    pinned(archive)
+    runtime = root / "weights/ollama-runtime"
+    runtime.symlink_to(external / "nowhere")  # dangling
+    assert _run_main(monkeypatch, runtime, archive) == 2
+    assert "symlink" in capsys.readouterr().err
+
+
+def test_force_never_deletes_outside_the_weights_folder(tmp_path, pinned, monkeypatch, capsys):
+    root, external = _project(tmp_path, monkeypatch)
+    archive = _tar(tmp_path, {"bin/ollama": b"new"})
+    pinned(archive)
+    for victim in (external, root / "src"):
+        victim.mkdir(exist_ok=True)
+        (victim / "keep2").write_text("x")
+        assert _run_main(monkeypatch, victim, archive, "--force") == 2
+        assert "weights" in capsys.readouterr().err
+        assert (victim / "keep2").exists()
+
+
+def test_force_still_replaces_a_real_runtime_inside_weights(tmp_path, pinned, monkeypatch):
+    root, _ = _project(tmp_path, monkeypatch)
+    archive = _tar(tmp_path, {"bin/ollama": b"new"})
+    pinned(archive)
+    runtime = root / "weights/ollama-runtime"
+    runtime.mkdir()
+    (runtime / "old").write_text("old")
+    with pytest.raises(SystemExit) as stop:
+        monkeypatch.setattr(sys, "argv", ["x", "--runtime", str(runtime), "--archive",
+                                          str(archive), "--force"])
+        setup.main()
+        raise SystemExit(0)
+    assert stop.value.code == 0
+    assert (runtime / "bin/ollama").read_bytes() == b"new" and not (runtime / "old").exists()
+
+
+class _Stream(io.BytesIO):
+    """A fake network response that records how much was pulled from it."""
+
+
+def test_download_stops_and_removes_partial_file_past_the_size_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup, "SIZE", 1000)
+    monkeypatch.setattr(setup, "DOWNLOAD_MARGIN", 100)
+    monkeypatch.setattr(setup, "CHUNK", 64)
+    source = _Stream(b"x" * 100_000)
+    target = tmp_path / "dl.tar.zst"
+    with pytest.raises(ValueError, match="larger than expected"):
+        setup._download(source, target)
+    assert not target.exists()
+    assert source.tell() <= 1100 + 64  # stopped reading right after the cap
+
+
+def test_download_of_the_expected_size_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup, "SIZE", 1000)
+    target = tmp_path / "dl.tar.zst"
+    setup._download(io.BytesIO(b"y" * 1000), target)
+    assert target.read_bytes() == b"y" * 1000

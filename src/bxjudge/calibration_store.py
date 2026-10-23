@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 from collections.abc import Iterable
 from collections.abc import Set as AbstractSet
@@ -178,12 +179,25 @@ def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
             homography=None if hom is None else tuple(tuple(float(v) for v in r) for r in hom),
             template_set=None if tset is None else tuple(str(t) for t in tset),
         )
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
         raise ValueError(f"{jpath}: malformed calibration snapshot ({e!r})") from None
 
 
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+_MAX_FRAME_SIDE = 100_000  # sane bound for a frame width/height in pixels
+_MAX_COORD = 1e7  # sane bound for a zone polygon coordinate
+
+
+def _is_frame_side(v) -> bool:
+    """A finite whole number in ``1.._MAX_FRAME_SIDE`` (safe for ``int()``)."""
+    return _is_number(v) and math.isfinite(v) and 1 <= v <= _MAX_FRAME_SIDE and v == int(v)
+
+
+def _is_coord(v) -> bool:
+    return _is_number(v) and math.isfinite(v) and abs(v) <= _MAX_COORD
 
 
 def _checked_meta(doc) -> dict:
@@ -212,14 +226,14 @@ def _checked_meta(doc) -> dict:
     if tset is not None and not (isinstance(tset, list) and all(isinstance(t, str) for t in tset)):
         raise ValueError("template_set is not a list of strings")
     size = doc.get("frame_size")
-    if not (isinstance(size, list) and len(size) == 2 and all(_is_number(v) for v in size)):
-        raise ValueError("frame_size is not [width, height]")
+    if not (isinstance(size, list) and len(size) == 2 and all(_is_frame_side(v) for v in size)):
+        raise ValueError("frame_size is not [width, height] of positive whole pixel counts")
     if not isinstance(doc.get("name"), str):
         raise TypeError("name is not a string")
     for f in _POLY_FIELDS:
         poly = doc.get(f)
         if not (isinstance(poly, list) and all(
-                isinstance(pt, list) and len(pt) == 2 and all(map(_is_number, pt))
+                isinstance(pt, list) and len(pt) == 2 and all(map(_is_coord, pt))
                 for pt in poly)):
             raise ValueError(f"{f} is not a list of [x, y] points")
     return meta

@@ -422,3 +422,22 @@ def test_validate_output_paths_rejects_overlap_and_files(tmp_path):
     afile.write_text("x")
     with pytest.raises(ValueError, match="file"):
         validate_output_paths(afile, calib)
+
+
+@pytest.mark.parametrize("bad", [
+    [1e309, 720], [1280, float("nan")], [1e30, 720], [1280.5, 720], [0, 720], [-1280, 720],
+    [1280, 1e12],
+])
+def test_load_snapshot_rejects_a_non_finite_huge_or_fractional_frame_size(tmp_path, bad):
+    out, snap, jpath = _stored_manual_snapshot(tmp_path)
+    _edit_snapshot_json(jpath, lambda doc: doc.__setitem__("frame_size", bad))
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id)
+
+
+@pytest.mark.parametrize("bad", [1e309, float("nan"), -1e309, 1e30])
+def test_load_snapshot_rejects_a_non_finite_or_huge_polygon_coordinate(tmp_path, bad):
+    out, snap, jpath = _stored_manual_snapshot(tmp_path)
+    _edit_snapshot_json(jpath, lambda doc: doc[ZONES[0][0]].append([bad, 1.0]))
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id)

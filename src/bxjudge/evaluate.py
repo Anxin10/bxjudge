@@ -414,7 +414,8 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None,
                        audit: dict | None = None) -> dict:
     """Unflagged finish+winner accuracy without selection bias (R62).
 
-    ``exact`` when every unflagged real round is reviewed; else ``audit_sample``: the
+    ``exact`` when every unflagged real round is reviewed (C5-1: the exact value needs no sample,
+    so a changed audit sample cannot invalidate it); else ``audit_sample``: the
     reviewed members of the seeded random audit sample, with a Wilson interval at
     ``level`` (config default); else unverified. Reviewed unflagged rounds outside the
     sample were chosen by people, so they are reported separately as ``biased``.
@@ -430,15 +431,15 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None,
            "level": None,
            # share of the audit sample already reviewed (< 1 = warn in the report)
            "coverage": _ratio(len(sampled_reviewed), len(sampled))}
-    if invalid is not None:  # R69: never an estimate, never a PASS
-        return {**out, "method": "invalidated", "n_used": 0, "correct": 0, "estimate": NAN,
-                "low": NAN, "high": NAN, "reason": f"audit sample invalidated: {invalid}",
-                "audit_n": audit.get("n"), "audit_seed": audit.get("seed")}
     if unflagged and len(reviewed) == len(unflagged):
         k = sum(map(_finish_right, reviewed))
         p = k / len(reviewed)
         return {**out, "method": "exact", "n_used": len(reviewed), "correct": k,
                 "estimate": p, "low": p, "high": p}
+    if invalid is not None:  # R69: a sample estimate is never trusted, never a PASS
+        return {**out, "method": "invalidated", "n_used": 0, "correct": 0, "estimate": NAN,
+                "low": NAN, "high": NAN, "reason": f"audit sample invalidated: {invalid}",
+                "audit_n": audit.get("n"), "audit_seed": audit.get("seed")}
     if sampled_reviewed:
         level = load_eval_config().audit_confidence_level if level is None else level
         k = sum(map(_finish_right, sampled_reviewed))
