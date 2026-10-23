@@ -5,7 +5,6 @@ from bxjudge import calibration
 from bxjudge.calibration import (
     PolygonCollector,
     calibration_similarity,
-    find_calibration,
     load_calibration,
     save_calibration,
 )
@@ -36,20 +35,6 @@ def test_similarity_identical_high(tmp_path, ref_img):
 def test_similarity_shifted_low(tmp_path, ref_img):
     shifted = np.roll(ref_img, 40, axis=1)
     assert calibration_similarity(shifted, cal_with(ref_img, tmp_path)) < 0.8
-
-
-def test_find_calibration_none_when_no_match(tmp_path, ref_img):
-    save_calibration(cal_with(ref_img, tmp_path), tmp_path / "a.json")
-    assert find_calibration(np.roll(ref_img, 40, axis=1), tmp_path, 0.8) is None
-
-
-def test_find_calibration_picks_best_match(tmp_path, ref_img):
-    from tests.helpers import make_ref_img
-
-    save_calibration(cal_with(make_ref_img(seed=1), tmp_path, name="other"), tmp_path / "other.json")
-    save_calibration(cal_with(ref_img, tmp_path, name="mine"), tmp_path / "mine.json")
-    found = find_calibration(ref_img, tmp_path, 0.8)
-    assert found is not None and found.name == "mine"
 
 
 def test_polygon_collector_order_undo_and_min_points():

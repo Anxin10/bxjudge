@@ -2,12 +2,11 @@
 
 A calibration is a JSON file plus a reference-frame PNG. ``calibration_similarity``
 compares a video frame with the reference frame (inside the stadium polygon only) so a
-moved camera is detected (``find_calibration`` returns ``None``).
+moved camera is detected; per-video selection lives in ``calibration_store.select_snapshot``.
 """
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 from dataclasses import asdict, replace
@@ -18,8 +17,6 @@ import numpy as np
 
 from bxjudge.geometry import RIM_BLUR_SIGMA, RIM_MASK_MARGIN, rim_mask
 from bxjudge.types import Calibration, Polygon
-
-log = logging.getLogger(__name__)
 
 SIM_WIDTH = 320  # similarity is computed on frames downscaled to this width
 
@@ -121,22 +118,6 @@ def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:
     if denom < 1e-6:
         return 0.0
     return float(np.clip((a * b).sum() / denom, 0.0, 1.0))
-
-
-def find_calibration(frame: np.ndarray, calib_dir: Path, min_similarity: float) -> Calibration | None:
-    """Best-matching calibration in ``calib_dir`` (``*.json``) with similarity >= ``min_similarity``."""
-    best: Calibration | None = None
-    best_sim = -1.0
-    for p in sorted(Path(calib_dir).glob("*.json")):
-        try:
-            c = load_calibration(p)
-            sim = calibration_similarity(frame, c)
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            log.warning("skipping calibration %s: %s", p, e)
-            continue
-        if sim >= min_similarity and sim > best_sim:
-            best, best_sim = c, sim
-    return best
 
 
 # --------------------------------------------------------------------------- frame grab

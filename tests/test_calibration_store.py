@@ -191,6 +191,92 @@ def test_removed_template_makes_its_auto_snapshot_ineligible(tmp_path):
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config()) is None
 
 
+# ---- template set (ruling F-2) ---------------------------------------------------------
+
+
+def _noisy_template_and_better_one(tmp_path):
+    """calib/ with a noisy (worse-aligning) template A_old; returns (calib, out, frame, add_b)
+    where add_b() adds template B_new, a better match for the frame (manual similarity < 0.8)."""
+    from tests.helpers import add_manual_calibration
+
+    calib, out = tmp_path / "calib", tmp_path / "out"
+    img_a, cal_a = stadium_scene()
+    noisy = np.clip(img_a + np.random.default_rng(1).normal(0, 45, img_a.shape), 0, 255)
+    add_manual_calibration(calib, (noisy.astype(np.uint8), cal_a), name="A_old")
+    frame = stadium_scene(shift=(45, 20))[0]
+    return calib, out, frame, lambda: add_manual_calibration(
+        calib, stadium_scene(shift=(37, 15)), name="B_new")
+
+
+def test_auto_snapshot_records_the_sorted_template_set(tmp_path):
+    calib, out, frame, add_b = _noisy_template_and_better_one(tmp_path)
+    add_b()
+    ids = sorted(select_snapshot(img, calib, tmp_path / "ids", th(), load_autocalib_config()).id
+                 for img in (cv2.imread(str(calib / "A_old.png")),
+                             cv2.imread(str(calib / "B_new.png"))))
+    s = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert s.kind == "auto" and s.template_set == tuple(ids)
+    doc = json.loads((out / "calibrations" / f"{s.id}.json").read_text())
+    assert doc["snapshot"]["template_set"] == ids
+    assert load_snapshot(out, s.id).template_set == tuple(ids)
+
+
+def test_template_set_is_part_of_an_auto_snapshot_identity(tmp_path):
+    img, c = stadium_scene()
+    a = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id="a" * 16,
+                      template_set=["a" * 16])
+    b = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id="a" * 16,
+                      template_set=["b" * 16, "a" * 16])
+    assert a.id != b.id and b.template_set == ("a" * 16, "b" * 16)
+
+
+def test_added_better_template_replaces_an_existing_auto_snapshot(tmp_path):
+    """Final review I2 probe: spec 6.1 (best over all templates) and 6.3b item 4."""
+    calib, out, frame, add_b = _noisy_template_and_better_one(tmp_path)
+    cfg = load_autocalib_config()
+    first = select_snapshot(frame, calib, out, th(), cfg)
+    assert first.kind == "auto" and first.calibration.name == "auto-A_old"
+    add_b()
+    b_id = select_snapshot(cv2.imread(str(calib / "B_new.png")), calib, tmp_path / "ids", th(),
+                           cfg).id
+    second = select_snapshot(frame, calib, out, th(), cfg)
+    assert second.kind == "auto" and second.id != first.id
+    assert second.template_id == b_id and second.calibration.name == "auto-B_new"
+    assert second.score > first.score
+    # unchanged template set: the new auto snapshot is reused (grouping still works)
+    assert select_snapshot(frame, calib, out, th(), cfg).id == second.id
+    neighbour = stadium_scene(shift=(46, 21))[0]
+    assert select_snapshot(neighbour, calib, out, th(), cfg).id == second.id
+
+
+def test_removing_an_unrelated_template_forces_a_fresh_alignment(tmp_path):
+    from tests.helpers import add_manual_calibration
+
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    add_manual_calibration(calib, stadium_scene(rotation_deg=30.0), name="other")
+    frame = stadium_scene(shift=(45, 20))[0]
+    a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert a.kind == "auto" and a.calibration.name == "auto-scene"
+    (calib / "other.json").unlink()
+    b = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert b.kind == "auto" and b.id != a.id and b.template_id == a.template_id
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).id == b.id
+
+
+def test_adding_a_template_keeps_a_vetoed_group_barred_for_its_template(tmp_path):
+    """Ruling T4-4 survives F-2: a template change elsewhere does not re-create a vetoed
+    group from the same (unchanged) template under a new id."""
+    from tests.helpers import add_manual_calibration
+
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20))[0]
+    a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    veto_calibration(out, a.id)
+    add_manual_calibration(calib, stadium_scene(rotation_deg=30.0), name="other")  # cannot align
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config(),
+                           vetoed_ids(out)) is None
+
+
 # ---- vetoes (Task 4, ruling T4-1) ------------------------------------------------------
 
 

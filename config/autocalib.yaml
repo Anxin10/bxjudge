@@ -19,5 +19,9 @@ max_perspective: 0.0005
 # ECC refinement termination: iteration cap per pyramid level and correlation-increment epsilon.
 ecc_iterations: 200
 ecc_epsilon: 1.0e-6
+# Review band (ruling F-1): rounds judged with an AUTO snapshot whose alignment score is below
+# this (but >= min_score, else it is not used at all) get needs_review with reason
+# calibration_low_score. Manual calibrations are unaffected. Must lie in [min_score, 1].
+auto_review_score: 0.75
 # Acceptance threshold for the mean boundary error between auto and manual zones (inference px).
 max_boundary_error_px: 8.0

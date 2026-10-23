@@ -171,7 +171,7 @@ class Metrics:
     finish_accuracy_unflagged_coverage: float = NAN
     # Calibration (spec 6.6b): vetoed / failed calibrations never leave the population.
     n_vetoed_rounds: int = 0  # real rounds judged with a vetoed snapshot (reviewed or not)
-    n_recalibrate_videos: int = 0  # videos whose result is a ``recalibrate`` placeholder
+    n_recalibrate_videos: int = 0  # videos whose calibration selection failed (recalibrate)
     n_vetoed_groups: int = 0  # vetoed calibration snapshots
     n_vetoed_videos: int = 0  # videos recorded (videos.json) with a vetoed snapshot
     coverage: float = NAN  # videos judged with a non-vetoed snapshot / all videos in videos.json
@@ -180,6 +180,8 @@ class Metrics:
 
 # A video whose rows are only these placeholders was not judged, whatever snapshot it recorded.
 _FAILED_REASONS = frozenset({"recalibrate", "decode_error", "analysis_error"})
+# Failures that are not a calibration failure (their videos.json calibration is None as well).
+_NON_CALIBRATION_FAILURES = frozenset({"decode_error", "analysis_error"})
 
 
 def _vetoed_pending(row: dict, vetoed: set[str]) -> bool:
@@ -193,7 +195,13 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
     (video level: they have no round, R53), effective coverage = videos of ``videos.json``
     judged with a recorded, non-vetoed snapshot (and not only failure placeholders) / all of
     them (nan without ``videos.json``), and pending = recalibrate + vetoed videos. Vetoed
-    videos come from ``videos.json`` (else, without it, from the vetoed rows)."""
+    videos come from ``videos.json`` (else, without it, from the vetoed rows).
+
+    ``recalibrate`` videos are those with a ``recalibrate`` placeholder row plus, from
+    ``videos.json``, every video whose latest analysis recorded ``"calibration": null`` without
+    a ``decode_error`` / ``analysis_error`` row (final review T4-M4: a reviewed round 1 is kept
+    on reanalysis, so the colliding round-1 placeholder is dropped and the failure would
+    otherwise vanish from the counts)."""
     vetoed = set(vetoed or ())
     real = real_rows(rows)
     vetoed_rows = [r for r in real if r.get("calibration_id") in vetoed]
@@ -212,6 +220,11 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
         covered: list[str] = []
         total = 0
     else:
+        other_failure = {v for v, rs in reasons.items()
+                         if any(_NON_CALIBRATION_FAILURES & s for s in rs)}
+        recal |= {v for v, e in timings.items()
+                  if isinstance(e, dict) and "calibration" in e and e["calibration"] is None
+                  and v not in other_failure}
         vetoed_videos = {v for v, e in timings.items() if recorded(e) in vetoed}
         covered = sorted(v for v, e in timings.items() if recorded(e) is not None
                          and recorded(e) not in vetoed and v not in failed)

@@ -29,13 +29,15 @@ def _kw(tmp_path):
     return {"out_dir": tmp_path / "out", "autocalib": _ac()}
 
 
-def _snapshot(c, sid="0123456789abcdef"):
+def _snapshot(c, sid="0123456789abcdef", kind="manual", score=0.95):
     from bxjudge.calibration_store import Snapshot
 
-    return Snapshot(sid, "manual", c, 0.95, None, "calib/test.json", "0" * 64, None)
+    if kind == "auto":
+        return Snapshot(sid, "auto", c, score, "f" * 16, None, None, None)
+    return Snapshot(sid, "manual", c, score, None, "calib/test.json", "0" * 64, None)
 
 
-def calibrated(monkeypatch, tmp_path, *, tracks=None):
+def calibrated(monkeypatch, tmp_path, *, tracks=None, snap_kind="manual", snap_score=0.95):
     c = cal_with(make_ref_img(), tmp_path)
     frame = np.zeros((720, 1280, 3), np.uint8)
     calls = []
@@ -46,7 +48,8 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None):
             yield f, frame
 
     monkeypatch.setattr(pipeline, "iter_frames", frames)
-    monkeypatch.setattr(pipeline, "select_snapshot", lambda frame, *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "select_snapshot",
+                        lambda frame, *a: _snapshot(c, kind=snap_kind, score=snap_score))
     monkeypatch.setattr(pipeline, "write_preview", lambda out_dir, snap: None)
 
     def measured(frames, scaled, ref):
@@ -207,7 +210,8 @@ def _gate_round(monkeypatch, tmp_path, th, rules, **change):
         make_track(1, "bey", {f: (360, 360) for f in range(120)}),
         make_track(2, "bey", {f: (900, 360) for f in range(120)}),
     ]
-    calibrated(monkeypatch, tmp_path, tracks=tracks)
+    calibrated(monkeypatch, tmp_path, tracks=tracks,
+               **{k: change[k] for k in ("snap_kind", "snap_score") if k in change})
     launch = LaunchCheck(
         {"X": "no", "B": "no", **change.get("touch", {})},
         {"X": True, "B": True},
@@ -244,6 +248,26 @@ def test_confident_known_round_with_informational_notes_is_not_review(
     assert "shake_by_bey_impact@5" in r.review_reasons
     assert "X_stop_still" in r.review_reasons
     assert r.needs_review is False
+
+
+@pytest.mark.parametrize(
+    "kind, offset, flagged",
+    [
+        ("auto", -0.01, True),  # below the review band: review-triggering, not informational
+        ("auto", 0.0, False),  # at the band
+        ("auto", 0.1, False),
+        ("manual", -0.5, False),  # manual snapshots are never flagged by the band
+    ],
+)
+def test_auto_calibration_below_review_band_requires_review(
+    monkeypatch, tmp_path, th, rules, kind, offset, flagged
+):
+    """Ruling F-1: a round judged with an auto snapshot scoring below auto_review_score
+    gets needs_review with reason calibration_low_score; an otherwise clean round."""
+    score = _ac().auto_review_score + offset
+    r = _gate_round(monkeypatch, tmp_path, th, rules, snap_kind=kind, snap_score=score)
+    assert ("calibration_low_score" in r.review_reasons) is flagged
+    assert r.needs_review is flagged
 
 
 def test_confidence_at_threshold_is_not_review(monkeypatch, tmp_path, th, rules):
@@ -1049,7 +1073,8 @@ def _run(videos, calib, out, rules, detector=None, **kw):
     from tests.helpers import FakeDetector
 
     pipeline.run_batch(videos, calib, out, detector=detector or FakeDetector(),
-                       th=kw.pop("th", _cpu_th()), rules=rules, autocalib=_ac(), **kw)
+                       th=kw.pop("th", _cpu_th()), rules=rules,
+                       autocalib=kw.pop("autocalib", _ac()), **kw)
 
 
 def _confirm_reviewed(out, video, round_no, rules):
@@ -1078,6 +1103,34 @@ def test_moved_camera_is_judged_with_auto_snapshot_and_recorded(tmp_path, rules)
     assert not list(calib.glob("auto*"))  # auto results never go into calib/
 
 
+@pytest.mark.parametrize("band, flagged", [(1.0, True), (None, False)])
+def test_run_flags_rounds_of_a_low_scoring_auto_snapshot(tmp_path, rules, band, flagged):
+    """Ruling F-1 end to end: the synthetic clip aligns at ~0.99 (< 1); a band of 1.0 flags
+    every real round, the shipped band (0.75) does not; manual rounds are never flagged."""
+    from dataclasses import replace
+
+    from tests.helpers import stadium_scene, write_scene_video
+
+    videos, calib, out = _clip_setup(tmp_path)
+    write_scene_video(videos / "still.mp4", stadium_scene()[0], seconds=3.0, fps=30)
+    ac = _ac() if band is None else replace(_ac(), auto_review_score=band)
+    _run(videos, calib, out, rules, autocalib=ac)
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip.mp4"]["calibration"]["kind"] == "auto"
+    assert _ac().auto_review_score < v["clip.mp4"]["calibration"]["score"] < 1.0
+    assert v["still.mp4"]["calibration"]["kind"] == "manual"
+    rows = json.loads((out / "rounds.json").read_text())
+    auto_rows = [r for r in rows if r["video"] == "clip.mp4"]
+    manual_rows = [r for r in rows if r["video"] == "still.mp4"]
+    assert auto_rows and manual_rows
+    assert not any(is_not_a_round(r["review_reasons"]) for r in rows)
+    for r in auto_rows:
+        assert ("calibration_low_score" in r["review_reasons"]) is flagged
+        if flagged:
+            assert r["needs_review"] is True
+    assert not any("calibration_low_score" in r["review_reasons"] for r in manual_rows)
+
+
 def test_adding_a_manual_calibration_reanalyses_an_auto_video(tmp_path, rules, monkeypatch):
     from tests.helpers import add_manual_calibration, stadium_scene
 
@@ -1097,6 +1150,44 @@ def test_adding_a_manual_calibration_reanalyses_an_auto_video(tmp_path, rules, m
     assert v["calibration"]["template_id"] is None and v["calibration"]["score"] >= 0.8
     rows = json.loads((out / "rounds.json").read_text())
     assert {r["calibration_id"] for r in rows} == {v["calibration"]["id"]}
+
+
+def test_added_better_template_rejudges_an_auto_video_once(tmp_path, rules, monkeypatch):
+    """Final review I2 probe (ruling F-2): run 1 has only a noisy template A (auto 0.973);
+    adding template B (manual similarity 0.639, alignment 0.996) gives a new auto snapshot
+    from B and the video is re-judged on the next run; a further run reuses it."""
+    import cv2
+
+    from bxjudge.calibration_store import select_snapshot
+    from tests.helpers import add_manual_calibration, stadium_scene, write_scene_video
+
+    videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
+    videos.mkdir()
+    write_scene_video(videos / "clip.mp4", stadium_scene(shift=(45, 20))[0])
+    img_a, cal_a = stadium_scene()
+    noisy = np.clip(img_a + np.random.default_rng(1).normal(0, 45, img_a.shape), 0, 255)
+    add_manual_calibration(calib, (noisy.astype(np.uint8), cal_a), name="A_old")
+    _run(videos, calib, out, rules)
+    rec1 = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]
+    assert rec1["kind"] == "auto" and rec1["name"] == "auto-A_old"
+
+    add_manual_calibration(calib, stadium_scene(shift=(37, 15)), name="B_new")
+    b_id = select_snapshot(cv2.imread(str(calib / "B_new.png")), calib, tmp_path / "ids",
+                           _cpu_th(), _ac()).id
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)
+    assert spy.videos == {"clip.mp4"}
+    rec2 = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]
+    assert rec2["kind"] == "auto" and rec2["name"] == "auto-B_new"
+    assert rec2["id"] != rec1["id"] and rec2["template_id"] == b_id
+    assert rec2["score"] > rec1["score"]
+    rows = json.loads((out / "rounds.json").read_text())
+    assert rows and {r["calibration_id"] for r in rows} == {rec2["id"]}
+
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)  # template set unchanged: reused, nothing re-judged
+    assert spy.videos == set()
+    assert json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"] == rec2
 
 
 def test_unchanged_calibration_is_not_reanalysed(tmp_path, rules, monkeypatch):
@@ -1414,6 +1505,27 @@ def test_unveto_then_rerun_keeps_the_rounds(tmp_path, rules, rerun_while_vetoed)
     assert rows == before_rows
     assert {(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]} == {
         ("clip.mp4", 1), ("clip2.mp4", 1)}
+
+
+def test_reviewed_video_whose_calibration_later_fails_stays_in_the_failure_counts(
+    tmp_path, rules
+):
+    """Final review T4-M4 probe: a reviewed round 1, then the template disappears; the
+    recalibrate placeholder collides with the kept reviewed row, but the video must still be
+    counted as recalibrate / pending by the evaluation (video level, videos.json)."""
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    _confirm_reviewed(out, "clip.mp4", 1, rules)
+    before = _eval(out)
+    assert (before.n_recalibrate_videos, before.n_pending_videos, before.coverage) == (0, 0, 1.0)
+    (calib / "scene.json").unlink()
+    _run(videos, calib, out, rules)
+    rows = json.loads((out / "rounds.json").read_text())
+    assert [(r["round"], r["reviewed"]) for r in rows] == [(1, True)]  # the reviewed row is kept
+    assert json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"] is None
+    after = _eval(out)
+    assert after.n_rounds == before.n_rounds
+    assert (after.n_recalibrate_videos, after.n_pending_videos, after.coverage) == (1, 1, 0.0)
 
 
 def test_placeholder_only_result_removes_the_processed_record_so_recovery_rejudges(

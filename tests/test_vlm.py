@@ -760,6 +760,43 @@ def test_vlm_row_without_record_is_unavailable_and_batch_continues(tmp_path, mon
     assert summary["answered"] == 1 and summary["unavailable"] == 2
 
 
+def test_vlm_never_sends_vetoed_zones_and_other_rows_continue(tmp_path, monkeypatch, rules, th):
+    """Ruling T5-2: an unreviewed row judged with a vetoed auto snapshot gets
+    ``vlm_unavailable: calibration vetoed`` and its zones are never drawn or sent."""
+    from bxjudge.calibration_store import veto_calibration
+
+    out = tmp_path / "out"
+    bad, good = _snapshot(out, seed=0).id, _snapshot(out, seed=1).id
+    assert bad != good
+    rows = []
+    for video, sid in (("bad.mp4", bad), ("good.mp4", good)):
+        r = res(video, 1, finish="spin", winner="X", needs_review=True, reasons=["id_swap_risk"],
+                t_launch=0.5)
+        r.t_end = 1.0
+        r.calibration_id = sid
+        rows.append(r)
+    output.write_results(rows, out, rules)
+    for video in ("bad.mp4", "good.mp4"):
+        source = make_video(tmp_path / video, seconds=2, fps=30, size=(320, 180))
+        output.record_video_timing(out, video, 2.0, 1.0, source_video=source)
+    veto_calibration(out, bad, rules=rules)
+    drawn = []
+    real_frames = vlm.event_frames
+
+    def frames(source, t, snapshot, config, th_):
+        drawn.append(snapshot.id)
+        return real_frames(source, t, snapshot, config, th_)
+
+    monkeypatch.setattr(vlm, "event_frames", frames)
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"over_left","reason":"r"}'))
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg(frames=3))
+    notes = {r["video"]: r.get("vlm_note") for r in output.read_rounds(out)}
+    assert notes["bad.mp4"] == "vlm_unavailable: calibration vetoed"
+    assert notes["good.mp4"].startswith(f"[{PRIMARY}]")
+    assert drawn == [good]  # the vetoed snapshot's zones were never drawn / sent
+    assert summary["answered"] == 1 and summary["unavailable"] == 1
+
+
 def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypatch, rules, th):
     source = tmp_path / "a.mp4"
     source.write_bytes(b"")

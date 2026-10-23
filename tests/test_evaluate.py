@@ -12,6 +12,7 @@ from bxjudge.cli import main
 from bxjudge.evaluate import (
     METRIC_NAMES,
     Metrics,
+    calibration_coverage,
     derive_shake,
     derive_shake_px,
     error_groups,
@@ -1129,6 +1130,27 @@ def test_failed_analysis_with_a_snapshot_is_not_coverage():
     m = evaluate(rows, timings=timings, vetoed=set())
     assert m.coverage == pytest.approx(1 / 3)
     assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 1
+
+
+def test_reviewed_video_whose_calibration_later_fails_stays_counted():
+    """T4-M4: the recalibrate placeholder (round 1) collided with the reviewed round 1 and was
+    dropped; videos.json (calibration None) still counts the video as recalibrate/pending."""
+    timings = videos_with_calibration({"a": None, "b": "S1"})
+    rows = [rev(video="a.mp4", calibration_id="S1"), rev(video="b.mp4", calibration_id="S1")]
+    m = evaluate(rows, timings=timings, vetoed=set())
+    assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 1
+    assert m.coverage == pytest.approx(0.5)
+    cal = calibration_coverage(rows, timings, set())
+    assert cal["recalibrate_videos"] == ["a.mp4"] and cal["pending_videos"] == ["a.mp4"]
+
+
+def test_video_level_recalibrate_excludes_other_failures_and_unrecorded_videos():
+    timings = videos_with_calibration({"d": None, "e": "S1"})
+    timings["old.mp4"] = {"duration_s": 10.0, "processing_s": 5.0}  # no calibration key at all
+    rows = [placeholder("d.mp4", "decode_error"), rev(video="e.mp4", calibration_id="S1"),
+            rev(video="old.mp4")]
+    m = evaluate(rows, timings=timings, vetoed=set())
+    assert m.n_recalibrate_videos == 0 and m.n_pending_videos == 0
 
 
 def test_cli_eval_reports_calibration_section(tmp_path):

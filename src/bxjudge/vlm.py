@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import closing
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -31,7 +32,7 @@ import numpy as np
 import yaml
 
 from .calibration import ZONES, scale_calibration
-from .calibration_store import Snapshot, load_snapshot
+from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds, config_loader
 from .manifest import probe
 from .output import record_vlm_timing, row_to_result, write_results
@@ -43,6 +44,7 @@ log = logging.getLogger(__name__)
 
 UNAVAILABLE_PREFIX = "vlm_unavailable: "
 NO_CALIBRATION_RECORD = "no calibration record"  # spec 6.5b: never guess the zones
+CALIBRATION_VETOED = "calibration vetoed"  # ruling T5-2: vetoed zones are untrusted (6.5)
 
 TOUCH_QUESTION = "發射時是否有發射器或手碰到盤面？是哪一側？"
 FINAL_QUESTION = "左方開始的陀螺最後停在哪個區域，還是先停止旋轉？"
@@ -85,6 +87,11 @@ class VlmFramesError(RuntimeError):
 class NoCalibrationRecord(VlmFramesError):
     """The row has no recorded calibration snapshot (no ``calibration_id``, or its snapshot
     file is missing): the zones are not guessed (spec section 6.5b)."""
+
+
+class CalibrationVetoed(VlmFramesError):
+    """The row was judged with a vetoed calibration snapshot: its zones are untrusted (spec
+    section 6.5), so they are never drawn or sent to the model (ruling T5-2)."""
 
 
 @dataclass(frozen=True)
@@ -533,6 +540,9 @@ def _note(r: RoundResult, get_frames, session: VlmSession) -> str:
     except NoCalibrationRecord as error:
         log.warning("no calibration record for %s round %s: %s", r.video, r.round, error)
         return f"{UNAVAILABLE_PREFIX}{NO_CALIBRATION_RECORD}"
+    except CalibrationVetoed:
+        log.info("calibration of %s round %s is vetoed: not asking the VLM", r.video, r.round)
+        return f"{UNAVAILABLE_PREFIX}{CALIBRATION_VETOED}"
     except Exception as error:  # noqa: BLE001 - any frame failure is noted; the batch continues
         log.warning("frames unavailable for %s round %s: %s", r.video, r.round, _describe(error))
         return f"{UNAVAILABLE_PREFIX}frames: {_describe(error)}"
@@ -666,12 +676,16 @@ def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None
         write_results(snapshot, out_dir, rules)
 
 
-def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot]) -> Snapshot:
+def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot],
+                  vetoed: AbstractSet[str] = frozenset()) -> Snapshot:
     """The recorded snapshot ``r`` was judged with; ``NoCalibrationRecord`` when the row has no
-    ``calibration_id`` or its snapshot file is missing (never re-selected from ``calib/``)."""
+    ``calibration_id`` or its snapshot file is missing (never re-selected from ``calib/``);
+    ``CalibrationVetoed`` when that snapshot is in ``vetoed`` (ruling T5-2)."""
     sid = r.calibration_id
     if not sid:
         raise NoCalibrationRecord(f"{r.video} round {r.round} has no calibration_id")
+    if sid in vetoed:
+        raise CalibrationVetoed(f"{r.video} round {r.round}: calibration {sid} is vetoed")
     if sid not in cache:
         try:
             cache[sid] = load_snapshot(out_dir, sid)
@@ -692,7 +706,9 @@ def review_results_dir(
 
     Source media come only from the absolute ``source_video`` in ``videos.json`` and the zones
     only from each row's recorded calibration snapshot (``calibration_id``); a row without
-    one gets ``vlm_unavailable: no calibration record`` and the batch continues. Each
+    one gets ``vlm_unavailable: no calibration record``, and a row whose snapshot is vetoed
+    (``calibration_vetoes.json``) gets ``vlm_unavailable: calibration vetoed`` without its
+    zones being drawn or sent (ruling T5-2); the batch continues. Each
     video's notes are persisted through ``write_results`` as a complete snapshot and its
     VLM time is recorded as ``vlm_s`` beside the core ``processing_s``.
     """
@@ -722,6 +738,7 @@ def review_results_dir(
             summary["unavailable"] += len(asked)
         return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
     snapshots: dict[str, Snapshot] = {}
+    vetoed = vetoed_ids(out_dir)
     try:
         for video in targets:
             results = by_video[video]
@@ -729,7 +746,7 @@ def review_results_dir(
             source = recorded_source(timing.get(video))
 
             def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
-                snapshot = _row_snapshot(out_dir, r, snapshots)
+                snapshot = _row_snapshot(out_dir, r, snapshots, vetoed)
                 if isinstance(source, str):
                     raise VlmFramesError(source)
                 return event_frames(source, event_time(r), snapshot, session.config, th)

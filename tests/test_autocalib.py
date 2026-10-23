@@ -65,12 +65,14 @@ def test_config_loads_shipped_values():
     assert (c.work_width, c.min_score, c.max_shift_frac, c.max_rotation_deg) == (640, 0.6, 0.15, 8.0)
     assert (c.min_scale, c.max_scale, c.max_perspective) == (0.85, 1.15, 0.0005)
     assert (c.ecc_iterations, c.ecc_epsilon, c.max_boundary_error_px) == (200, 1.0e-6, 8.0)
+    assert c.auto_review_score == 0.75  # ruling F-1: review band above min_score
 
 
 @pytest.mark.parametrize("key, value", [
     ("min_score", "1.5"), ("min_score", "-0.1"), ("min_scale", "1.2"), ("max_scale", "0.85"),
     ("max_perspective", ".nan"), ("ecc_epsilon", ".inf"), ("work_width", "640.0"),
     ("ecc_iterations", "true"), ("extra_key", "1"),
+    ("auto_review_score", "0.59"), ("auto_review_score", "1.01"), ("auto_review_score", ".nan"),
 ])
 def test_config_rejects_each_bad_value(tmp_path, key, value):
     from pathlib import Path

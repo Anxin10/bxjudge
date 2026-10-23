@@ -6,16 +6,19 @@ identical content always gets the same id and a later edit of ``calib/`` never c
 result used (spec §6.4). A manual snapshot's identity is its polygons, name, size, source-file
 hash and image: the per-video similarity is *not* part of it (it is returned on the Snapshot and
 recorded per video), so one manual calibration has exactly one id. An auto snapshot's alignment
-score is fixed at creation and shared by its group, so it is part of its identity. The JSON is a normal calibration file (``calibration.load_calibration``
-reads it; ``ref_frame`` is stored relative to it so a moved results folder still loads) plus a
-``snapshot`` block with the kind, score, template id, manual source hash and homography.
+score is fixed at creation and shared by its group, so it is part of its identity, as is its
+``template_set`` (ruling F-2): the sorted manual snapshot ids of every readable template in
+``calib/`` when it was created. The JSON is a normal calibration file
+(``calibration.load_calibration`` reads it; ``ref_frame`` is stored relative to it so a moved
+results folder still loads) plus a ``snapshot`` block with the kind, score, template id,
+template set, manual source hash and homography.
 
 ``select_snapshot`` picks the calibration for a video's first-second frame: a manual calibration
 with enough similarity first (used unrefined, spec §6.5c), else an existing auto snapshot at the
-same camera position (the grouping, spec §6.3; only while the template it came from is still
-present and unchanged in ``calib/``), else a new auto snapshot made by aligning the
-best manual template to the frame (spec §6.1/§6.2b: its reference image is the frame itself),
-else ``None`` (the video is ``recalibrate``).
+same camera position (the grouping, spec §6.3; only while the template set in ``calib/`` is
+exactly the one it was created with, ruling F-2), else a new auto snapshot made by aligning
+every manual template to the frame and keeping the best (spec §6.1/§6.2b: its reference image
+is the frame itself), else ``None`` (the video is ``recalibrate``).
 
 A reviewer can veto an auto snapshot (``veto_calibration``; spec section 6.5, ruling T4-1): the
 veto lives in ``<results>/calibration_vetoes.json``, keyed by snapshot id, and is honoured by
@@ -27,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Iterable
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -62,6 +66,8 @@ class Snapshot:
     source_path: str | None  # manual: the calib/ JSON it was copied from
     source_sha256: str | None  # manual: SHA-256 of that JSON's bytes
     homography: tuple | None  # auto: 3x3 template px -> frame px
+    # auto: sorted manual snapshot ids of all readable calib/ templates at creation (F-2)
+    template_set: tuple[str, ...] | None = None
 
 
 def _cal_dir(out_dir: Path) -> Path:
@@ -69,7 +75,8 @@ def _cal_dir(out_dir: Path) -> Path:
 
 
 def _canonical(kind: str, c: Calibration, score: float, template_id: str | None,
-               source_sha256: str | None, homography: tuple | None) -> str:
+               source_sha256: str | None, homography: tuple | None,
+               template_set: tuple[str, ...] | None) -> str:
     d = {
         "kind": kind,
         "name": c.name,
@@ -78,6 +85,7 @@ def _canonical(kind: str, c: Calibration, score: float, template_id: str | None,
                   for f in _POLY_FIELDS},
         "score": round(float(score), 4) if kind == "auto" else None,
         "template_id": template_id,
+        "template_set": None if template_set is None else list(template_set),
         "source_sha256": source_sha256,
         "homography": None if homography is None
         else [[round(float(v), 9) for v in row] for row in homography],
@@ -97,24 +105,30 @@ def _sha256_file(path: Path) -> str:
 
 
 def _snapshot_id(kind: str, c: Calibration, score: float, template_id: str | None,
-                 source_sha256: str | None, homography: tuple | None, png: bytes) -> str:
-    canon = _canonical(kind, c, score, template_id, source_sha256, homography)
+                 source_sha256: str | None, homography: tuple | None, png: bytes,
+                 template_set: tuple[str, ...] | None = None) -> str:
+    canon = _canonical(kind, c, score, template_id, source_sha256, homography, template_set)
     return hashlib.sha256(canon.encode("utf-8") + png).hexdigest()[:_ID_LEN]
 
 
 def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image: np.ndarray, *,
                   score: float, template_id: str | None = None, source_path: Path | None = None,
-                  homography: tuple | None = None) -> Snapshot:
+                  homography: tuple | None = None,
+                  template_set: Iterable[str] | None = None) -> Snapshot:
     """Write the snapshot of ``calibration`` with reference image ``ref_image`` and return it.
     Idempotent: identical content gives the same id and an existing snapshot is never rewritten.
     For a manual snapshot ``score`` (the per-video similarity) is not part of the identity: it is
-    returned on the Snapshot but the stored file keeps a fixed value."""
+    returned on the Snapshot but the stored file keeps a fixed value. ``template_set`` (auto
+    only, stored sorted) is part of the identity (ruling F-2)."""
     if kind not in _KINDS:
         raise ValueError(f"snapshot kind must be one of {_KINDS}, got {kind!r}")
+    if kind == "manual" and template_set is not None:
+        raise ValueError("a manual snapshot has no template_set")
+    tset = None if template_set is None else tuple(sorted(set(template_set)))
     png = _encode_png(ref_image)
     sha = _sha256_file(source_path) if source_path is not None else None
     hom = None if homography is None else tuple(tuple(float(v) for v in row) for row in homography)
-    sid = _snapshot_id(kind, calibration, score, template_id, sha, hom, png)
+    sid = _snapshot_id(kind, calibration, score, template_id, sha, hom, png, tset)
     stored_score = float(score) if kind == "auto" else _MANUAL_STORED_SCORE
     d = _cal_dir(out_dir)
     jpath, ppath = d / f"{sid}.json", d / f"{sid}.png"
@@ -128,6 +142,7 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
             "ref_frame": ppath.name,
             "snapshot": {
                 "id": sid, "kind": kind, "score": stored_score, "template_id": template_id,
+                "template_set": None if tset is None else list(tset),
                 "source_path": None if source_path is None else str(source_path),
                 "source_sha256": sha,
                 "homography": None if hom is None else [list(r) for r in hom],
@@ -150,11 +165,13 @@ def load_snapshot(out_dir: Path, snapshot_id: str) -> Snapshot:
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}: {jpath}")
     meta = json.loads(jpath.read_text(encoding="utf-8"))["snapshot"]
     hom = meta.get("homography")
+    tset = meta.get("template_set")
     return Snapshot(
         id=meta["id"], kind=meta["kind"], calibration=load_calibration(jpath),
         score=float(meta["score"]), template_id=meta.get("template_id"),
         source_path=meta.get("source_path"), source_sha256=meta.get("source_sha256"),
         homography=None if hom is None else tuple(tuple(float(v) for v in r) for r in hom),
+        template_set=None if tset is None else tuple(str(t) for t in tset),
     )
 
 
@@ -205,19 +222,24 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
 
     Order: (1) the best manual calibration in ``calib_dir`` with similarity >=
     ``th.calibration_min_similarity``; (2) the best existing auto snapshot in ``out_dir`` with
-    similarity >= that threshold (same camera position = same snapshot) and whose template is
-    still present, readable and unchanged in ``calib_dir`` (an edited or removed template makes
-    its auto snapshots ineligible, so a fresh alignment gives a new id); (3) a new auto snapshot
-    from the template with the best alignment score >= ``cfg.min_score``, whose reference image
-    is ``frame`` itself; (4) ``None``. Broken templates are skipped with a warning.
+    similarity >= that threshold (same camera position = same snapshot) whose ``template_set``
+    equals the current set of readable template ids in ``calib_dir`` (ruling F-2: adding,
+    removing or editing any template makes every older auto snapshot ineligible, so the frame
+    is re-aligned against all templates, the best wins, and a changed result gets a new id);
+    (3) a new auto snapshot from the template with the best alignment score >=
+    ``cfg.min_score``, whose reference image is ``frame`` itself and which records the current
+    template set; (4) ``None``. Broken templates are skipped with a warning.
 
     ``vetoed`` (ruling T4-1; vetoes apply to auto snapshots only, manual selection is unchanged):
     a vetoed auto snapshot is never reused, a fresh alignment whose id is vetoed gives ``None``,
     and a template is not re-aligned at a camera position one of its vetoed auto snapshots
     covers (same similarity test as reuse), so a vetoed group stays ``recalibrate`` until a
     manual calibration or a changed/new template applies, instead of being re-created from
-    another video of the same group under a new id."""
+    another video of the same group under a new id. Barring follows the template itself
+    (its id still present in ``calib_dir``), not the template set: a template added elsewhere
+    does not re-create a vetoed group from the same unchanged template."""
     templates = _manual_templates(calib_dir)
+    template_set = tuple(sorted({t.id for t in templates}))
 
     best_manual: _Template | None = None
     best_sim = -1.0
@@ -246,7 +268,7 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
             continue
         if s.id in vetoed:
             barred.add(s.template_id)
-        elif sim > best_sim:
+        elif s.template_set == template_set and sim > best_sim:
             best_auto, best_sim = s, sim
     if best_auto is not None:
         return best_auto
@@ -267,7 +289,8 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     h, w = frame.shape[:2]
     warped = warp_calibration(cal, best_al, (w, h), f"auto-{cal.name}")
     snap = save_snapshot(out_dir, "auto", warped, frame, score=best_al.score,
-                         template_id=template.id, homography=best_al.homography)
+                         template_id=template.id, homography=best_al.homography,
+                         template_set=template_set)
     # A vetoed id is a known snapshot, so save_snapshot wrote nothing new for it.
     return None if snap.id in vetoed else snap
 

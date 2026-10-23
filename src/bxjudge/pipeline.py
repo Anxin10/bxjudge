@@ -60,6 +60,9 @@ from .vlm import load_vlm_config, review_results_dir
 
 log = logging.getLogger(__name__)
 
+# Ruling F-1: a round judged with an auto snapshot scoring below auto_review_score.
+CALIBRATION_LOW_SCORE = "calibration_low_score"
+
 
 def _review(video: str, duration: float, reason: str) -> RoundResult:
     return RoundResult(
@@ -173,6 +176,13 @@ def judge_video(
                     [_review(info.path.name, info.duration, "recalibrate")], provenance
                 )
             write_preview(out_dir, snap)
+            # Ruling F-1: an accepted but loosely aligned auto snapshot (min_score <= score <
+            # auto_review_score) is never scored silently. Manual snapshots are unaffected.
+            calibration_notes = (
+                [CALIBRATION_LOW_SCORE]
+                if snap.kind == "auto" and snap.score < autocalib.auto_review_score
+                else []
+            )
             c = scale_calibration(snap.calibration, (first.shape[1], first.shape[0]))
             # Ruling T3-1 (spec 6.2b): shake is measured against this video's own camera view,
             # never the snapshot's reference image (another video's frame, or the manual
@@ -284,9 +294,12 @@ def judge_video(
                 for side, reason in stop_kinds.items()
             ]
             reasons = list(
-                dict.fromkeys([*launch.notes, *finish.reasons, *stop_reasons])
+                dict.fromkeys(
+                    [*launch.notes, *finish.reasons, *stop_reasons, *calibration_notes]
+                )
             )
-            # These explain observed evidence, while reversals remain review-required.
+            # These explain observed evidence, while reversals remain review-required;
+            # calibration_low_score is not among them: it always requires review (F-1).
             uncertainty = [
                 note
                 for note in reasons

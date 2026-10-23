@@ -1,8 +1,10 @@
 """``bxjudge autocalib``: acceptance/preview tool for auto-calibration (spec 6.6)."""
 
+import json
 import re
 
 import numpy as np
+import pytest
 
 from bxjudge.calibration import save_calibration
 from bxjudge.cli import main
@@ -158,6 +160,32 @@ def test_autocalib_cli_calib_that_is_a_file_is_an_error_line(tmp_path, capsys):
     assert main(["autocalib", str(video), "--calib", str(not_a_dir),
                  "--out", str(tmp_path / "o")]) == 2
     assert capsys.readouterr().err.startswith("error: ")
+
+
+@pytest.mark.parametrize("broken", [
+    "missing_zones", "zero_frame_size", "not_a_mapping", "empty_polygon", "bad_frame_size",
+])
+def test_autocalib_cli_malformed_truth_is_an_error_line(tmp_path, capsys, broken):
+    """Final review N1: a malformed --truth file is an ``error:`` line and exit 2, never a
+    KeyError / ZeroDivisionError traceback."""
+    calib = make_calib(tmp_path)
+    video = render_video(tmp_path, stadium_scene(shift=SHIFT))
+    good = json.loads(save_truth(tmp_path, stadium_scene(shift=SHIFT)[1], "good.json").read_text())
+    doc = {
+        "missing_zones": {"name": "t", "frame_size": [1280, 720]},
+        "zero_frame_size": {**good, "frame_size": [0, 720]},
+        "not_a_mapping": [good],
+        "empty_polygon": {**good, "battle_area": []},
+        "bad_frame_size": {**good, "frame_size": 1280},
+    }[broken]
+    truth = tmp_path / "truth.json"
+    truth.write_text(json.dumps(doc))
+    code = main(["autocalib", str(video), "--calib", str(calib), "--out", str(tmp_path / "o"),
+                 "--truth", str(truth)])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.err.startswith("error: ") and "truth.json" in captured.err
+    assert "Traceback" not in captured.err and captured.out == ""
 
 
 def test_autocalib_cli_unreadable_video_is_an_error_line(tmp_path, capsys):

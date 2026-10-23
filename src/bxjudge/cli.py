@@ -166,12 +166,31 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_run)
 
 
+def _load_truth(path: Path):
+    """The ``--truth`` manual calibration; a malformed file (missing zones, wrong shapes, a
+    non-positive frame size, a polygon with fewer than 3 points) is a ``ValueError`` naming
+    the file, so the CLI prints an ``error:`` line and exits 2 (final review N1)."""
+    from bxjudge.calibration import ZONES, load_calibration
+
+    try:
+        truth = load_calibration(path)
+    except (KeyError, TypeError, AttributeError, ValueError) as e:
+        raise ValueError(f"{path}: --truth is not a calibration JSON "
+                         f"({type(e).__name__}: {e})") from None
+    if min(truth.frame_size) <= 0:
+        raise ValueError(f"{path}: --truth frame_size must be positive, "
+                         f"got {list(truth.frame_size)}")
+    short = [z for z, _en, _zh in ZONES if len(getattr(truth, z)) < 3]
+    if short:
+        raise ValueError(f"{path}: --truth polygons need >= 3 points: {short}")
+    return truth
+
+
 def _cmd_autocalib(args: argparse.Namespace) -> int:
     import sys
 
     from bxjudge import manifest
     from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
-    from bxjudge.calibration import load_calibration
     from bxjudge.calibration_store import select_snapshot, write_preview
     from bxjudge.config import load_thresholds
     from bxjudge.pipeline import first_second_frame
@@ -183,7 +202,7 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
     if not calib_dir.is_dir():  # a typo must not silently turn every video into recalibrate
         raise ValueError(f"{calib_dir}: --calib is not a folder")
     out_dir = Path(args.out).expanduser()  # scratch results folder: --calib is only ever read
-    truth = load_calibration(Path(args.truth).expanduser()) if args.truth else None
+    truth = _load_truth(Path(args.truth).expanduser()) if args.truth else None
     counts = {"PASS": 0, "FAIL": 0, "REJECTED": 0}
     errors = 0
     for video in map(Path, args.videos):

@@ -50,6 +50,7 @@ class AutoCalibConfig:
     ecc_iterations: int
     ecc_epsilon: float
     max_boundary_error_px: float
+    auto_review_score: float
 
 
 _INT_FIELDS = ("work_width", "ecc_iterations")
@@ -96,6 +97,9 @@ def load_autocalib_config(path: Path = Path("config/autocalib.yaml")) -> AutoCal
         raise ValueError(f"{path}: ecc_epsilon must be > 0, got {c.ecc_epsilon}")
     if c.max_boundary_error_px <= 0.0:
         raise ValueError(f"{path}: max_boundary_error_px must be > 0, got {c.max_boundary_error_px}")
+    if not c.min_score <= c.auto_review_score <= 1.0:
+        raise ValueError(f"{path}: auto_review_score must be in [min_score, 1] = "
+                         f"[{c.min_score}, 1], got {c.auto_review_score}")
     return c
 
 
