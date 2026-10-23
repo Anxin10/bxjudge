@@ -281,6 +281,72 @@ def test_export_rejects_cancelled_and_rotated_annotations(tmp_path):
         label_studio_to_coco(source, tmp_path / "rotated")
 
 
+def test_export_split_swaps_in_a_video_so_val_has_every_class(tmp_path):
+    from bxjudge.labeling.export import label_studio_to_coco
+    from bxjudge.labeling.sam3_prelabel import to_label_studio
+
+    # Hash order puts only "a" in val (5 videos x 0.2), but bey_part lives in d and e.
+    parts = {"a": 0, "b": 0, "c": 0, "d": 2, "e": 1}
+    tasks = []
+    for video, n_parts in parts.items():
+        image = tmp_path / f"{video}.jpg"
+        cv2.imwrite(str(image), np.zeros((50, 100, 3), np.uint8))
+        boxes = [("bey", (1, 2, 11, 12), 0.9), ("launcher", (40, 2, 50, 12), 0.9)]
+        boxes += [("bey_part", (60 + 5 * i, 30, 64 + 5 * i, 34), 0.9) for i in range(n_parts)]
+        t = to_label_studio("ignored", 100, 50, boxes)
+        t["data"].update(
+            video_id=video, video_sha256=video * 64, frame=0, image_path=str(image)
+        )
+        t["annotations"] = [{"result": t["predictions"][0]["result"]}]
+        tasks.append(t)
+    source = tmp_path / "human.json"
+    source.write_text(json.dumps(tasks))
+    out = tmp_path / "dataset"
+    label_studio_to_coco(source, out, val_ratio=0.2)
+    split = {
+        s: json.loads((out / f"annotations/instances_{s}.json").read_text())
+        for s in ("train", "val")
+    }
+    # The part holder with the fewest parts (e) replaces a; val size stays 1.
+    assert {i["video_id"] for i in split["val"]["images"]} == {"e"}
+    assert {i["video_id"] for i in split["train"]["images"]} == {"a", "b", "c", "d"}
+    for s in ("train", "val"):
+        assert {a["category_id"] for a in split[s]["annotations"]} == {1, 2, 3}
+    provenance = json.loads((out / "provenance.json").read_text())
+    assert provenance["val_class_swaps"] == [
+        {"category": "bey_part", "in": "e" * 64, "out": "a" * 64}
+    ]
+
+
+def test_export_accepts_edge_snapped_box_and_rejects_real_overflow(tmp_path):
+    from bxjudge.labeling.export import label_studio_to_coco
+    from bxjudge.labeling.sam3_prelabel import to_label_studio
+
+    image = tmp_path / "image.jpg"
+    cv2.imwrite(str(image), np.zeros((48, 64, 3), np.uint8))
+    t = to_label_studio("image", 64, 48, [("launcher", (6.4, 0.0, 25.6, 9.6), 0.9)])
+    t["data"].update(
+        video_id="a", video_sha256="a" * 64, frame=0, image_path=str(image)
+    )
+    t["annotations"] = [{"result": t["predictions"][0]["result"]}]
+    value = t["annotations"][0]["result"][0]["value"]
+    # Label Studio stores a box snapped to the top edge as a tiny negative float.
+    value["y"] = -1e-13
+    source = tmp_path / "human.json"
+    source.write_text(json.dumps([t]))
+    out = tmp_path / "snapped"
+    label_studio_to_coco(source, out)
+    [ann] = json.loads((out / "annotations/instances_train.json").read_text())[
+        "annotations"
+    ]
+    assert ann["bbox"][1] == 0.0
+    assert ann["bbox"][3] == pytest.approx(9.6)
+    value["y"] = -1.0
+    source.write_text(json.dumps([t]))
+    with pytest.raises(ValueError, match="outside image"):
+        label_studio_to_coco(source, tmp_path / "overflow")
+
+
 def test_non_square_normalized_box_roundtrip_and_local_asset(tmp_path, monkeypatch):
     from urllib.parse import parse_qs, urlparse
 

@@ -11,6 +11,42 @@ from .config import load_config
 from .sam3_prelabel import CLASSES
 
 
+def _cover_every_class(videos, val_n, reviewed):
+    """Hash-order val, then swap whole videos so val holds every class that at
+    least two videos contain (train keeps one). Rare classes otherwise land
+    entirely in train and cannot be validated."""
+    counts = {v: [0] * len(CLASSES) for v in videos}
+    for data, _, _, _, boxes in reviewed:
+        for category, _ in boxes:
+            counts[data["video_sha256"]][category - 1] += 1
+
+    def covered(vs):
+        return {c for v in vs for c in range(len(CLASSES)) if counts[v][c]}
+
+    val, swaps = list(videos[:val_n]), []
+    if not val:
+        return val, swaps
+    for c in range(len(CLASSES)):
+        holders = [v for v in videos if counts[v][c]]
+        if len(holders) < 2 or any(v in val for v in holders):
+            continue
+        incoming = min(holders, key=lambda v: (counts[v][c], v))
+        before = covered(val)
+        outgoing = next(
+            (
+                v
+                for v in reversed(val)
+                if covered([u for u in val if u != v] + [incoming]) >= before
+            ),
+            None,
+        )
+        if outgoing is not None:
+            val.remove(outgoing)
+        val.append(incoming)
+        swaps.append({"category": CLASSES[c], "in": incoming, "out": outgoing})
+    return val, swaps
+
+
 def label_studio_to_coco(
     export_json: Path, out_dir: Path, val_ratio: float | None = None
 ) -> None:
@@ -65,14 +101,17 @@ def label_studio_to_coco(
                 raise ValueError("annotation and image dimensions differ")
             x, y, bw, bh = [float(v[k]) for k in ["x", "y", "width", "height"]]
             if not all(math.isfinite(z) for z in [x, y, bw, bh]) or not (
-                0 <= x < 100
-                and 0 <= y < 100
+                -1e-6 <= x < 100
+                and -1e-6 <= y < 100
                 and bw > 0
                 and bh > 0
                 and x + bw <= 100 + 1e-6
                 and y + bh <= 100 + 1e-6
             ):
                 raise ValueError("rectangle outside image")
+            # Label Studio stores edge-snapped boxes with float noise past 0/100.
+            x, y = max(x, 0.0), max(y, 0.0)
+            bw, bh = min(bw, 100 - x), min(bh, 100 - y)
             boxes.append(
                 (
                     CLASSES.index(labels[0]) + 1,
@@ -87,7 +126,8 @@ def label_studio_to_coco(
         if ratio > 0 and len(videos) > 1
         else 0
     )
-    val_videos = set(videos[:val_n])
+    val, swaps = _cover_every_class(videos, val_n, reviewed)
+    val_videos = set(val)
     out_dir = Path(out_dir)
     if out_dir.exists() and any(out_dir.iterdir()):
         raise ValueError("output dataset directory must be empty")
@@ -98,8 +138,9 @@ def label_studio_to_coco(
     }
     provenance = {
         "source_export": str(Path(export_json).resolve()),
-        "split": "whole video, sorted video_sha256",
+        "split": "whole video, sorted video_sha256, class-covering swaps",
         "val_ratio": ratio,
+        "val_class_swaps": swaps,
         "images": [],
     }
     for image_id, (data, image, w, h, boxes) in enumerate(reviewed, 1):
