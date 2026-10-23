@@ -180,17 +180,19 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
     th = load_thresholds(Path(args.thresholds).expanduser())
     cfg = load_autocalib_config(Path(args.autocalib).expanduser())
     calib_dir = Path(args.calib).expanduser()
+    if not calib_dir.is_dir():  # a typo must not silently turn every video into recalibrate
+        raise ValueError(f"{calib_dir}: --calib is not a folder")
     out_dir = Path(args.out).expanduser()  # scratch results folder: --calib is only ever read
     truth = load_calibration(Path(args.truth).expanduser()) if args.truth else None
-    failed = errors = 0
+    counts = {"PASS": 0, "FAIL": 0, "REJECTED": 0}
+    errors = 0
     for video in map(Path, args.videos):
         video = video.expanduser()
         try:
             info = manifest.probe(video)
             frame = first_second_frame(info, th)
             snap = select_snapshot(frame, calib_dir, out_dir, th, cfg)
-            if snap is not None:
-                write_preview(out_dir, snap)
+            preview = write_preview(out_dir, snap) if snap is not None else None
         except (ValueError, OSError, VideoDecodeError) as error:
             errors += 1
             print(f"error: {video}: {error}", file=sys.stderr)
@@ -198,19 +200,24 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
         if snap is None:
             line = f"{video.name}: recalibrate name=- score=-"
         else:
-            line = f"{video.name}: {snap.kind} name={snap.calibration.name} score={snap.score:.3f}"
+            line = (f"{video.name}: {snap.kind} name={snap.calibration.name} "
+                    f"score={snap.score:.3f} id={snap.id} preview={preview}")
         if truth is not None:
-            if snap is None:  # a rejected video is the correct conservative outcome, not a FAIL
-                line += " boundary_error_px=- n/a"
+            if snap is None:  # no calibration produced: not evidence that anything aligns
+                status, shown = "REJECTED", "-"
             else:
                 err = mean_boundary_error(snap.calibration, truth, th.infer_long_edge)
-                passed = err <= cfg.max_boundary_error_px
-                failed += not passed
-                line += f" boundary_error_px={err:.2f} {'PASS' if passed else 'FAIL'}"
+                status = "PASS" if err <= cfg.max_boundary_error_px else "FAIL"
+                shown = f"{err:.2f}"
+            counts[status] += 1
+            line += f" boundary_error_px={shown} {status}"
         print(line)
+    if truth is not None:
+        print(f"PASS {counts['PASS']} / FAIL {counts['FAIL']} / REJECTED {counts['REJECTED']}")
     if errors:
         return 2
-    return 1 if failed else 0
+    rejected = counts["REJECTED"] and not args.allow_recalibrate
+    return 1 if counts["FAIL"] or rejected else 0
 
 
 def _add_autocalib(sub: argparse._SubParsersAction) -> None:
@@ -222,8 +229,13 @@ def _add_autocalib(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--calib", default="calib", help="manual calibrations (read only)")
     p.add_argument("--out", required=True,
                    help="scratch results-style folder for calibrations/<id>.json|png|preview.jpg")
-    p.add_argument("--truth", help="manual calibration JSON for these videos; prints "
-                                   "boundary_error_px and exits 1 above max_boundary_error_px")
+    p.add_argument("--truth", help="manual calibration JSON (keep it OUTSIDE --calib) applied to "
+                                   "every video given; prints boundary_error_px PASS|FAIL "
+                                   "(above max_boundary_error_px) or REJECTED (recalibrate); "
+                                   "exit 1 on any FAIL or REJECTED")
+    p.add_argument("--allow-recalibrate", action="store_true",
+                   help="with --truth: REJECTED (recalibrate) videos do not fail the run "
+                        "(transparent floors may legitimately end up recalibrate)")
     p.add_argument("--autocalib", default="config/autocalib.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.set_defaults(func=_cmd_autocalib)

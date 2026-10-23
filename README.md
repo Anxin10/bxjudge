@@ -145,23 +145,46 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
 
    ```bash
    uv run bxjudge autocalib ~/bx/videos/20261014/*.mp4 --calib calib --out runs/autocalib-check
-   # 有該機位的手動真值時，另加 --truth calib/<真值>.json 比對邊界誤差
    ```
 
-   每支影片印一行 `影片: manual|auto|recalibrate name=<校準名> score=<分數>`：
+   每支影片印一行 `影片: manual|auto|recalibrate name=<校準名> score=<分數> id=<快照 id>
+   preview=<預覽圖路徑>`（`recalibrate` 沒有快照，只印 `name=- score=-`）。`--calib` 必須是
+   存在的資料夾，否則印 `error:` 並以結束碼 2 結束；`--calib` 只讀，快照與預覽圖寫到 `--out`
+   指定的暫存資料夾（格式同結果資料夾的 `calibrations/`）。
 
    - `manual`：影片第一秒與某個手動校準相似度 ≥ `calibration_min_similarity`（0.8），
-     直接用該手動校準，不微調；`score` 是相似度。
-   - `auto`：以最接近的手動校準對齊到該影片第一秒的畫面，對位分數 ≥ `config/autocalib.yaml`
-     的 `min_score`（0.6）；`score` 是對位分數。同一機位的影片共用同一組快照。
-     預覽圖在 `<out>/calibrations/<id>.preview.jpg`：以該影片自己的第一秒畫面為底，
-     疊上全部 8 個區域的輪廓（左上角標示 kind、template、score）。**請目視確認每個輪廓都貼著
-     場地的邊（外框、過界口、極限區、發射區）**，歪掉就不要採用（見下方否決）。
-   - `recalibrate name=- score=-`：沒有任何手動校準對得上、對位也不夠可靠，判定時此影片
-     會被標成 `recalibrate`，不猜區域；為該鏡頭新增一個手動校準（第 2 步）後重跑。
-   - 有 `--truth` 時，同一行再加 `boundary_error_px=<8 區域平均邊界誤差，推論像素>
-     PASS|FAIL`（門檻 `max_boundary_error_px`，8 px）；任何 FAIL 時結束碼為 1。
-     `recalibrate` 印 `boundary_error_px=- n/a`，不算 FAIL（保守拒絕是正確結果）。
+     直接用該手動校準，不微調；`score` 是相似度，預覽圖是該手動校準自己的參考畫面。
+   - `auto`：以最接近的手動校準對齊到影片第一秒的畫面，對位分數 ≥ `config/autocalib.yaml`
+     的 `min_score`（0.6）。**同一機位的影片共用同一組快照與同一張預覽圖**（`id` 與 `preview`
+     相同）：預覽圖以該組**第一支**被處理的影片的第一秒畫面為底，`score` 是該組建立時的
+     對位分數；其他影片只知道與該組畫面的相似度 ≥ 0.8，並沒有各自對位。預覽圖疊上全部 8 個
+     區域的輪廓（左上角標示 kind、template、score）。**請開 `preview=` 指的那張圖，目視確認
+     每個輪廓都貼著場地的邊（外框、過界口、極限區）**，歪掉就不要採用（見下方否決）。分數
+     接近 0.6 的（例如 0.6–0.65）尤其要仔細看，常見的是某一側的外框或蓋子輪廓偏掉。
+   - `recalibrate`：沒有任何手動校準對得上、對位也不夠可靠，判定時此影片會被標成
+     `recalibrate`，不猜區域；為該鏡頭新增一個手動校準（第 2 步）後重跑。
+
+   **用手動真值驗收（`--truth`）**：在同一個機位另外手動點一次當真值，**存到 `calib/` 以外的
+   資料夾**；放進 `calib/` 它就變成範本，該機位會直接以 `manual`、誤差 0 通過，完全沒測到
+   自動對齊。`--truth` 只有一個檔，會套用到命令列上的**每一支**影片，所以只放該真值那個機位
+   的影片：
+
+   ```bash
+   uv run bxjudge calibrate ~/bx/videos/20261014/<任一支影片>.mp4 --name truth-20261014 --out truth
+   uv run bxjudge autocalib ~/bx/videos/20261014/*.mp4 --calib calib --out runs/autocalib-check \
+     --truth truth/truth-20261014.json
+   ```
+
+   有 `--truth` 時，每行再加 `boundary_error_px=<8 區域平均邊界誤差，推論像素> <狀態>`，
+   最後印 `PASS n / FAIL n / REJECTED n`：
+
+   - `PASS`：誤差 ≤ `max_boundary_error_px`（8 px）。
+   - `FAIL`：誤差超過門檻。
+   - `REJECTED`：結果是 `recalibrate`（`boundary_error_px=-`），沒有產出校準，不能算通過。
+
+   任何 FAIL 或 REJECTED 時結束碼為 1。白色、黑色下盤有真值時應該要對得上；只有驗收透明
+   下盤時（允許對不準、但必須被標成 `recalibrate`，spec §6.6）才加 `--allow-recalibrate`，
+   此時 REJECTED 仍會印出並計入摘要，但不影響結束碼（FAIL 仍然是 1）。
 
    使用上要注意：
 
