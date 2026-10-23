@@ -5,7 +5,13 @@ from datetime import datetime
 
 import pytest
 
-from bxjudge.manifest import mark_processed, parse_recorded_at, probe, scan
+from bxjudge.manifest import (
+    forget_processed,
+    mark_processed,
+    parse_recorded_at,
+    probe,
+    scan,
+)
 from tests.helpers import make_video
 
 
@@ -175,3 +181,16 @@ def test_processed_videos_lists_only_current_records(tmp_path):
     st = b.stat()
     os.utime(b, (st.st_atime, st.st_mtime + 5))  # changed: back in scan, not processed
     assert [i.path for i in processed_videos(tmp_path, db)] == [a]
+
+
+def test_forget_processed_makes_scan_return_the_video_again(tmp_path):
+    make_video(tmp_path / "a.mp4", seconds=0.2)
+    db = tmp_path / "out" / "processed.json"
+    [info] = scan(tmp_path, db)
+    mark_processed(info, db, calibration_id="0123456789abcdef")
+    assert scan(tmp_path, db) == []
+    forget_processed(db, info.path)
+    assert [i.path for i in scan(tmp_path, db)] == [info.path]
+    forget_processed(db, info.path)  # absent: no-op
+    forget_processed(tmp_path / "missing.json", info.path)
+    assert not (tmp_path / "missing.json").exists()

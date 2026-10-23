@@ -144,6 +144,19 @@ def mark_processed(info: VideoInfo, db_path: Path, *, calibration_id: str | None
     os.replace(tmp, db_path)
 
 
+def forget_processed(db_path: Path, path: Path) -> None:
+    """Remove the processed record of ``path`` (no-op when absent), so ``scan`` returns it
+    again. Ruling T4-5: a video whose (re)analysis yields only non-round placeholders is
+    retried as new (R56) instead of keeping a stale record of an earlier success."""
+    db_path = Path(db_path)
+    data = _load_db(db_path)
+    if data.pop(_key(path), None) is None:
+        return
+    tmp = db_path.with_name(db_path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, db_path)
+
+
 def processed_calibration(db_path: Path, path: Path) -> str | None:
     """Calibration snapshot id recorded for ``path`` (``None``: not processed, or judged without
     a snapshot)."""

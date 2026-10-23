@@ -37,6 +37,7 @@ from .finish import (
 from .launch_check import analyze_launch
 from .manifest import (
     VideoInfo,
+    forget_processed,
     mark_processed,
     processed_calibration,
     processed_videos,
@@ -422,8 +423,14 @@ def needs_reanalysis(
     """Spec section 6.3b items 3-4 for an unchanged, already processed video: reanalyse when the
     calibration snapshot selected now (``current``, ``None`` = selection fails) differs from the
     one it was judged with (``recorded``) — a new manual calibration, an edited or new template,
-    or a failure after a previous success — or when the recorded snapshot is vetoed."""
-    return current != recorded or recorded in vetoed
+    or a failure after a previous success.
+
+    Ruling T4-3: a video judged with a now-vetoed snapshot is reanalysed only when selection
+    yields a usable, non-vetoed snapshot (manual added, template changed, veto lifted); a veto
+    alone keeps its rows and original predictions (spec 6.6b), never a recalibrate placeholder."""
+    if recorded in vetoed:
+        return current is not None and current not in vetoed
+    return current != recorded
 
 
 def run_batch(
@@ -507,9 +514,8 @@ def run_batch(
     # Spec section 6.3b: an unchanged processed video is reanalysed when its calibration
     # changed. Selection needs only the first second, so it runs for every processed video;
     # a reanalysed video is judged with this same selection (not selected twice).
-    # Ruling T4-1: a vetoed auto snapshot is never selected again; a video recorded with one
-    # is reanalysed into a cheap recalibrate placeholder (no detection) until a manual or a
-    # changed template applies.
+    # Rulings T4-1/T4-3: a vetoed auto snapshot is never selected again; a video recorded with
+    # one keeps its rows until selection yields a non-vetoed snapshot (then it is reanalysed).
     vetoed = vetoed_ids(out_dir)
     preselected: dict[Path, Snapshot | None] = {}
     for info in processed_videos(folder, db, on_error=on_error):
@@ -565,8 +571,11 @@ def run_batch(
             source_video=path.resolve(),
         )
         record_video_calibration(out_dir, path.name, snap)
-        # Placeholder-only videos await corrected input and are retried (R56).
-        if info is not None and not all(is_not_a_round(r.review_reasons) for r in results):
+        # Placeholder-only videos await corrected input and are retried (R56): their record
+        # is removed, never left stale with an earlier success's id (ruling T4-5).
+        if all(is_not_a_round(r.review_reasons) for r in results):
+            forget_processed(db, path)
+        elif info is not None:
             mark_processed(
                 info, db, calibration_id=snap.id if snap is not None else None
             )

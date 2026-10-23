@@ -289,7 +289,8 @@ def _read_vetoes(out_dir: Path) -> dict[str, dict]:
     if not isinstance(data, dict) or not all(
         isinstance(k, str) and isinstance(v, dict) for k, v in data.items()
     ):
-        raise ValueError(f"{path}: expected {{snapshot_id: {{at, note}}}}")
+        raise ValueError(f"{path}: expected {{snapshot_id: {{at, note}}}}; fix or delete the "
+                         "file (deleting it lifts every calibration veto)")
     return data
 
 

@@ -1153,3 +1153,31 @@ def test_cli_eval_reports_calibration_section(tmp_path):
     assert "0.500 (1/2)" in section  # coverage: b.mp4 of a.mp4, b.mp4
     assert s1 in section
     assert "需覆核比例 review_ratio | 0.250 (1/4)" in text  # a.mp4 round 2: vetoed, unreviewed
+
+
+def test_report_tradeoff_is_consistent_with_review_ratio_under_a_veto():
+    from bxjudge.evaluate import render_eval_report
+
+    rows = [rev(video="a.mp4", round=n, calibration_id="S2", fix={}) for n in (1, 2, 3)]
+    for r in rows:
+        r["audit_sample"] = True
+    rows.append(row(video="b.mp4", round=1, calibration_id="S1"))  # vetoed, unreviewed
+    cfg, vetoed = _cfg(), {"S1"}
+    m = evaluate(rows, config=cfg, vetoed=vetoed)
+    extra = report_metrics(rows, None, cfg, vetoed=vetoed)
+    t = extra.tradeoff
+    assert m.review_ratio == pytest.approx(0.25)
+    assert t["automation_rate"] == pytest.approx(1 - m.review_ratio)
+    # The vetoed unreviewed round needs human work: an error until reviewed, never "at the
+    # unflagged estimate" (1.0 here).
+    assert t["auto_accuracy"]["estimate"] == pytest.approx(0.75)
+    assert t["final_accuracy"]["estimate"] == pytest.approx(0.75)
+    assert t["flagged_reviewed"] == (0, 1)
+    text = render_eval_report("res", rows, None, m, passes(m, cfg), extra, cfg, today="x",
+                              vetoed=vetoed)
+    assert "| 需覆核比例 review_ratio | 0.250 (1/4) |" in text
+    assert "| 自動化率 Automation Rate | 0.750 |" in text
+    assert "Auto Accuracy (all real rounds) | 0.750 (" in text
+    assert "Final Accuracy after review | 0.750 (" in text
+    plain = report_metrics(rows, None, cfg).tradeoff  # without vetoes: the old definition
+    assert plain["automation_rate"] == 1.0

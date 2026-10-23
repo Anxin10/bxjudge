@@ -298,7 +298,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         vetoed = vetoed_ids(results)
         metrics = ev.evaluate(rows, timings, config=cfg, runs=runs, vetoed=vetoed)
         ok = ev.passes(metrics, cfg)
-        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs)
+        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs, vetoed=vetoed)
         path, today = _report_path(args, "eval")
         _write_report(path, ev.render_eval_report(
             results, rows, timings, metrics, ok, extra, cfg, truth=truth,

@@ -219,8 +219,9 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
     groups = {}
     for sid in sorted(vetoed):
         group_rows = [r for r in vetoed_rows if r["calibration_id"] == sid]
-        videos = {r["video"] for r in group_rows}
-        videos |= {v for v, e in (timings or {}).items() if recorded(e) == sid}
+        # Same source as vetoed_videos: videos.json when present, else the rows.
+        videos = ({r["video"] for r in group_rows} if timings is None
+                  else {v for v, e in timings.items() if recorded(e) == sid})
         groups[sid] = {"videos": sorted(videos), "rounds": len(group_rows),
                        "unreviewed": sum(_vetoed_pending(r, vetoed) for r in group_rows)}
     return {
@@ -577,11 +578,14 @@ def _vlm_requests(rows, timings, percentile):
 
 def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: EvalConfig,
                    *, rules: Rules | None = None,
-                   runs: list[dict] | None = None) -> ReportMetrics:
+                   runs: list[dict] | None = None,
+                   vetoed: set[str] | None = None) -> ReportMetrics:
     """Latency, VLM and referee-accuracy metrics for the eval report (R60).
 
     Core = ``processing_s`` (excludes one-time model init and scan/probe), end-to-end =
     core + ``vlm_s``; VLM latency is per request actually sent (``vlm_requests``).
+    ``vetoed`` snapshot ids: their unreviewed rounds need human work in the R63 block, as in
+    ``review_ratio`` (spec 6.6b).
     """
     pct = config.latency_percentile
     videos, excluded = _speed_videos(rows, timings, config.speed_max_video_s)
@@ -649,22 +653,29 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
         match_agreement=agreement,
         wall=wall,
         unflagged=u,
-        tradeoff=_tradeoff(real, u, speed),
+        tradeoff=_tradeoff(real, u, speed, set(vetoed or ())),
     )
 
 
-def _tradeoff(real: list[dict], u: dict, speed: dict) -> dict:
+def _tradeoff(real: list[dict], u: dict, speed: dict,
+              vetoed: set[str] = frozenset()) -> dict:
     """R63 joint block, side by side (no weighted score).
 
     auto accuracy = what the judge gets right on its own over ALL real rounds: unflagged
     rounds at the unflagged estimate, flagged rounds by their reviewed original accuracy
     with unreviewed flagged rounds counted as errors. final accuracy = after the human
     review done so far: reviewed rounds are right, unreviewed unflagged rounds at the
-    estimate, unreviewed flagged rounds still pending (counted as errors).
+    estimate, unreviewed flagged rounds still pending (counted as errors). An unreviewed
+    round of a vetoed calibration needs human work (spec 6.6b) and is treated as flagged,
+    so automation rate = 1 - review_ratio.
     """
     n = len(real)
-    unflagged = [r for r in real if r["needs_review"] is False]
-    flagged = [r for r in real if r["needs_review"] is True]
+
+    def needs_human(r: dict) -> bool:
+        return r["needs_review"] is True or _vetoed_pending(r, vetoed)
+
+    unflagged = [r for r in real if r["needs_review"] is False and not needs_human(r)]
+    flagged = [r for r in real if needs_human(r)]
     flagged_reviewed = [r for r in flagged if r.get("reviewed") is True]
     n_u, n_u_rev = len(unflagged), sum(r.get("reviewed") is True for r in unflagged)
     correct_flagged = sum(map(_finish_right, flagged_reviewed))
@@ -1136,8 +1147,9 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         (f"| 自動化率 Automation Rate | {_f(t['automation_rate'])} | 1 − review_ratio over "
          f"{m.n_rounds} real rounds |"),
         (f"| 自動判定估計正確率 Auto Accuracy (all real rounds) | {interval(t['auto_accuracy'])} "
-         f"| unflagged at [{t['unflagged_method']}]; flagged by reviewed original accuracy, "
-         f"unreviewed flagged counted as errors ({t['flagged_reviewed'][0]}/"
+         f"| unflagged at [{t['unflagged_method']}]; flagged (incl. vetoed unreviewed) by "
+         f"reviewed original accuracy, unreviewed flagged counted as errors "
+         f"({t['flagged_reviewed'][0]}/"
          f"{t['flagged_reviewed'][1]} flagged reviewed) |"),
         (f"| 覆核後估計正確率 Final Accuracy after review | {interval(t['final_accuracy'])} | "
          "reviewed rounds right; unreviewed unflagged at the estimate; unreviewed flagged "
