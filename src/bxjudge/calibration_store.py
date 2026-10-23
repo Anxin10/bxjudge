@@ -16,6 +16,10 @@ same camera position (the grouping, spec §6.3; only while the template it came 
 present and unchanged in ``calib/``), else a new auto snapshot made by aligning the
 best manual template to the frame (spec §6.1/§6.2b: its reference image is the frame itself),
 else ``None`` (the video is ``recalibrate``).
+
+A reviewer can veto an auto snapshot (``veto_calibration``; spec section 6.5, ruling T4-1): the
+veto lives in ``<results>/calibration_vetoes.json``, keyed by snapshot id, and is honoured by
+selection and by every ``matches.csv`` rebuild; it never rewrites a judged row.
 """
 from __future__ import annotations
 
@@ -23,7 +27,9 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -193,7 +199,8 @@ def _existing_auto_snapshots(out_dir: Path, template_ids: set[str]) -> list[Snap
 
 
 def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thresholds,
-                    cfg: AutoCalibConfig) -> Snapshot | None:
+                    cfg: AutoCalibConfig,
+                    vetoed: AbstractSet[str] = frozenset()) -> Snapshot | None:
     """Calibration snapshot for ``frame`` (a video's first-second frame) or ``None``.
 
     Order: (1) the best manual calibration in ``calib_dir`` with similarity >=
@@ -202,7 +209,14 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     still present, readable and unchanged in ``calib_dir`` (an edited or removed template makes
     its auto snapshots ineligible, so a fresh alignment gives a new id); (3) a new auto snapshot
     from the template with the best alignment score >= ``cfg.min_score``, whose reference image
-    is ``frame`` itself; (4) ``None``. Broken templates are skipped with a warning."""
+    is ``frame`` itself; (4) ``None``. Broken templates are skipped with a warning.
+
+    ``vetoed`` (ruling T4-1; vetoes apply to auto snapshots only, manual selection is unchanged):
+    a vetoed auto snapshot is never reused, a fresh alignment whose id is vetoed gives ``None``,
+    and a template is not re-aligned at a camera position one of its vetoed auto snapshots
+    covers (same similarity test as reuse), so a vetoed group stays ``recalibrate`` until a
+    manual calibration or a changed/new template applies, instead of being re-created from
+    another video of the same group under a new id."""
     templates = _manual_templates(calib_dir)
 
     best_manual: _Template | None = None
@@ -221,13 +235,18 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
 
     best_auto: Snapshot | None = None
     best_sim = -1.0
+    barred: set[str] = set()  # templates whose vetoed auto snapshot covers this position
     for s in _existing_auto_snapshots(out_dir, {t.id for t in templates}):
         try:
             sim = calibration_similarity(frame, s.calibration)
         except _LOAD_ERRORS as e:
             log.warning("skipping calibration snapshot %s: %s", s.id, e)
             continue
-        if sim >= th.calibration_min_similarity and sim > best_sim:
+        if sim < th.calibration_min_similarity:
+            continue
+        if s.id in vetoed:
+            barred.add(s.template_id)
+        elif sim > best_sim:
             best_auto, best_sim = s, sim
     if best_auto is not None:
         return best_auto
@@ -235,6 +254,8 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     best_t = None
     best_al = None
     for t in templates:
+        if t.id in barred:
+            continue
         al = estimate_alignment(frame, t.cal, t.img, cfg)
         if al is not None and al.score >= cfg.min_score and (best_al is None or al.score > best_al.score):
             best_t, best_al = t, al
@@ -245,8 +266,87 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
                              source_path=best_t.path)
     h, w = frame.shape[:2]
     warped = warp_calibration(cal, best_al, (w, h), f"auto-{cal.name}")
-    return save_snapshot(out_dir, "auto", warped, frame, score=best_al.score,
+    snap = save_snapshot(out_dir, "auto", warped, frame, score=best_al.score,
                          template_id=template.id, homography=best_al.homography)
+    # A vetoed id is a known snapshot, so save_snapshot wrote nothing new for it.
+    return None if snap.id in vetoed else snap
+
+
+# --------------------------------------------------------------------------- vetoes (spec 6.5)
+
+VETOES_FILE = "calibration_vetoes.json"
+
+
+def _vetoes_path(out_dir: Path) -> Path:
+    return Path(out_dir) / VETOES_FILE
+
+
+def _read_vetoes(out_dir: Path) -> dict[str, dict]:
+    path = _vetoes_path(out_dir)
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, dict) for k, v in data.items()
+    ):
+        raise ValueError(f"{path}: expected {{snapshot_id: {{at, note}}}}")
+    return data
+
+
+def _write_vetoes_and_rebuild(out_dir: Path, vetoes: dict[str, dict], rules) -> None:
+    out_dir = Path(out_dir)
+    path = _vetoes_path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(vetoes, indent=2, sort_keys=True, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    if (out_dir / "rounds.json").is_file():
+        # The single export path: matches.csv drops / restores the vetoed unreviewed rounds;
+        # the rows themselves are rewritten unchanged (vetoes never rewrite judgments).
+        from bxjudge.output import read_rounds, save_rounds
+        from bxjudge.rules import load_rules
+
+        save_rounds(read_rounds(out_dir), out_dir, rules if rules is not None else load_rules())
+
+
+def vetoed_ids(out_dir: Path) -> set[str]:
+    """Snapshot ids currently vetoed in ``<out_dir>/calibration_vetoes.json`` (empty if absent)."""
+    return set(_read_vetoes(out_dir))
+
+
+def veto_calibration(out_dir: Path, snapshot_id: str, *, note: str = "", rules=None) -> None:
+    """「不採用此組校準」: record a veto of AUTO snapshot ``snapshot_id`` (ruling T4-1: a wrong
+    manual calibration is fixed in ``calib/``) as ``{id: {"at": iso, "note": str}}`` in
+    ``<out_dir>/calibration_vetoes.json`` and rebuild the CSVs through ``save_rounds``.
+    The group's unreviewed rounds stop scoring in ``matches.csv``; no row is changed.
+    Raises ``ValueError`` for an unknown or manual snapshot id."""
+    try:
+        snap = load_snapshot(out_dir, snapshot_id)
+    except FileNotFoundError as e:
+        raise ValueError(str(e)) from None
+    if snap.kind != "auto":
+        raise ValueError(f"calibration snapshot {snapshot_id} is {snap.kind}: only auto "
+                         "calibrations can be vetoed (edit the manual calibration in calib/)")
+    vetoes = _read_vetoes(out_dir)
+    vetoes[snapshot_id] = {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                           "note": str(note)}
+    _write_vetoes_and_rebuild(out_dir, vetoes, rules)
+
+
+def unveto_calibration(out_dir: Path, snapshot_id: str, *, rules=None) -> None:
+    """Cancel the veto of ``snapshot_id`` (no-op when it is not vetoed) and rebuild the CSVs
+    through ``save_rounds``. Raises ``ValueError`` for an id that is neither vetoed nor a
+    known snapshot."""
+    vetoes = _read_vetoes(out_dir)
+    if snapshot_id not in vetoes:
+        try:
+            load_snapshot(out_dir, snapshot_id)
+        except FileNotFoundError as e:
+            raise ValueError(str(e)) from None
+        return
+    del vetoes[snapshot_id]
+    _write_vetoes_and_rebuild(out_dir, vetoes, rules)
 
 
 def write_preview(out_dir: Path, snap: Snapshot) -> Path:

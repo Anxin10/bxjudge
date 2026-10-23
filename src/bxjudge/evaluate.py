@@ -169,6 +169,71 @@ class Metrics:
     finish_accuracy_unflagged_low: float = NAN
     finish_accuracy_unflagged_high: float = NAN
     finish_accuracy_unflagged_coverage: float = NAN
+    # Calibration (spec 6.6b): vetoed / failed calibrations never leave the population.
+    n_vetoed_rounds: int = 0  # real rounds judged with a vetoed snapshot (reviewed or not)
+    n_recalibrate_videos: int = 0  # videos whose result is a ``recalibrate`` placeholder
+    n_vetoed_groups: int = 0  # vetoed calibration snapshots
+    n_vetoed_videos: int = 0  # videos recorded (videos.json) with a vetoed snapshot
+    coverage: float = NAN  # videos judged with a non-vetoed snapshot / all videos in videos.json
+    n_pending_videos: int = 0  # recalibrate + vetoed videos (await recalibration or a rerun)
+
+
+# A video whose rows are only these placeholders was not judged, whatever snapshot it recorded.
+_FAILED_REASONS = frozenset({"recalibrate", "decode_error", "analysis_error"})
+
+
+def _vetoed_pending(row: dict, vetoed: set[str]) -> bool:
+    """An unreviewed round judged with a vetoed calibration: it needs human work (6.6b)."""
+    return row.get("reviewed") is not True and row.get("calibration_id") in vetoed
+
+
+def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
+                         vetoed: set[str] | None = None) -> dict:
+    """Spec 6.6b calibration summary: vetoed rounds/videos/groups, ``recalibrate`` videos
+    (video level: they have no round, R53), effective coverage = videos of ``videos.json``
+    judged with a recorded, non-vetoed snapshot (and not only failure placeholders) / all of
+    them (nan without ``videos.json``), and pending = recalibrate + vetoed videos. Vetoed
+    videos come from ``videos.json`` (else, without it, from the vetoed rows)."""
+    vetoed = set(vetoed or ())
+    real = real_rows(rows)
+    vetoed_rows = [r for r in real if r.get("calibration_id") in vetoed]
+    recal = {r["video"] for r in rows if "recalibrate" in (r.get("review_reasons") or [])}
+    reasons: dict[str, list[set]] = {}
+    for r in rows:
+        reasons.setdefault(r["video"], []).append(set(r.get("review_reasons") or []))
+    failed = {v for v, rs in reasons.items() if all(_FAILED_REASONS & s for s in rs)}
+
+    def recorded(entry) -> str | None:
+        cal = entry.get("calibration") if isinstance(entry, dict) else None
+        return cal.get("id") if isinstance(cal, dict) else None
+
+    if timings is None:
+        vetoed_videos = {r["video"] for r in vetoed_rows}
+        covered: list[str] = []
+        total = 0
+    else:
+        vetoed_videos = {v for v, e in timings.items() if recorded(e) in vetoed}
+        covered = sorted(v for v, e in timings.items() if recorded(e) is not None
+                         and recorded(e) not in vetoed and v not in failed)
+        total = len(timings)
+    groups = {}
+    for sid in sorted(vetoed):
+        group_rows = [r for r in vetoed_rows if r["calibration_id"] == sid]
+        videos = {r["video"] for r in group_rows}
+        videos |= {v for v, e in (timings or {}).items() if recorded(e) == sid}
+        groups[sid] = {"videos": sorted(videos), "rounds": len(group_rows),
+                       "unreviewed": sum(_vetoed_pending(r, vetoed) for r in group_rows)}
+    return {
+        "n_vetoed_rounds": len(vetoed_rows),
+        "n_vetoed_unreviewed": sum(_vetoed_pending(r, vetoed) for r in vetoed_rows),
+        "recalibrate_videos": sorted(recal),
+        "vetoed_videos": sorted(vetoed_videos),
+        "groups": groups,
+        "n_covered": len(covered),
+        "n_videos": total,
+        "coverage": _ratio(len(covered), total) if timings is not None else NAN,
+        "pending_videos": sorted(recal | vetoed_videos),
+    }
 
 
 def _ratio(num: int, den: int) -> float:
@@ -342,13 +407,17 @@ def unflagged_accuracy(rows: list[dict], level: float | None = None) -> dict:
 
 
 def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
-             config: EvalConfig | None = None, runs: list[dict] | None = None) -> Metrics:
+             config: EvalConfig | None = None, runs: list[dict] | None = None,
+             vetoed: set[str] | None = None) -> Metrics:
     """Spec section 11 metrics from flat ``rounds.json`` rows (+ ``videos.json`` timings
     and ``runs.json`` wall-clock records).
 
     Without ``timings`` or run records speed is unverified (R11). ``config`` defaults to
-    ``config/evaluation.yaml``.
+    ``config/evaluation.yaml``. ``vetoed`` calibration snapshot ids (spec 6.6b): their rounds
+    stay in every population with their original predictions; the unreviewed ones also count
+    as needing human work in ``review_ratio``; the calibration fields summarise coverage.
     """
+    vetoed = set(vetoed or ())
     real, truth = real_rows(rows), truth_rows(rows)
     touch = [_caught(r, "touch", s) for r in truth for s in SIDES]
     touch = [c for positive, c in touch if positive]
@@ -368,11 +437,14 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     basis = ("wall-clock" if math.isfinite(wall)
              else "sum-based" if math.isfinite(speed[0]) else "unverified")
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level)
+    cal = calibration_coverage(rows, timings, vetoed)
     return Metrics(
         finish_accuracy_unflagged=u["estimate"],
         touch_recall=_ratio(sum(touch), len(touch)),
         air_recall=_ratio(sum(air), len(air)),
-        review_ratio=_ratio(sum(r["needs_review"] is True for r in real), len(real)),
+        review_ratio=_ratio(
+            sum(r["needs_review"] is True or _vetoed_pending(r, vetoed) for r in real), len(real)
+        ),
         speed_ratio=wall if basis == "wall-clock" else speed[0],
         n_reviewed=len(truth),
         n_rounds=len(real),
@@ -390,6 +462,12 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         finish_accuracy_unflagged_low=u["low"],
         finish_accuracy_unflagged_high=u["high"],
         finish_accuracy_unflagged_coverage=u["coverage"],
+        n_vetoed_rounds=cal["n_vetoed_rounds"],
+        n_recalibrate_videos=len(cal["recalibrate_videos"]),
+        n_vetoed_groups=len(vetoed),
+        n_vetoed_videos=len(cal["vetoed_videos"]),
+        coverage=cal["coverage"],
+        n_pending_videos=len(cal["pending_videos"]),
     )
 
 
@@ -950,8 +1028,10 @@ def _count(value: float, den: int) -> int:
 
 def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[str, str],
                        extra: ReportMetrics, config: EvalConfig, *,
-                       truth: TruthMatch | None = None, truth_dir=None, today: str) -> str:
-    """Markdown eval report: R60 summary table first, then timing, R37 coverage, errors."""
+                       truth: TruthMatch | None = None, truth_dir=None, today: str,
+                       vetoed: set[str] | None = None) -> str:
+    """Markdown eval report: R60 summary table first, then calibration (spec 6.6b), timing,
+    R37 coverage, errors."""
     m, x, pct = metrics, extra, extra.latency_percentile
     q, fv, ref = extra.vlm_request_s, extra.flagged_vlm, extra.referee
     limit = config.targets["speed_ratio"][1]
@@ -1065,6 +1145,7 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         (f"| 速度達標 Speed Pass | {_f(t['speed']['pass_rate'])} (ratio "
          f"{_f(t['speed']['ratio'])}) | {t['speed']['basis']} |"),
         "",
+        *_calibration_section(rows, timings, m, vetoed),
         "## Timing",
         "",
         _TIMING_NOTE,
@@ -1107,6 +1188,41 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
     out += [f"- {r['video']}: {r.get('review_reasons')}" for r in placeholders] or ["- none"]
     out.append("")
     return "\n".join(out)
+
+
+def _calibration_section(rows, timings, m: Metrics, vetoed: set[str] | None) -> list[str]:
+    """「校準 Calibration」 (spec 6.6b): failures and vetoes stay visible, never hidden."""
+    c = calibration_coverage(rows, timings, vetoed)
+
+    def names(videos: list[str]) -> str:
+        return ", ".join(videos) or "none"
+
+    coverage = ("unverified (no videos.json)" if timings is None
+                else _frac(c["coverage"], c["n_covered"], c["n_videos"]))
+    out = [
+        "## 校準 Calibration",
+        "",
+        ("Vetoed rounds stay in every accuracy population with their original predictions; "
+         "unreviewed ones count as needing human work in review_ratio and are left out of "
+         "matches.csv; the random audit sample (R62) is unchanged. `recalibrate` videos have "
+         "no round and are counted per video (spec 6.6b)."),
+        "",
+        "| 項目 Item | 數值 Value |",
+        "|---|---|",
+        (f"| 有效處理覆蓋率 Coverage | {coverage} videos judged with an accepted (non-vetoed) "
+         "calibration |"),
+        (f"| 校準失敗影片 Recalibrate videos | {m.n_recalibrate_videos}: "
+         f"{names(c['recalibrate_videos'])} |"),
+        (f"| 被否決的校準組 Vetoed groups | {m.n_vetoed_groups} group(s); "
+         f"{m.n_vetoed_videos} video(s); {m.n_vetoed_rounds} round(s), "
+         f"{c['n_vetoed_unreviewed']} unreviewed |"),
+        (f"| 待處理影片 Pending videos | {m.n_pending_videos} (recalibrate + vetoed): "
+         f"{names(c['pending_videos'])} |"),
+        "",
+    ]
+    out += [f"- vetoed `{sid}`: videos {names(g['videos'])}; {g['rounds']} round(s), "
+            f"{g['unreviewed']} unreviewed" for sid, g in c["groups"].items()]
+    return out + [""] if c["groups"] else out
 
 
 _PENDING = [

@@ -315,10 +315,13 @@ def rev(
     review_reasons=None,
     confidence=0.9,
     motion_evidence=None,
+    calibration_id=None,
 ) -> dict:
     """A flat ``rounds.json`` row (Task 13 schema). Defaults: a reviewed, unflagged,
-    confident spin win for X; ``fix`` becomes ``reviewer_fix`` (the human truth)."""
+    confident spin win for X; ``fix`` becomes ``reviewer_fix`` (the human truth).
+    ``calibration_id`` (the snapshot the round was judged with) is added only when given."""
     return {
+        **({"calibration_id": calibration_id} if calibration_id is not None else {}),
         "video": video,
         "round": round,
         "t_launch": t_launch,
@@ -348,6 +351,84 @@ def rev(
         "motion_evidence": motion_evidence,
         "detector_provenance": None,
     }
+
+
+def row(**kw) -> dict:
+    """An UNREVIEWED flat row (``rev`` with ``reviewed=False``)."""
+    return rev(**{"reviewed": False, **kw})
+
+
+def placeholder(video: str, reason: str) -> dict:
+    """A diagnostic non-round row (``recalibrate``, ``decode_error`` ...) for ``video``."""
+    return rev(video=video, finish=None, winner=None, needs_review=True, reviewed=False,
+               review_reasons=[reason])
+
+
+def videos_with_calibration(ids: dict) -> dict:
+    """``videos.json`` content: ``{"a": "S1", "c": None}`` -> entry ``a.mp4`` judged with snapshot
+    ``S1`` (auto) and ``c.mp4`` without a snapshot (``recalibrate``)."""
+    return {
+        f"{name}.mp4": {
+            "duration_s": 10.0,
+            "processing_s": 5.0,
+            "calibration": None if sid is None else {
+                "id": sid, "kind": "auto", "name": "auto-test", "score": 0.9,
+                "template_id": "f" * 16},
+        }
+        for name, sid in ids.items()
+    }
+
+
+def _fixed_auto_snapshot(out_dir, seed: int):
+    """A deterministic auto snapshot (same content, same id) written into ``out_dir``."""
+    from bxjudge.calibration_store import save_snapshot
+
+    eye = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    return save_snapshot(out_dir, "auto", make_calibration(), make_ref_img(seed), score=0.9,
+                         template_id="f" * 16, homography=eye)
+
+
+def auto_snapshot_ids() -> tuple[str, str]:
+    """Ids (S1, S2) of the two fixed auto snapshots used by ``results_with_two_positions``."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        return _fixed_auto_snapshot(Path(d), 1).id, _fixed_auto_snapshot(Path(d), 2).id
+
+
+def results_with_two_positions(tmp_path):
+    """A results folder from one batch with two camera positions: ``a.mp4`` judged with auto
+    snapshot S1 and ``b.mp4`` with S2 (``auto_snapshot_ids``), two unreviewed rounds each."""
+    from dataclasses import replace
+
+    from bxjudge.output import (
+        record_video_calibration,
+        record_video_timing,
+        write_results,
+    )
+    from bxjudge.rules import load_rules
+
+    out = tmp_path / "out"
+    rounds = []
+    for seed, video in ((1, "a.mp4"), (2, "b.mp4")):
+        snap = _fixed_auto_snapshot(out, seed)
+        rounds += [replace(rr("spin", "X", video=video, round=n, t_launch=10.0 * n),
+                           calibration_id=snap.id) for n in (1, 2)]
+        record_video_timing(out, video, 30.0, 10.0)
+        record_video_calibration(out, video, snap)
+    write_results(rounds, out, load_rules())
+    return out
+
+
+def read_matches(out_dir) -> list[dict]:
+    """``matches.csv`` rows with their ``rounds`` JSON decoded."""
+    import csv
+    import json
+    from pathlib import Path
+
+    with (Path(out_dir) / "matches.csv").open(encoding="utf-8", newline="") as f:
+        return [{**m, "rounds": json.loads(m["rounds"])} for m in csv.DictReader(f)]
 
 
 def _ellipse_poly(cx: float, cy: float, a: float, b: float, n: int = 72) -> Polygon:

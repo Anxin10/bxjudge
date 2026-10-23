@@ -25,7 +25,7 @@ from bxjudge.evaluate import (
     spin_dir_check,
     thresholds_diff,
 )
-from tests.helpers import rev
+from tests.helpers import placeholder, rev, row, videos_with_calibration
 
 ROOT = Path(__file__).resolve().parents[1]
 EVAL_CONFIG = ROOT / "config" / "evaluation.yaml"
@@ -1076,3 +1076,80 @@ def test_r64_inconclusive_shown_in_cli_summary_and_report_table(tmp_path, capsys
                if line.startswith("| 未標覆核回合判定正確率"))
     assert row.endswith("| INCONCLUSIVE (樣本不足) |")
     assert "WARNING: audit sample only partly reviewed" in row
+
+
+# ---- calibration vetoes and coverage (auto-calibration Task 4, spec 6.6b) -------------------
+
+
+def test_vetoed_rounds_stay_in_population_and_raise_review_ratio():
+    rows = [rev(calibration_id="S1", needs_review=False, fix={}), rev(calibration_id="S2", needs_review=False, fix={}),
+            row(calibration_id="S1", needs_review=False), row(calibration_id="S2", needs_review=False)]
+    m = evaluate(rows, timings=videos_with_calibration({"a": "S1", "b": "S2"}), vetoed={"S1"})
+    assert m.n_rounds == 4 and m.n_vetoed_rounds == 2
+    assert m.review_ratio == pytest.approx(0.25)  # the one unreviewed vetoed round
+    assert m.coverage == pytest.approx(0.5) and m.n_vetoed_groups == 1 and m.n_pending_videos == 1
+
+
+def test_recalibrate_videos_counted_at_video_level():
+    m = evaluate([placeholder("c.mp4", "recalibrate")], timings=videos_with_calibration({"c": None}), vetoed=set())
+    assert m.n_recalibrate_videos == 1 and m.coverage == 0.0
+
+
+def test_vetoed_reviewed_rounds_keep_original_predictions_in_accuracy():
+    rows = [rev(video="a.mp4", calibration_id="S1", fix={"finish": "over"}),
+            rev(video="a.mp4", round=2, calibration_id="S1", fix={})]
+    plain = evaluate(rows)
+    vetoed = evaluate(rows, vetoed={"S1"})
+    assert vetoed.finish_accuracy_unflagged == plain.finish_accuracy_unflagged == 0.5
+    assert vetoed.n_reviewed == plain.n_reviewed == 2
+    assert vetoed.review_ratio == plain.review_ratio == 0.0  # reviewed: no pending human work
+    assert vetoed.n_vetoed_rounds == 2
+
+
+def test_veto_does_not_change_the_audit_sample_population():
+    rows = [row(video="a.mp4", round=n, calibration_id="S1") for n in (1, 2, 3)]
+    rows[0]["audit_sample"] = True
+    rows[0]["reviewed"], rows[0]["reviewer_fix"] = True, {}
+    m_plain, m_veto = evaluate(rows), evaluate(rows, vetoed={"S1"})
+    assert m_veto.finish_accuracy_unflagged == m_plain.finish_accuracy_unflagged == 1.0
+    assert m_veto.finish_accuracy_unflagged_method == "audit_sample"
+    assert m_veto.finish_accuracy_unflagged_coverage == m_plain.finish_accuracy_unflagged_coverage
+
+
+def test_calibration_metrics_without_vetoes_or_timings():
+    m = evaluate([rev(calibration_id="S1")])
+    assert m.n_vetoed_rounds == 0 and m.n_vetoed_groups == 0 and m.n_pending_videos == 0
+    assert math.isnan(m.coverage)  # no videos.json: coverage unverified
+
+
+def test_failed_analysis_with_a_snapshot_is_not_coverage():
+    timings = videos_with_calibration({"a": "S2", "b": "S2", "c": None})
+    rows = [rev(video="a.mp4", calibration_id="S2"), placeholder("b.mp4", "analysis_error"),
+            placeholder("c.mp4", "recalibrate")]
+    m = evaluate(rows, timings=timings, vetoed=set())
+    assert m.coverage == pytest.approx(1 / 3)
+    assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 1
+
+
+def test_cli_eval_reports_calibration_section(tmp_path):
+    from bxjudge.calibration_store import veto_calibration
+    from bxjudge.corrections import confirm_reviewed
+    from tests.helpers import auto_snapshot_ids, results_with_two_positions
+
+    s1, _ = auto_snapshot_ids()
+    out = results_with_two_positions(tmp_path)
+    confirm_reviewed(out, "a.mp4", 1)
+    veto_calibration(out, s1)
+    def files():
+        return {p: p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
+
+    before = files()
+    report = tmp_path / "eval.md"
+    assert main(["eval", str(out), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
+    assert files() == before
+    text = report.read_text(encoding="utf-8")
+    section = text[text.index("## 校準 Calibration"):]
+    section = section[:section.index("\n## ", 1)]
+    assert "0.500 (1/2)" in section  # coverage: b.mp4 of a.mp4, b.mp4
+    assert s1 in section
+    assert "需覆核比例 review_ratio | 0.250 (1/4)" in text  # a.mp4 round 2: vetoed, unreviewed

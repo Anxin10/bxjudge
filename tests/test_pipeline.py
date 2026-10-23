@@ -1306,3 +1306,35 @@ def test_manual_match_with_moved_camera_measures_shake_against_the_videos_own_fr
     assert v["calibration"]["kind"] == "manual"
     rows = json.loads((out / "rounds.json").read_text())
     _assert_own_reference(series[0], _cpu_th(), rows)
+
+
+# --------------------------------------------------------------------------- vetoes (auto-calibration Task 4, ruling T4-1)
+
+
+def test_veto_turns_the_group_into_recalibrate_without_rejudging_every_run(tmp_path, rules):
+    from bxjudge.calibration_store import veto_calibration
+    from tests.helpers import (
+        FakeDetector,
+        read_matches,
+        stadium_scene,
+        write_scene_video,
+    )
+
+    videos, calib, out = _clip_setup(tmp_path)
+    first = FakeDetector()
+    _run(videos, calib, out, rules, detector=first)
+    assert first.frames
+    sid = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]["id"]
+    veto_calibration(out, sid)
+    assert not read_matches(out)  # its unreviewed rounds no longer score
+    # A new video at the same camera position joins the vetoed group: not judged either.
+    write_scene_video(videos / "clip2.mp4", stadium_scene(shift=(46, 21))[0], seconds=3.0, fps=30)
+    for _ in range(2):  # the second run changes nothing else: still no detector work
+        detector = FakeDetector()
+        _run(videos, calib, out, rules, detector=detector)
+        assert detector.frames == []
+        v = json.loads((out / "videos.json").read_text())
+        assert v["clip.mp4"]["calibration"] is None and v["clip2.mp4"]["calibration"] is None
+        rows = json.loads((out / "rounds.json").read_text())
+        assert sorted((r["video"], r["review_reasons"]) for r in rows) == [
+            ("clip.mp4", ["recalibrate"]), ("clip2.mp4", ["recalibrate"])]

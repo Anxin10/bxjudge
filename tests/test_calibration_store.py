@@ -13,10 +13,13 @@ from bxjudge.calibration_store import (
     load_snapshot,
     save_snapshot,
     select_snapshot,
+    unveto_calibration,
+    veto_calibration,
+    vetoed_ids,
     write_preview,
 )
 from bxjudge.config import load_thresholds
-from tests.helpers import stadium_scene
+from tests.helpers import results_with_two_positions, stadium_scene
 
 
 def th():
@@ -186,3 +189,67 @@ def test_removed_template_makes_its_auto_snapshot_ineligible(tmp_path):
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).kind == "auto"
     (calib / "scene.json").unlink()
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config()) is None
+
+
+# ---- vetoes (Task 4, ruling T4-1) ------------------------------------------------------
+
+
+def test_veto_unknown_id_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        veto_calibration(results_with_two_positions(tmp_path), "0" * 16)
+
+
+def test_veto_file_records_time_and_note_and_unveto_restores(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    assert vetoed_ids(out) == set()
+    veto_calibration(out, a.id, note="rim off by 10 px")
+    assert vetoed_ids(out) == {a.id}
+    entry = json.loads((out / "calibration_vetoes.json").read_text())[a.id]
+    assert entry["note"] == "rim off by 10 px" and entry["at"]
+    unveto_calibration(out, a.id)
+    assert vetoed_ids(out) == set()
+    unveto_calibration(out, a.id)  # idempotent
+    with pytest.raises(ValueError):
+        unveto_calibration(out, "0" * 16)
+
+
+def test_veto_applies_to_auto_snapshots_only(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config())
+    assert manual.kind == "manual"
+    with pytest.raises(ValueError, match="manual"):
+        veto_calibration(out, manual.id)
+    assert not (out / "calibration_vetoes.json").exists()
+
+
+def test_vetoed_auto_snapshot_is_never_reused(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    other = stadium_scene(shift=(46, 21))[0]  # same camera position, a different video frame
+    assert select_snapshot(other, calib, out, th(), load_autocalib_config()).id == a.id
+    # Its own fresh alignment would be a different snapshot (its own reference frame) ...
+    fresh = select_snapshot(other, calib, tmp_path / "fresh", th(), load_autocalib_config())
+    assert fresh.kind == "auto" and fresh.id != a.id
+    # ... but a vetoed group is not re-aligned automatically from another of its videos.
+    assert select_snapshot(other, calib, out, th(), load_autocalib_config(), {a.id}) is None
+    assert len(list((out / "calibrations").glob("*.json"))) == 2  # template + a, nothing new
+
+
+def test_fresh_alignment_equal_to_a_vetoed_id_returns_none(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20))[0]
+    a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    assert select_snapshot(frame, calib, tmp_path / "again", th(), load_autocalib_config()).id == a.id
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config(), {a.id}) is None
+
+
+def test_veto_leaves_other_positions_and_manual_selection_alone(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    far = stadium_scene(shift=(-50, 25))[0]
+    b = select_snapshot(far, calib, out, th(), load_autocalib_config())
+    assert b.kind == "auto" and b.id != a.id
+    assert select_snapshot(far, calib, out, th(), load_autocalib_config(), {a.id}).id == b.id
+    manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config(), {a.id})
+    assert manual.kind == "manual"

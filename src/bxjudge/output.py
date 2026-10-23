@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import os
+from collections.abc import Set as AbstractSet
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -187,16 +188,34 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
     save_rounds(list(rows.values()), out_dir, rules)
 
 
-def matches_for(rows: list[dict], rules: Rules) -> list[Match]:
-    """Matches from the effective (reviewer-corrected) flat rows."""
-    return group_matches([row_to_result(effective(row)) for row in rows], rules)
+def scoring_rows(rows: list[dict], vetoed: AbstractSet[str] = frozenset()) -> list[dict]:
+    """``rows`` without the UNREVIEWED rows judged with a vetoed calibration snapshot: their
+    zones are untrusted, so they are no valid judgment to score (spec section 6.5). Reviewed
+    rows are human truth and always score."""
+    return [row for row in rows
+            if row.get("reviewed") is True or row.get("calibration_id") not in vetoed]
+
+
+def matches_for(rows: list[dict], rules: Rules,
+                vetoed: AbstractSet[str] = frozenset()) -> list[Match]:
+    """Matches from the effective (reviewer-corrected) flat rows; unreviewed rows of a
+    ``vetoed`` calibration snapshot are left out (``scoring_rows``)."""
+    return group_matches(
+        [row_to_result(effective(row)) for row in scoring_rows(rows, vetoed)], rules
+    )
 
 
 def save_rounds(rows: list[dict], out_dir: Path, rules: Rules) -> None:
     """Persist the COMPLETE flat row set and rebuild ``rounds.csv`` and ``matches.csv``.
 
-    The single export path shared by the judge writer and human corrections.
+    The single export path shared by the judge writer, human corrections and calibration
+    vetoes: ``matches.csv`` leaves out the unreviewed rows whose calibration snapshot is
+    vetoed in ``<out_dir>/calibration_vetoes.json``; ``rounds.json`` / ``rounds.csv`` keep
+    every row unchanged.
     """
+    # Deferred: calibration_store pulls in autocalib (and imports this module lazily).
+    from .calibration_store import vetoed_ids
+
     out_dir = Path(out_dir)
     keys = [(row["video"], row["round"]) for row in rows]
     if len(set(keys)) != len(keys):
@@ -220,7 +239,7 @@ def save_rounds(rows: list[dict], out_dir: Path, rules: Rules) -> None:
                 for r, outcome in m.rounds
             ],
         }
-        for i, m in enumerate(matches_for(merged, rules), 1)
+        for i, m in enumerate(matches_for(merged, rules, vetoed_ids(out_dir)), 1)
     ]
     _write_json(out_dir / "rounds.json", merged)
     _csv(out_dir / "rounds.csv", ROUND_FIELDS, merged)

@@ -21,7 +21,7 @@ import numpy as np
 
 from .autocalib import AutoCalibConfig, load_autocalib_config
 from .calibration import scale_calibration
-from .calibration_store import Snapshot, select_snapshot, write_preview
+from .calibration_store import Snapshot, select_snapshot, vetoed_ids, write_preview
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -135,12 +135,14 @@ def judge_video(
     autocalib: AutoCalibConfig,
     snapshot: Snapshot | None | object = _SELECT,
     on_snapshot: Callable[[Snapshot | None], None] | None = None,
+    vetoed: set[str] | frozenset[str] = frozenset(),
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
     Only the first second is buffered to select a calibration snapshot
     (``select_snapshot``: manual, else reused/new auto, else ``None`` = ``recalibrate``),
-    unless the caller already selected one on that same frame (``snapshot``, may be ``None``).
+    unless the caller already selected one on that same frame (``snapshot``, may be ``None``);
+    ``vetoed`` snapshot ids are honoured by that selection (ruling T4-1).
     The chosen snapshot (or ``None``) is reported to ``on_snapshot``. Its polygons are scaled to
     the decoded frame size; the stadium-displacement reference is that same first-second frame
     of this video (ruling T3-1: the snapshot's image serves only selection, grouping, previews);
@@ -159,7 +161,7 @@ def judge_video(
                 raise VideoDecodeError(f"{info.path}: no frames decoded")
             first = prefix[-1][1]
             snap = (
-                select_snapshot(first, calib_dir, out_dir, th, autocalib)
+                select_snapshot(first, calib_dir, out_dir, th, autocalib, vetoed)
                 if snapshot is _SELECT
                 else snapshot
             )
@@ -505,12 +507,15 @@ def run_batch(
     # Spec section 6.3b: an unchanged processed video is reanalysed when its calibration
     # changed. Selection needs only the first second, so it runs for every processed video;
     # a reanalysed video is judged with this same selection (not selected twice).
-    vetoed: set[str] = set()  # Task 4 fills this with the vetoed snapshot ids
+    # Ruling T4-1: a vetoed auto snapshot is never selected again; a video recorded with one
+    # is reanalysed into a cheap recalibrate placeholder (no detection) until a manual or a
+    # changed template applies.
+    vetoed = vetoed_ids(out_dir)
     preselected: dict[Path, Snapshot | None] = {}
     for info in processed_videos(folder, db, on_error=on_error):
         try:
             frame = first_second_frame(info, th)
-            snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib)
+            snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
         except Exception:
             # e.g. an unreadable first second: the normal per-video flow handles it.
             log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
@@ -541,6 +546,7 @@ def run_batch(
                     detection_config=detection_config,
                     autocalib=autocalib,
                     on_snapshot=chosen.append,
+                    vetoed=vetoed,
                     **({"snapshot": preselected[path]} if path in preselected else {}),
                 )
             except Exception:

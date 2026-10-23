@@ -289,18 +289,21 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     import sys
 
     from bxjudge import evaluate as ev
+    from bxjudge.calibration_store import vetoed_ids
     from bxjudge.rules import load_rules
 
     try:
         cfg, results, rows, timings, runs, truth = _eval_inputs(args)
         rules = load_rules(Path(args.rules).expanduser())
-        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs)
+        vetoed = vetoed_ids(results)
+        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs, vetoed=vetoed)
         ok = ev.passes(metrics, cfg)
         extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs)
         path, today = _report_path(args, "eval")
         _write_report(path, ev.render_eval_report(
             results, rows, timings, metrics, ok, extra, cfg, truth=truth,
-            truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today))
+            truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today,
+            vetoed=vetoed))
     except (ValueError, OSError, KeyError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

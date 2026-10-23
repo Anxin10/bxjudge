@@ -7,7 +7,17 @@ import cv2
 import pytest
 
 from bxjudge import output
-from tests.helpers import cal_with, make_ref_img, make_track, rr
+from bxjudge.calibration_store import unveto_calibration, veto_calibration
+from bxjudge.corrections import confirm_reviewed
+from tests.helpers import (
+    auto_snapshot_ids,
+    cal_with,
+    make_ref_img,
+    make_track,
+    read_matches,
+    results_with_two_positions,
+    rr,
+)
 
 FIELDS = [
     "video",
@@ -252,3 +262,48 @@ def test_trajectory_png_path_matches_writer(tmp_path):
     assert output.trajectory_png(tmp_path, r.video, r.round) == (
         tmp_path / "trajectories" / "nested__a_r2.png"
     )
+
+
+# ---- calibration vetoes (auto-calibration Task 4) -----------------------------------------
+
+S1, S2 = auto_snapshot_ids()
+
+
+def test_veto_excludes_unreviewed_rounds_from_matches_only(tmp_path):
+    out = results_with_two_positions(tmp_path)  # videos a.mp4 (snapshot S1) and b.mp4 (S2), 2 rounds each
+    veto_calibration(out, S1)
+    matches = read_matches(out)
+    assert all(r["video"] == "b.mp4" for m in matches for r in m["rounds"])
+    assert len(json.loads((out / "rounds.json").read_text())) == 4
+    unveto_calibration(out, S1)
+    assert {r["video"] for m in read_matches(out) for r in m["rounds"]} == {"a.mp4", "b.mp4"}
+
+
+def test_reviewed_rows_under_veto_still_score(tmp_path):
+    out = results_with_two_positions(tmp_path); confirm_reviewed(out, "a.mp4", 1); veto_calibration(out, S1)
+    assert ("a.mp4", 1) in {(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]}
+
+
+def test_veto_keeps_rows_byte_identical_and_every_rebuild_honours_it(tmp_path, rules):
+    out = results_with_two_positions(tmp_path)
+    before_rows = (out / "rounds.json").read_bytes()
+    before_csv = (out / "rounds.csv").read_bytes()
+    veto_calibration(out, S1, note="zones off by a pocket")
+    assert (out / "rounds.json").read_bytes() == before_rows  # vetoes never rewrite judgments
+    assert (out / "rounds.csv").read_bytes() == before_csv
+    # A later export through the shared path (judge writer / corrections) still honours it.
+    output.save_rounds(output.read_rounds(out), out, rules)
+    assert {r["video"] for m in read_matches(out) for r in m["rounds"]} == {"b.mp4"}
+    confirm_reviewed(out, "b.mp4", 2)
+    assert {r["video"] for m in read_matches(out) for r in m["rounds"]} == {"b.mp4"}
+
+
+def test_matches_for_excludes_only_unreviewed_vetoed_rows(rules):
+    rows = [output._result_row(rr("spin", "X", video="a.mp4", round=n)) for n in (1, 2, 3)]
+    for r in rows:
+        r["calibration_id"] = "S1"
+    rows[1]["reviewed"] = True
+    scored = [(r.video, r.round) for m in output.matches_for(rows, rules, vetoed={"S1"})
+              for r, _ in m.rounds]
+    assert scored == [("a.mp4", 2)]
+    assert len([r for m in output.matches_for(rows, rules) for r in m.rounds]) == 3
