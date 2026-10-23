@@ -38,6 +38,73 @@ def _add_calibrate(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_calibrate)
 
 
+
+def _cmd_autocalib(args: argparse.Namespace) -> int:
+    import math
+
+    from bxjudge import calibration
+    from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
+    from bxjudge.calibration_store import select_snapshot, vetoed_ids, write_preview
+    from bxjudge.config import load_thresholds
+
+    calib = Path(args.calib).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve()
+    if not calib.is_dir():
+        raise ValueError(f"{calib}: expected a calibration directory")
+    if out.exists() and not out.is_dir():
+        raise ValueError(f"{out}: expected an output directory")
+    if out.is_relative_to(calib) or calib.is_relative_to((out / "calibrations").resolve()):
+        raise ValueError("--out must keep generated snapshots outside --calib")
+    cfg = load_autocalib_config(Path(args.autocalib).expanduser())
+    th = load_thresholds()
+    truth = None
+    if args.truth:
+        path = Path(args.truth).expanduser()
+        try:
+            truth = calibration.load_calibration(path)
+            if min(truth.frame_size) <= 0 or any(
+                len(getattr(truth, field)) < 3
+                or not all(math.isfinite(v) for point in getattr(truth, field) for v in point)
+                for field, _, _ in calibration.ZONES
+            ):
+                raise ValueError(f"{path}: truth needs a positive frame size and 8 finite polygons")
+        except (KeyError, TypeError, AttributeError, OverflowError) as error:
+            raise ValueError(f"{path}: invalid calibration truth: {error}") from error
+    vetoed = vetoed_ids(out)
+    failed = False
+    for name in args.videos:
+        video = Path(name).expanduser()
+        frame = calibration.grab_frame(video, 1.0)
+        snap = select_snapshot(frame, calib, out, th, cfg, vetoed=vetoed)
+        if snap is None:
+            line = f"{video}: recalibrate name=none score=0.000"
+        else:
+            write_preview(out, snap)
+            line = f"{video}: {snap.kind} name={snap.calibration.name} score={snap.score:.3f}"
+        if truth is None:
+            line += " boundary_error_px=unverified"
+        elif snap is None:
+            line += " boundary_error_px=unverified FAIL"
+            failed = True
+        else:
+            error = mean_boundary_error(snap.calibration, truth, th.infer_long_edge)
+            passed = math.isfinite(error) and error < cfg.max_boundary_error_px
+            line += f" boundary_error_px={error:.2f} {'PASS' if passed else 'FAIL'}"
+            failed |= not passed
+        print(line)
+    return 1 if failed else 0
+
+
+def _add_autocalib(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("autocalib", help="check calibration snapshots and previews without judging")
+    p.add_argument("videos", nargs="+", help="video files; each uses its first-second frame")
+    p.add_argument("--calib", required=True, help="read-only manual template directory")
+    p.add_argument("--out", required=True, help="snapshot and preview output directory")
+    p.add_argument("--truth", help="manual calibration JSON for boundary-error acceptance")
+    p.add_argument("--autocalib", default="config/autocalib.yaml", help="auto-calibration policy")
+    p.set_defaults(func=_cmd_autocalib)
+
+
 def _cmd_scan(args: argparse.Namespace) -> int:
     import sys
 
@@ -394,7 +461,7 @@ def _add_audit_sample(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_audit_sample)
 
 
-_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
+_REGISTRARS = [_add_calibrate, _add_autocalib, _add_scan, add_label, _add_train, _add_compare, _add_run,
                _add_vlm, _add_review, _add_eval, _add_tune, _add_audit_sample]
 
 
