@@ -74,13 +74,15 @@ def test_filters_and_counts():
         row(round=3, needs_review=False),
         row(round=4, review_reasons=["recalibrate"]),
     ]
-    assert review_ui.FILTERS == ("全部", "需覆核", "已覆核", "抽樣稽核")
-    assert review_ui.filter_rows(rows, "全部") == rows
-    assert review_ui.filter_rows(rows, "抽樣稽核") == []
+    assert review_ui.FILTERS == ("全部", "需覆核", "已覆核", "抽樣稽核", "校準被否決")
+    out = Path("/nonexistent")  # no calibration records: nothing is vetoed
+    assert review_ui.filter_rows(rows, "全部", out) == rows
+    assert review_ui.filter_rows(rows, "抽樣稽核", out) == []
     rows[2]["audit_sample"] = True  # R62: random audit sample of unflagged rounds
-    assert review_ui.filter_rows(rows, "抽樣稽核") == [rows[2]]
-    assert review_ui.filter_rows(rows, "需覆核") == [rows[0], rows[3]]
-    assert review_ui.filter_rows(rows, "已覆核") == [rows[1]]
+    assert review_ui.filter_rows(rows, "抽樣稽核", out) == [rows[2]]
+    assert review_ui.filter_rows(rows, "需覆核", out) == [rows[0], rows[3]]
+    assert review_ui.filter_rows(rows, "已覆核", out) == [rows[1]]
+    assert review_ui.filter_rows(rows, "校準被否決", out) == []
     assert review_ui.counts(rows) == {"回合": 3, "待覆核": 1, "已覆核": 1, "分析診斷": 1}
 
 
@@ -458,6 +460,41 @@ def test_corrections_after_veto_keep_vetoed_unreviewed_rounds_out_of_matches(
     assert not at.exception, at.exception
     scored = [(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]]
     assert scored == [("clip.mp4", 1)]  # reviewed row scores; vetoed unreviewed row 2 does not
+
+
+def _vetoed_app(tmp_path, monkeypatch, rules):
+    out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
+    confirm_reviewed(out, "clip.mp4", 1, rules=rules)  # reviewed: changed_since_review, not vetoed
+    veto_calibration(out, SNAP_ID, rules=rules)
+    return out, app_test(out, monkeypatch).run()
+
+
+def test_vetoed_round_label_has_prefix(tmp_path, monkeypatch, rules):
+    _out, at = _vetoed_app(tmp_path, monkeypatch, rules)
+    assert not at.exception, at.exception
+    options = widget(at.sidebar.selectbox, "回合").options
+    assert [o for o in options if o.startswith("⛔ 校準被否決")] == [
+        o for o in options if "第 2 回合" in o
+    ]
+    assert not any("第 1 回合" in o and "⛔" in o for o in options)
+
+
+def test_vetoed_filter_selects_exactly_vetoed_rounds(tmp_path, monkeypatch, rules):
+    _out, at = _vetoed_app(tmp_path, monkeypatch, rules)
+    widget(at.sidebar.radio, "篩選").set_value("校準被否決").run()
+    assert not at.exception, at.exception
+    options = widget(at.sidebar.selectbox, "回合").options
+    assert len(options) == 1 and "第 2 回合" in options[0]
+
+
+def test_needs_review_filter_includes_vetoed_unreviewed_round(tmp_path, rules):
+    out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
+    veto_calibration(out, SNAP_ID, rules=rules)
+    rows = [{**find_row(out, "clip.mp4", n), "needs_review": False} for n in (1, 2)]
+    assert [r["round"] for r in review_ui.filter_rows(rows, "需覆核", out)] == [1, 2]
+    rows[1]["reviewed"] = True  # reviewed under a veto: changed_since_review, not vetoed
+    assert [r["round"] for r in review_ui.filter_rows(rows, "需覆核", out)] == [1]
+    assert [r["round"] for r in review_ui.filter_rows(rows, "校準被否決", out)] == [1]
 
 
 # ----------------------------------------------------------------------------- cli

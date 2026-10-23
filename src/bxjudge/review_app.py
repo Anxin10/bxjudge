@@ -273,12 +273,13 @@ def main() -> None:
         col.metric(label, value)
 
     choice = st.sidebar.radio("篩選", ui.FILTERS, key="filter")
-    shown = ui.filter_rows(rows, choice)
+    shown = ui.filter_rows(rows, choice, out)
     if not shown:
         st.info(f"沒有「{choice}」的回合。")
         return
     labels = {
-        _row_key(r): f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}"
+        _row_key(r): (f"{ui.VETOED_PREFIX} · " if ui.calibration_status(out, r) == "vetoed" else "")
+        + f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}"
         + (" · 抽樣稽核" if r.get("audit_sample") is True else "")
         for r in shown
     }

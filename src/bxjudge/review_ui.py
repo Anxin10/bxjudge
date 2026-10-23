@@ -24,7 +24,9 @@ from .types import Calibration
 from .video import VideoDecodeError, iter_frames
 from .vlm import overlay_zones, recorded_source
 
-FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核")  # 抽樣稽核 = R62 random audit sample
+# 抽樣稽核 = R62 random audit sample; 校準被否決 = unreviewed rounds of a vetoed calibration
+FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核", "校準被否決")
+VETOED_PREFIX = "⛔ 校準被否決"
 
 # Calibration copy (spec section 6.5)
 NO_RECORD = "此結果沒有校準紀錄，請用新版重新執行 bxjudge run"
@@ -90,9 +92,16 @@ def status(row: dict) -> str:
     return "待覆核" if row.get("needs_review") else "未標記"
 
 
-def filter_rows(rows: list[dict], choice: str) -> list[dict]:
+def filter_rows(rows: list[dict], choice: str, out_dir: Path) -> list[dict]:
     if choice == "需覆核":
-        return [r for r in rows if status(r) in ("待覆核", "分析診斷")]
+        # a vetoed unreviewed round needs human work even when it was not flagged
+        # (same rule as evaluate.review_ratio)
+        return [
+            r for r in rows
+            if status(r) in ("待覆核", "分析診斷") or calibration_status(out_dir, r) == "vetoed"
+        ]
+    if choice == "校準被否決":
+        return [r for r in rows if calibration_status(out_dir, r) == "vetoed"]
     if choice == "已覆核":
         return [r for r in rows if status(r) == "已覆核"]
     if choice == "抽樣稽核":
