@@ -24,6 +24,12 @@ def info(path=Path("a.mp4")):
     return VideoInfo(path, 1, 1, 4, 30, 1280, 720, "h264", False, None)
 
 
+def _empty_calib(tmp_path):
+    path = tmp_path / "calib"
+    path.mkdir(exist_ok=True)
+    return path
+
+
 def _kw(tmp_path):
     """judge_video's required keywords for unit tests."""
     return {"out_dir": tmp_path / "out", "autocalib": _ac()}
@@ -403,7 +409,7 @@ def test_placeholder_only_video_is_retried_until_real_rounds(
 
     def run():
         pipeline.run_batch(
-            tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+            tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
         )
 
     run()  # placeholder only: nothing recorded
@@ -429,7 +435,7 @@ def test_mixed_real_and_diagnostic_rows_video_is_cached(
     )
     out = tmp_path / "out"
     pipeline.run_batch(
-        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+        tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
     )
     assert "a.mp4" in (out / "processed_videos.json").read_text()
 
@@ -470,7 +476,7 @@ def test_run_cli_missing_calibration_is_error_line(tmp_path, capsys):
 def test_invalid_global_selection_fails_without_output(tmp_path):
     with pytest.raises((ValueError, FileNotFoundError)):
         pipeline.run_batch(
-            tmp_path, tmp_path, tmp_path / "out", selection=tmp_path / "absent.json"
+            tmp_path, _empty_calib(tmp_path), tmp_path / "out", selection=tmp_path / "absent.json"
         )
     assert not (tmp_path / "out").exists()
 
@@ -555,7 +561,7 @@ def test_invalid_numeric_config_fails_before_model_and_outputs(
 
     monkeypatch.setattr(pipeline, "load_detector", forbidden)
     with pytest.raises(ValueError, match="threshold"):
-        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out", thresholds=thresholds)
+        pipeline.run_batch(tmp_path, _empty_calib(tmp_path), tmp_path / "out", thresholds=thresholds)
     assert not (tmp_path / "out").exists()
 
 
@@ -568,7 +574,7 @@ def test_run_batch_injected_dependencies_require_no_selection(
     )
     out = tmp_path / "out"
     pipeline.run_batch(
-        tmp_path, tmp_path, out, detector=lambda *a: [], rules=rules, th=th
+        tmp_path, _empty_calib(tmp_path), out, detector=lambda *a: [], rules=rules, th=th
     )
     assert json.loads((out / "rounds.json").read_text())[0]["finish"] == "spin"
 
@@ -738,7 +744,7 @@ def test_injected_thresholds_are_the_detector_policy(tmp_path, monkeypatch, th, 
 
     monkeypatch.setattr(pipeline, "load_detector", loader)
     pipeline.run_batch(
-        tmp_path, tmp_path, tmp_path / "out", selection=selection, th=th, rules=rules
+        tmp_path, _empty_calib(tmp_path), tmp_path / "out", selection=selection, th=th, rules=rules
     )
     assert captured == [th]
 
@@ -765,7 +771,7 @@ def test_invalid_tracking_is_startup_failure(tmp_path, monkeypatch, tracking_cha
     monkeypatch.setattr(pipeline, "load_detector", forbidden)
     with pytest.raises(ValueError, match="tracking"):
         pipeline.run_batch(
-            tmp_path, tmp_path, tmp_path / "out", detection_config=config
+            tmp_path, _empty_calib(tmp_path), tmp_path / "out", detection_config=config
         )
     assert not (tmp_path / "out").exists()
 
@@ -774,7 +780,7 @@ def test_case_variant_video_artifact_collision_fails_preflight(tmp_path):
     (tmp_path / "a.mp4").touch()
     (tmp_path / "a.MP4").touch()
     with pytest.raises(ValueError, match="basename|artifact"):
-        pipeline.run_batch(tmp_path, tmp_path, tmp_path / "out")
+        pipeline.run_batch(tmp_path, _empty_calib(tmp_path), tmp_path / "out")
     assert not (tmp_path / "out").exists()
 
 
@@ -810,7 +816,7 @@ def test_run_records_batch_wall_clock_with_vlm_phase_inside(tmp_path, monkeypatc
     monkeypatch.setattr(pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")])
     monkeypatch.setattr(pipeline, "review_results_dir", review)
     out = tmp_path / "out"
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     [run] = json.loads((out / "runs.json").read_text())
     videos = json.loads((out / "videos.json").read_text())
@@ -821,7 +827,7 @@ def test_run_records_batch_wall_clock_with_vlm_phase_inside(tmp_path, monkeypatc
     assert run["wall_s"] >= 0.1 + videos["a.mp4"]["processing_s"]
     assert run["wall_s"] >= run["vlm_wall_s"] + videos["a.mp4"]["processing_s"]
     # nothing new to judge: no record (init alone is not judgment wall-clock)
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     assert len(json.loads((out / "runs.json").read_text())) == 1
 
@@ -859,7 +865,7 @@ def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     out = tmp_path / "out"
     pipeline.run_batch(
         folder,
-        tmp_path,
+        _empty_calib(tmp_path),
         out,
         selection=_synthetic_selection(tmp_path),
         vlm_config=_vlm_config(tmp_path),
@@ -907,7 +913,7 @@ def test_detector_freed_then_gpu_cache_released_before_first_vlm_work(
     )
     pipeline.run_batch(
         folder,
-        tmp_path,
+        _empty_calib(tmp_path),
         tmp_path / "out",
         selection=_synthetic_selection(tmp_path),
         vlm_config=_vlm_config(tmp_path),
@@ -948,7 +954,7 @@ def test_vlm_phase_is_opt_in_and_config_guarded(tmp_path, monkeypatch, rules, th
     ):
         pipeline.run_batch(
             tmp_path,
-            tmp_path,
+            _empty_calib(tmp_path),
             tmp_path / name,
             detector=lambda *a: [],
             rules=rules,
@@ -968,7 +974,7 @@ def test_invalid_vlm_config_fails_before_model_and_outputs(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="loopback"):
         pipeline.run_batch(
             tmp_path,
-            tmp_path,
+            _empty_calib(tmp_path),
             tmp_path / "out",
             vlm_config=_vlm_config(tmp_path, host="http://192.0.2.10:11435"),
         )
@@ -997,7 +1003,7 @@ def test_unreachable_vlm_phase_records_no_vlm_wall_but_keeps_batch_wall(tmp_path
     monkeypatch.setattr(pipeline, "review_results_dir", lambda out_dir, **kw: {
         "asked": 0, "answered": 0, "unavailable": 1, "skipped": "vlm_unreachable", "models": {}})
     out = tmp_path / "out"
-    pipeline.run_batch(folder, tmp_path, out, selection=_synthetic_selection(tmp_path),
+    pipeline.run_batch(folder, _empty_calib(tmp_path), out, selection=_synthetic_selection(tmp_path),
                        vlm_config=_vlm_config(tmp_path))
     [run] = json.loads((out / "runs.json").read_text())
     assert run["vlm_wall_s"] is None and run["wall_s"] > 0  # R65
@@ -1437,3 +1443,161 @@ def test_placeholder_only_result_removes_the_processed_record_so_recovery_rejudg
     assert {r["calibration_id"] for r in rows} == {sid}
     db = json.loads((out / "processed_videos.json").read_text())
     assert [rec["calibration_id"] for rec in db.values()] == [sid]
+
+
+@pytest.mark.parametrize("failure", ["recalibrate", "decode_error", "analysis_error"])
+def test_latest_video_failure_survives_reviewed_round_collision_and_recovers(
+    tmp_path, rules, monkeypatch, failure
+):
+    from bxjudge.manifest import forget_processed
+    from bxjudge.review_ui import calibration_status
+    from bxjudge.video import VideoDecodeError
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    _confirm_reviewed(out, "clip.mp4", 1, rules)
+    before = json.loads((out / "rounds.json").read_text())
+    template = calib / "scene.json"
+    original = template.read_bytes()
+    def decode_unavailable(*args, **kwargs):
+        raise VideoDecodeError("synthetic decoder unavailable")
+    class BrokenDetector:
+        def __call__(self, *args):
+            raise RuntimeError("synthetic analysis unavailable")
+    with monkeypatch.context() as patch:
+        if failure == "recalibrate":
+            template.unlink()
+        elif failure == "decode_error":
+            patch.setattr(pipeline, "iter_frames", decode_unavailable)
+        else:
+            forget_processed(out / "processed_videos.json", videos / "clip.mp4")
+        _run(videos, calib, out, rules,
+             detector=BrokenDetector() if failure == "analysis_error" else None)
+    after = json.loads((out / "rounds.json").read_text())
+    assert after == before
+    metrics = _eval(out)
+    assert metrics.n_recalibrate_videos == (1 if failure == "recalibrate" else 0)
+    assert metrics.n_pending_videos == 1
+    assert metrics.coverage == 0
+    entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert entry["analysis_status"] == failure
+    assert calibration_status(out, after[0]) != "ok"
+    template.write_bytes(original)
+    _run(videos, calib, out, rules)
+    metrics = _eval(out)
+    assert metrics.n_pending_videos == metrics.n_recalibrate_videos == 0
+    assert metrics.coverage == 1
+    assert json.loads((out / "rounds.json").read_text()) == before
+    assert json.loads((out / "videos.json").read_text())["clip.mp4"]["analysis_status"] == "success"
+
+
+@pytest.mark.parametrize("failure", ["preselection_decode", "processed_probe", "changed_probe", "replacement_analysis"])
+def test_vetoed_predictions_and_audit_survive_transient_failure_and_undo(
+    tmp_path, rules, monkeypatch, failure
+):
+    import os
+
+    from bxjudge import manifest
+    from bxjudge.calibration_store import unveto_calibration
+    from bxjudge.video import VideoDecodeError
+    from tests.helpers import add_manual_calibration, read_matches, stadium_scene
+
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before = _eval(out)
+    def unavailable(*args, **kwargs):
+        if "probe" in failure:
+            raise ValueError("synthetic ffprobe unavailable")
+        raise VideoDecodeError("synthetic decoder unavailable")
+    class BrokenDetector:
+        def __call__(self, *args):
+            raise RuntimeError("synthetic replacement analysis failed")
+    with monkeypatch.context() as patch:
+        if "probe" in failure:
+            if failure == "changed_probe":
+                for video in videos.glob("*.mp4"):
+                    stat = video.stat()
+                    os.utime(video, (stat.st_atime, stat.st_mtime + 1))
+            patch.setattr(manifest, "probe", unavailable)
+        elif failure == "replacement_analysis":
+            add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+        else:
+            patch.setattr(pipeline, "iter_frames", unavailable)
+        _run(videos, calib, out, rules,
+             detector=BrokenDetector() if failure == "replacement_analysis" else None)
+    assert (out / "rounds.json").read_bytes() == before_rows
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_pending_videos == 2 and after.coverage == 0
+    entries = json.loads((out / "videos.json").read_text())
+    assert {entry["calibration"]["id"] for entry in entries.values()} == {sid}
+    expected = "analysis_error" if failure == "replacement_analysis" else "decode_error"
+    assert {entry["analysis_status"] for entry in entries.values()} == {expected}
+    unveto_calibration(out, sid, rules=rules)
+    assert len([r for match in read_matches(out) for r in match["rounds"]]) == 2
+    assert (out / "rounds.json").read_bytes() == before_rows
+    _run(videos, calib, out, rules)
+    recovered = _eval(out)
+    assert recovered.n_rounds == 2 and recovered.n_pending_videos == 0 and recovered.coverage == 1
+    rows = json.loads((out / "rounds.json").read_text())
+    assert next(r for r in rows if r["video"] == "clip.mp4") == json.loads(before_rows)[0]
+
+
+@pytest.mark.parametrize("layout", ["equal", "output_inside", "source_inside", "symlink_equal", "symlink_descendant", "symlink_ancestor"])
+@pytest.mark.parametrize("entrypoint", ["run", "select"])
+def test_source_output_overlap_is_rejected_before_work(tmp_path, rules, monkeypatch, layout, entrypoint):
+    from bxjudge.calibration_store import select_snapshot
+    from tests.helpers import FakeDetector, stadium_scene
+
+    videos, calib, out = _clip_setup(tmp_path)
+    if layout == "equal":
+        out = calib
+    elif layout == "output_inside":
+        out = calib / "generated"
+    elif layout == "source_inside":
+        out = tmp_path
+    else:
+        out.mkdir()
+        target = {"symlink_equal": calib, "symlink_descendant": calib / "generated",
+                  "symlink_ancestor": tmp_path}[layout]
+        if layout == "symlink_descendant":
+            target.mkdir()
+            (target / "keep.txt").write_bytes(b"source descendant")
+        (out / "calibrations").symlink_to(target, target_is_directory=True)
+    before = {p.relative_to(calib): p.read_bytes() for p in calib.rglob("*") if p.is_file()}
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid source/output layout reached model initialization")
+    monkeypatch.setattr(pipeline, "load_detector", forbidden)
+    with pytest.raises(ValueError, match="outside.*calib"):
+        if entrypoint == "run":
+            pipeline.run_batch(videos, calib, out, rules=rules, th=_cpu_th(), autocalib=_ac())
+        else:
+            select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, _cpu_th(), _ac())
+    # Real FakeDetector path must reject as well, before it writes any result/cache artifacts.
+    with pytest.raises(ValueError, match="outside.*calib"):
+        pipeline.run_batch(videos, calib, out, detector=FakeDetector(), rules=rules,
+                           th=_cpu_th(), autocalib=_ac())
+    assert {p.relative_to(calib): p.read_bytes() for p in calib.rglob("*") if p.is_file()} == before
+    assert not (out / "rounds.json").exists()
+    assert not (out / "videos.json").exists()
+    assert not (out / "processed_videos.json").exists()
+
+
+
+def test_policy_tightening_retries_processed_auto_video(tmp_path, rules):
+    from dataclasses import replace
+
+    from tests.helpers import FakeDetector
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    detector = FakeDetector()
+    pipeline.run_batch(videos, calib, out, detector=detector, rules=rules,
+                       th=_cpu_th(), autocalib=replace(_ac(), max_shift_frac=0.01))
+    assert detector.frames == []
+    assert _eval(out).n_recalibrate_videos == 1
+    assert json.loads((out / "processed_videos.json").read_text()) == {}
+    _run(videos, calib, out, rules)
+    assert _eval(out).coverage == 1
+    assert _eval(out).n_pending_videos == 0

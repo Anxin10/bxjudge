@@ -36,7 +36,12 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
-from bxjudge.autocalib import AutoCalibConfig, estimate_alignment, warp_calibration
+from bxjudge.autocalib import (
+    AutoCalibConfig,
+    estimate_alignment,
+    validate_alignment,
+    warp_calibration,
+)
 from bxjudge.calibration import ZONES, calibration_similarity, load_calibration
 from bxjudge.config import Thresholds
 from bxjudge.types import Calibration
@@ -62,6 +67,20 @@ class Snapshot:
     source_path: str | None  # manual: the calib/ JSON it was copied from
     source_sha256: str | None  # manual: SHA-256 of that JSON's bytes
     homography: tuple | None  # auto: 3x3 template px -> frame px
+
+
+def validate_output_paths(calib_dir: Path, out_dir: Path) -> None:
+    """Reject resolved source/output overlap before snapshot or result work begins.
+
+    Resolve both roots and the snapshot directory separately: a safe-looking output can
+    contain a calibrations symlink into the source root, a descendant, or an ancestor.
+    """
+    source = Path(calib_dir).expanduser().resolve()
+    output = Path(out_dir).expanduser().resolve()
+    snapshots = (output / "calibrations").resolve()
+    if any(target.is_relative_to(source) or source.is_relative_to(target)
+           for target in (output, snapshots)):
+        raise ValueError("--out must keep generated snapshots outside --calib (no overlapping roots)")
 
 
 def _cal_dir(out_dir: Path) -> Path:
@@ -222,6 +241,7 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     covers (same similarity test as reuse), so a vetoed group stays ``recalibrate`` until a
     manual calibration or a changed/new template applies, instead of being re-created from
     another video of the same group under a new id."""
+    validate_output_paths(calib_dir, out_dir)
     templates = _manual_templates(calib_dir)
 
     best_manual: _Template | None = None
@@ -241,7 +261,8 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     best_auto: Snapshot | None = None
     best_sim = -1.0
     barred: set[str] = set()  # templates whose vetoed auto snapshot covers this position
-    for s in _existing_auto_snapshots(out_dir, {t.id for t in templates}):
+    by_id = {t.id: t for t in templates}
+    for s in _existing_auto_snapshots(out_dir, set(by_id)):
         try:
             sim = calibration_similarity(frame, s.calibration)
         except _LOAD_ERRORS as e:
@@ -252,7 +273,12 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
         if s.id in vetoed:
             barred.add(s.template_id)
         elif sim > best_sim:
-            best_auto, best_sim = s, sim
+            template = by_id[s.template_id]
+            reference = cv2.imread(s.calibration.ref_frame, cv2.IMREAD_COLOR)
+            if (reference is not None and s.homography is not None and s.score >= cfg.min_score
+                    and validate_alignment(reference, template.cal, template.img,
+                                           s.homography, cfg) is not None):
+                best_auto, best_sim = s, sim
     if best_auto is not None:
         return best_auto
 

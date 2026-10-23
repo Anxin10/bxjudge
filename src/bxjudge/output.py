@@ -266,6 +266,22 @@ def record_video_timing(
     _write_json(path, rows)
 
 
+VIDEO_FAILURE_STATUSES = frozenset({"recalibrate", "decode_error", "analysis_error"})
+
+
+def record_video_status(out_dir: Path, video: str, status: str) -> None:
+    """Latest analysis outcome, independent of historical rows and retained calibration.
+
+    Failure diagnostics can update this field without replacing predictions or audit flags.
+    """
+    if status not in VIDEO_FAILURE_STATUSES | {"success", "no_round"}:
+        raise ValueError(f"unknown video analysis status: {status}")
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    rows.setdefault(video, {})["analysis_status"] = status
+    _write_json(path, rows)
+
+
 def record_video_calibration(out_dir: Path, video: str, snap: Snapshot | None) -> None:
     """Record in ``videos.json[video]["calibration"]`` the snapshot the video was judged with
     (``{"id", "kind", "name", "score", "template_id"}``; ``score`` is this video's similarity

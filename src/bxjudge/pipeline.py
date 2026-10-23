@@ -21,7 +21,13 @@ import numpy as np
 
 from .autocalib import AutoCalibConfig, load_autocalib_config
 from .calibration import scale_calibration
-from .calibration_store import Snapshot, select_snapshot, vetoed_ids, write_preview
+from .calibration_store import (
+    Snapshot,
+    select_snapshot,
+    validate_output_paths,
+    vetoed_ids,
+    write_preview,
+)
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -44,8 +50,11 @@ from .manifest import (
     scan,
 )
 from .output import (
+    VIDEO_FAILURE_STATUSES,
+    read_rounds,
     record_run_timing,
     record_video_calibration,
+    record_video_status,
     record_video_timing,
     write_results,
     write_trajectory,
@@ -470,6 +479,7 @@ def run_batch(
     calib_dir = Path(calib_dir).expanduser()
     if not calib_dir.is_dir():
         raise ValueError(f"{calib_dir}: expected calibration directory (--calib)")
+    validate_output_paths(calib_dir, out_dir)
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
@@ -517,12 +527,19 @@ def run_batch(
     # Rulings T4-1/T4-3: a vetoed auto snapshot is never selected again; a video recorded with
     # one keeps its rows until selection yields a non-vetoed snapshot (then it is reanalysed).
     vetoed = vetoed_ids(out_dir)
+    retained_vetoed = {r["video"] for r in read_rounds(out_dir)
+                       if r.get("calibration_id") in vetoed}
     preselected: dict[Path, Snapshot | None] = {}
     for info in processed_videos(folder, db, on_error=on_error):
         try:
             frame = first_second_frame(info, th)
             snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
-        except Exception:
+        except Exception as error:
+            if info.path.name in retained_vetoed:
+                log.exception("cannot re-select %s; retaining vetoed predictions", info.path)
+                record_video_status(out_dir, info.path.name,
+                                    "decode_error" if isinstance(error, VideoDecodeError) else "analysis_error")
+                continue
             # e.g. an unreadable first second: the normal per-video flow handles it.
             log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
             infos.append(info)
@@ -531,6 +548,10 @@ def run_batch(
         if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
             infos.append(info)
             preselected[info.path] = snap
+        elif snap is not None:
+            # Unchanged input and accepted historical snapshot: a transient selection/probe
+            # outage has recovered; its successful analysis is still reusable.
+            record_video_status(out_dir, info.path.name, "success")
     entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
     if limit is not None:
         entries = entries[:limit]
@@ -561,6 +582,15 @@ def run_batch(
                     [_review(path.name, info.duration, "analysis_error")], provenance
                 )
         snap = chosen[-1] if chosen else None
+        outcome_errors = {reason for r in results for reason in r.review_reasons} & VIDEO_FAILURE_STATUSES
+        status = next(iter(sorted(outcome_errors))) if outcome_errors else (
+            "no_round" if all(is_not_a_round(r.review_reasons) for r in results) else "success")
+        if path.name in retained_vetoed and (status != "success" or snap is None):
+            # F3: no usable replacement analysis, including scan/probe, decode and detector
+            # failures. Preserve raw predictions, audit membership, identity and processed
+            # record; the independent diagnostic remains visible and is retried next run.
+            record_video_status(out_dir, path.name, status)
+            continue
         write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
         record_video_timing(
@@ -571,6 +601,7 @@ def run_batch(
             source_video=path.resolve(),
         )
         record_video_calibration(out_dir, path.name, snap)
+        record_video_status(out_dir, path.name, status)
         # Placeholder-only videos await corrected input and are retried (R56): their record
         # is removed, never left stale with an earlier success's id (ruling T4-5).
         if all(is_not_a_round(r.review_reasons) for r in results):

@@ -23,7 +23,7 @@ import numpy as np
 import yaml
 
 from .config import config_loader
-from .output import effective, matches_for, row_to_result
+from .output import VIDEO_FAILURE_STATUSES, effective, matches_for, row_to_result
 from .rules import SIDES, Rules, group_matches, is_not_a_round
 from .vlm import UNAVAILABLE_PREFIX
 
@@ -171,15 +171,11 @@ class Metrics:
     finish_accuracy_unflagged_coverage: float = NAN
     # Calibration (spec 6.6b): vetoed / failed calibrations never leave the population.
     n_vetoed_rounds: int = 0  # real rounds judged with a vetoed snapshot (reviewed or not)
-    n_recalibrate_videos: int = 0  # videos whose result is a ``recalibrate`` placeholder
+    n_recalibrate_videos: int = 0  # latest video outcome is ``recalibrate``
     n_vetoed_groups: int = 0  # vetoed calibration snapshots
     n_vetoed_videos: int = 0  # videos recorded (videos.json) with a vetoed snapshot
     coverage: float = NAN  # videos judged with a non-vetoed snapshot / all videos in videos.json
-    n_pending_videos: int = 0  # recalibrate + vetoed videos (await recalibration or a rerun)
-
-
-# A video whose rows are only these placeholders was not judged, whatever snapshot it recorded.
-_FAILED_REASONS = frozenset({"recalibrate", "decode_error", "analysis_error"})
+    n_pending_videos: int = 0  # latest failures + vetoed videos (await a rerun)
 
 
 def _vetoed_pending(row: dict, vetoed: set[str]) -> bool:
@@ -191,17 +187,14 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
                          vetoed: set[str] | None = None) -> dict:
     """Spec 6.6b calibration summary: vetoed rounds/videos/groups, ``recalibrate`` videos
     (video level: they have no round, R53), effective coverage = videos of ``videos.json``
-    judged with a recorded, non-vetoed snapshot (and not only failure placeholders) / all of
-    them (nan without ``videos.json``), and pending = recalibrate + vetoed videos. Vetoed
+    judged with a recorded, non-vetoed snapshot and successful current outcome / all of
+    them (nan without ``videos.json``), and pending = current failures + vetoed videos. Vetoed
     videos come from ``videos.json`` (else, without it, from the vetoed rows)."""
     vetoed = set(vetoed or ())
     real = real_rows(rows)
     vetoed_rows = [r for r in real if r.get("calibration_id") in vetoed]
     recal = {r["video"] for r in rows if "recalibrate" in (r.get("review_reasons") or [])}
-    reasons: dict[str, list[set]] = {}
-    for r in rows:
-        reasons.setdefault(r["video"], []).append(set(r.get("review_reasons") or []))
-    failed = {v for v, rs in reasons.items() if all(_FAILED_REASONS & s for s in rs)}
+    failed = {r["video"] for r in rows if VIDEO_FAILURE_STATUSES & set(r.get("review_reasons") or [])}
 
     def recorded(entry) -> str | None:
         cal = entry.get("calibration") if isinstance(entry, dict) else None
@@ -212,9 +205,12 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
         covered: list[str] = []
         total = 0
     else:
+        # Latest video outcome wins over retained reviewed rounds (including round 1).
+        recal = {v for v, e in timings.items() if e.get("analysis_status") == "recalibrate"}
+        failed = {v for v, e in timings.items() if e.get("analysis_status") in VIDEO_FAILURE_STATUSES}
         vetoed_videos = {v for v, e in timings.items() if recorded(e) in vetoed}
         covered = sorted(v for v, e in timings.items() if recorded(e) is not None
-                         and recorded(e) not in vetoed and v not in failed)
+                         and recorded(e) not in vetoed and e.get("analysis_status") in {"success", "no_round"})
         total = len(timings)
     groups = {}
     for sid in sorted(vetoed):
@@ -233,7 +229,7 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
         "n_covered": len(covered),
         "n_videos": total,
         "coverage": _ratio(len(covered), total) if timings is not None else NAN,
-        "pending_videos": sorted(recal | vetoed_videos),
+        "pending_videos": sorted(failed | vetoed_videos),
     }
 
 
@@ -1228,7 +1224,7 @@ def _calibration_section(rows, timings, m: Metrics, vetoed: set[str] | None) -> 
         (f"| 被否決的校準組 Vetoed groups | {m.n_vetoed_groups} group(s); "
          f"{m.n_vetoed_videos} video(s); {m.n_vetoed_rounds} round(s), "
          f"{c['n_vetoed_unreviewed']} unreviewed |"),
-        (f"| 待處理影片 Pending videos | {m.n_pending_videos} (recalibrate + vetoed): "
+        (f"| 待處理影片 Pending videos | {m.n_pending_videos} (analysis failures + vetoed): "
          f"{names(c['pending_videos'])} |"),
         "",
     ]

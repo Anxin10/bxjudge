@@ -21,3 +21,10 @@ ecc_iterations: 200
 ecc_epsilon: 1.0e-6
 # Acceptance threshold for the mean boundary error between auto and manual zones (inference px).
 max_boundary_error_px: 8.0
+# Local rim support: eight angular sectors independently search residual translation.
+# Distances use a 1280-pixel long edge; at least half the sectors must support the warp.
+# Occluded or textureless sectors may fail; a globally bent warp must not pass on NCC alone.
+local_search_px: 24.0
+max_local_shift_px: 4.0
+min_local_score: 0.6
+min_consistent_fraction: 0.5

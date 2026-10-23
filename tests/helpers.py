@@ -371,6 +371,7 @@ def videos_with_calibration(ids: dict) -> dict:
         f"{name}.mp4": {
             "duration_s": 10.0,
             "processing_s": 5.0,
+            "analysis_status": "recalibrate" if sid is None else "success",
             "calibration": None if sid is None else {
                 "id": sid, "kind": "auto", "name": "auto-test", "score": 0.9,
                 "template_id": "f" * 16},
@@ -404,6 +405,7 @@ def results_with_two_positions(tmp_path):
 
     from bxjudge.output import (
         record_video_calibration,
+        record_video_status,
         record_video_timing,
         write_results,
     )
@@ -417,6 +419,7 @@ def results_with_two_positions(tmp_path):
                            calibration_id=snap.id) for n in (1, 2)]
         record_video_timing(out, video, 30.0, 10.0)
         record_video_calibration(out, video, snap)
+        record_video_status(out, video, "success")
     write_results(rounds, out, load_rules())
     return out
 

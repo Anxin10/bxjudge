@@ -1124,11 +1124,12 @@ def test_calibration_metrics_without_vetoes_or_timings():
 
 def test_failed_analysis_with_a_snapshot_is_not_coverage():
     timings = videos_with_calibration({"a": "S2", "b": "S2", "c": None})
+    timings["b.mp4"]["analysis_status"] = "analysis_error"
     rows = [rev(video="a.mp4", calibration_id="S2"), placeholder("b.mp4", "analysis_error"),
             placeholder("c.mp4", "recalibrate")]
     m = evaluate(rows, timings=timings, vetoed=set())
     assert m.coverage == pytest.approx(1 / 3)
-    assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 1
+    assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 2
 
 
 def test_cli_eval_reports_calibration_section(tmp_path):

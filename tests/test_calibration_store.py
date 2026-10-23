@@ -262,3 +262,82 @@ def test_load_snapshot_rejects_malformed_document_or_metadata_shape(tmp_path, do
     (directory / "broken.json").write_text(json.dumps(document))
     with pytest.raises(ValueError, match="snapshot"):
         load_snapshot(tmp_path, "broken")
+
+
+@pytest.mark.parametrize("policy", [
+    {"min_score": 1.0}, {"max_shift_frac": 0.01}, {"max_rotation_deg": 0.1},
+    {"max_scale": 1.01}, {"min_scale": 1.1}, {"max_perspective": 0.0},
+    {"min_consistent_fraction": 1.0},
+])
+def test_cached_auto_obeys_current_policy_like_fresh_selection(tmp_path, policy):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20), rotation_deg=3, scale=1.06)[0]
+    cfg = load_autocalib_config()
+    original = select_snapshot(frame, calib, out, th(), cfg)
+    assert original.kind == "auto"
+    cfg = replace(cfg, **policy)
+    assert select_snapshot(frame, calib, tmp_path / "fresh", th(), cfg) is None
+    assert select_snapshot(frame, calib, out, th(), cfg) is None
+    assert load_snapshot(out, original.id) == original
+
+
+def test_eligible_cache_reuse_does_not_repeat_estimation(tmp_path, monkeypatch):
+    import bxjudge.calibration_store as store
+
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame = stadium_scene(shift=(45, 20))[0]
+    original = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    def unexpected(*args):
+        raise AssertionError("eligible grouping must not repeat full estimation")
+    monkeypatch.setattr(store, "estimate_alignment", unexpected)
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).id == original.id
+
+
+@pytest.mark.parametrize("axis, policy", [
+    (0, {"max_scale": 1.03}), (1, {"max_scale": 1.03}),
+    (0, {"min_scale": 0.97}), (1, {"min_scale": 0.97}),
+])
+def test_cached_policy_checks_principal_stretches_not_average_scale(tmp_path, axis, policy):
+    image, _ = stadium_scene()
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    scales = [1.06, 0.94] if axis == 0 else [0.94, 1.06]
+    matrix = np.array([[scales[0], 0, 45 + 640 * (1 - scales[0])],
+                       [0, scales[1], 20 + 360 * (1 - scales[1])], [0, 0, 1]])
+    frame = cv2.warpPerspective(image, matrix, (1280, 720))
+    cfg = load_autocalib_config()
+    from bxjudge.autocalib import validate_alignment, warp_calibration
+    from bxjudge.calibration import load_calibration
+
+    template = load_calibration(calib / "scene.json")
+    # Isolate cache geometry policy from the coarse estimator's convergence basin: this
+    # exact known transform is a legitimate accepted snapshot, not an approximate ECC fit.
+    alignment = validate_alignment(frame, template, image, matrix, cfg)
+    assert alignment is not None
+    manual = select_snapshot(image, calib, out, th(), cfg)
+    original = save_snapshot(out, "auto", warp_calibration(template, alignment, (1280, 720), "auto-scene"),
+                             frame, score=alignment.score, template_id=manual.id,
+                             homography=alignment.homography)
+    assert select_snapshot(frame, calib, out, th(), cfg).id == original.id
+    cfg = replace(cfg, **policy)
+    assert cfg.min_scale < alignment.scale < cfg.max_scale  # average scale alone would pass
+    assert validate_alignment(frame, template, image, matrix, cfg) is None
+    fresh = select_snapshot(frame, calib, tmp_path / "fresh", th(), cfg)
+    cached = select_snapshot(frame, calib, out, th(), cfg)
+    assert cached is None or cached.id != original.id
+    assert (cached.id if cached else None) == (fresh.id if fresh else None)
+
+
+
+@pytest.mark.parametrize("x", [24, 900])
+def test_old_locally_inconsistent_cache_cannot_bypass_new_policy(tmp_path, x):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    frame, _ = stadium_scene(shift=(49.019032876749094, -34.65765420413904),
+                             rotation_deg=-0.9879950469803092, scale=1.018190471590685)
+    displaced = cv2.warpAffine(frame, np.float32([[1, 0, 25], [0, 1, 0]]), (1280, 720))
+    frame[8:366, x:x + 334] = displaced[8:366, x:x + 334]
+    cfg = load_autocalib_config()
+    prior = select_snapshot(frame, calib, out, th(), replace(cfg, min_consistent_fraction=0.125))
+    assert prior is not None and prior.kind == "auto"
+    assert select_snapshot(frame, calib, tmp_path / "fresh", th(), cfg) is None
+    assert select_snapshot(frame, calib, out, th(), cfg) is None
+    assert load_snapshot(out, prior.id) == prior

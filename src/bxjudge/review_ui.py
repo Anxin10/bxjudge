@@ -18,6 +18,7 @@ from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds
 from .corrections import Correction, current_value
 from .manifest import probe
+from .output import VIDEO_FAILURE_STATUSES
 from .rules import is_not_a_round
 from .types import Calibration
 from .video import VideoDecodeError, iter_frames
@@ -181,7 +182,10 @@ def calibration_status(out_dir: Path, row: dict) -> str:
         return "no_record"
     path = Path(out_dir) / "videos.json"
     videos = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    current = (videos.get(row["video"], {}).get("calibration") or {}).get("id")
+    entry = videos.get(row["video"], {})
+    if entry.get("analysis_status") in VIDEO_FAILURE_STATUSES:
+        return "pending"
+    current = (entry.get("calibration") or {}).get("id")
     vetoed = snapshot.id in vetoed_ids(out_dir)
     if row.get("reviewed") and (vetoed or snapshot.id != current):
         return "changed_since_review"

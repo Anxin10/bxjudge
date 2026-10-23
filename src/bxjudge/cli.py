@@ -44,7 +44,12 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
 
     from bxjudge import calibration
     from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
-    from bxjudge.calibration_store import select_snapshot, vetoed_ids, write_preview
+    from bxjudge.calibration_store import (
+        select_snapshot,
+        validate_output_paths,
+        vetoed_ids,
+        write_preview,
+    )
     from bxjudge.config import load_thresholds
 
     calib = Path(args.calib).expanduser().resolve()
@@ -53,10 +58,7 @@ def _cmd_autocalib(args: argparse.Namespace) -> int:
         raise ValueError(f"{calib}: expected a calibration directory")
     if out.exists() and not out.is_dir():
         raise ValueError(f"{out}: expected an output directory")
-    snapshot_dir = (out / "calibrations").resolve()
-    if (out.is_relative_to(calib) or snapshot_dir.is_relative_to(calib)
-            or calib.is_relative_to(snapshot_dir)):
-        raise ValueError("--out must keep generated snapshots outside --calib")
+    validate_output_paths(calib, out)
     cfg = load_autocalib_config(Path(args.autocalib).expanduser())
     th = load_thresholds()
     truth = None

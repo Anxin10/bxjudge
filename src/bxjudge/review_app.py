@@ -113,7 +113,10 @@ def _calibration(row: dict, out: Path, videos: dict, rules) -> Snapshot | None:
     if snapshot is None:
         st.warning("此結果沒有校準紀錄，請用新版重新執行 bxjudge run")
         return None
-    if state == "changed_since_review":
+    if state == "pending":
+        status = videos.get(row["video"], {}).get("analysis_status")
+        st.warning(f"此影片最近一次處理未完成（{status}），待重新處理；以下顯示歷史回合校準")
+    elif state == "changed_since_review":
         st.warning("覆核當時使用的校準已被否決／更換，請確認是否需要重新覆核")
     elif state == "vetoed":
         st.warning("校準被否決，需重新校準")

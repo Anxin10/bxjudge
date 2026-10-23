@@ -50,6 +50,10 @@ class AutoCalibConfig:
     ecc_iterations: int
     ecc_epsilon: float
     max_boundary_error_px: float
+    local_search_px: float
+    max_local_shift_px: float
+    min_local_score: float
+    min_consistent_fraction: float
 
 
 _INT_FIELDS = ("work_width", "ecc_iterations")
@@ -96,6 +100,10 @@ def load_autocalib_config(path: Path = Path("config/autocalib.yaml")) -> AutoCal
         raise ValueError(f"{path}: ecc_epsilon must be > 0, got {c.ecc_epsilon}")
     if c.max_boundary_error_px <= 0.0:
         raise ValueError(f"{path}: max_boundary_error_px must be > 0, got {c.max_boundary_error_px}")
+    if not 0 < c.max_local_shift_px < c.local_search_px:
+        raise ValueError(f"{path}: need 0 < max_local_shift_px < local_search_px")
+    if not 0 < c.min_local_score <= 1 or not 0 < c.min_consistent_fraction <= 1:
+        raise ValueError(f"{path}: local score/fraction must be in (0, 1]")
     return c
 
 
@@ -237,6 +245,43 @@ def _edge_ncc(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
     return float(np.clip((x * y).sum() / den, 0.0, 1.0))
 
 
+def local_consistency(te: np.ndarray, fe: np.ndarray, rim: np.ndarray, h: np.ndarray,
+                      centre: tuple[float, float], cfg: AutoCalibConfig) -> bool:
+    """Require spatial support for the warp, allowing occluded/textureless rim sectors.
+
+    Eight angular sectors independently search residual translations with masked NCC.
+    A sector supports the warp only if its best match is strong and close to zero. This
+    detects a homography bent by a local displaced structure even when global NCC is high.
+    Distances are normalised to a 1280-pixel long edge, independent of work resolution.
+    No ECC or global search is repeated (also suitable for checking cached snapshots).
+    """
+    height, width = fe.shape
+    unit = max(width, height) / 1280
+    radius = math.ceil(cfg.local_search_px * unit)
+    padded = cv2.copyMakeBorder(fe, radius, radius, radius, radius, cv2.BORDER_CONSTANT, value=0)
+    warped = cv2.warpPerspective(te, h, (width, height))
+    yy, xx = np.indices(rim.shape)
+    angle = np.arctan2(yy - centre[1], xx - centre[0])
+    supported = 0
+    for sector in range(8):
+        mask = (rim & (angle >= -math.pi + sector * math.pi / 4)
+                & (angle < -math.pi + (sector + 1) * math.pi / 4))
+        mask = cv2.warpPerspective(mask.astype(np.uint8), h, (width, height),
+                                   flags=cv2.INTER_NEAREST) > 0
+        ys, xs = np.nonzero(mask)
+        if xs.size < 16:
+            continue
+        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+        patch, pmask = warped[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+        if float(patch[pmask].std()) < 1e-6:
+            continue
+        scores = _masked_ncc_map(padded[y0:y1 + 2 * radius, x0:x1 + 2 * radius], patch, pmask)
+        _, score, _, loc = cv2.minMaxLoc(scores)
+        distance = math.hypot(loc[0] - radius, loc[1] - radius) / unit
+        supported += score >= cfg.min_local_score and distance <= cfg.max_local_shift_px
+    return supported / 8 >= cfg.min_consistent_fraction
+
+
 def estimate_alignment(frame: np.ndarray, template: Calibration, template_image: np.ndarray,
                        cfg: AutoCalibConfig) -> Alignment | None:
     """Homography mapping ``template`` (manual calibration, reference image ``template_image``)
@@ -294,19 +339,41 @@ def estimate_alignment(frame: np.ndarray, template: Calibration, template_image:
         return None
     h_work = h / h[2, 2]
 
-    # Score: edge NCC of the warped template vs the frame over the warped rim mask.
+    # Back to full resolution: template px -> work px -> frame px.
+    s_t = np.diag([full[0] / tw, full[1] / th, 1.0])
+    s_f = np.diag([full[0] / fw, full[1] / fh, 1.0])
+    hfull = np.linalg.inv(s_f) @ h_work @ s_t
+    return validate_alignment(frame, template, template_image, hfull, cfg)
+
+
+def validate_alignment(frame: np.ndarray, template: Calibration, template_image: np.ndarray,
+                       homography: np.ndarray, cfg: AutoCalibConfig) -> Alignment | None:
+    """Apply today's geometry, correlation and local-support policy to fresh or stored H.
+
+    Rechecking an immutable group's reference costs only edge maps and eight small template
+    matches, not coarse search/ECC; no historical snapshot is rewritten on a policy change.
+    """
+    fh, fw = frame.shape[:2]
+    tw, th = template.frame_size
+    hfull = np.asarray(homography, dtype=np.float64)
+    if (hfull.shape != (3, 3) or not np.all(np.isfinite(hfull))
+            or abs(hfull[2, 2]) < 1e-12 or min(fw, fh, tw, th) <= 0):
+        return None
+    hfull = hfull / hfull[2, 2]
+    cx, cy = _stadium_centroid(template)
+    full = (cfg.work_width, max(1, round(cfg.work_width * fh / fw)))
+    s_t = np.diag([full[0] / tw, full[1] / th, 1.0])
+    s_f = np.diag([full[0] / fw, full[1] / fh, 1.0])
+    h_work = s_f @ hfull @ np.linalg.inv(s_t)
     rim = rim_mask(template, full, max(1, round(RIM_MASK_MARGIN * full[0] / 320)))
     te = _edge_map(_gray(template_image, full))
     fe = _edge_map(_gray(frame, full))
     wte = cv2.warpPerspective(te, h_work, full, flags=cv2.INTER_LINEAR)
     wrim = cv2.warpPerspective(rim.astype(np.uint8), h_work, full, flags=cv2.INTER_NEAREST) > 0
     score = _edge_ncc(wte, fe, wrim)
-
-    # Back to full resolution: template px -> work px -> frame px.
-    s_t = np.diag([full[0] / tw, full[1] / th, 1.0])
-    s_f = np.diag([full[0] / fw, full[1] / fh, 1.0])
-    hfull = np.linalg.inv(s_f) @ h_work @ s_t
-    hfull /= hfull[2, 2]
+    if not local_consistency(te, fe, _region_mask(template, full), h_work,
+                             (cx * full[0] / tw, cy * full[1] / th), cfg):
+        return None
     # Motion in frame px: the template rescaled to the frame size, then moved by hn.
     s_tf = np.diag([fw / tw, fh / th, 1.0])
     hn = hfull @ np.linalg.inv(s_tf)
