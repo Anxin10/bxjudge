@@ -50,8 +50,11 @@ from .manifest import (
     scan,
 )
 from .output import (
+    TRANSIENT_FAILURES,
+    read_rounds,
     record_run_timing,
     record_video_calibration,
+    record_video_status,
     record_video_timing,
     write_results,
     write_trajectory,
@@ -436,6 +439,17 @@ def _validate_thresholds(th: Thresholds) -> None:
             raise ValueError(f"threshold {name} must be in [0, 1]")
 
 
+def analysis_status(results: list[RoundResult]) -> str:
+    """``videos.json`` ``analysis_status`` of one analysis attempt (ruling R68): the failure
+    placeholder's reason (``recalibrate`` / ``decode_error`` / ``analysis_error``), else ``ok``
+    (real rounds, or a completed analysis that found none: ``no_round``)."""
+    for r in results:
+        for reason in ("recalibrate", "decode_error", "analysis_error"):
+            if reason in r.review_reasons:
+                return reason
+    return "ok"
+
+
 def needs_reanalysis(
     recorded: str | None, current: str | None, vetoed: set[str]
 ) -> bool:
@@ -551,6 +565,14 @@ def run_batch(
         if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
             infos.append(info)
             preselected[info.path] = snap
+        else:
+            # Unchanged and readable again: its rows stand for the current calibration, so an
+            # earlier transient failure (R68) has cleared without re-judging.
+            record_video_status(out_dir, info.path.name, "ok")
+    # Ruling R68: "previously judged" = at least one real (non-placeholder) row on disk.
+    judged_before = {
+        r["video"] for r in read_rounds(out_dir) if not is_not_a_round(r["review_reasons"])
+    }
     entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
     if limit is not None:
         entries = entries[:limit]
@@ -581,6 +603,16 @@ def run_batch(
                     [_review(path.name, info.duration, "analysis_error")], provenance
                 )
         snap = chosen[-1] if chosen else None
+        status = analysis_status(results)
+        if status in TRANSIENT_FAILURES and path.name in judged_before:
+            # Ruling R68: a transient failure (decode, probe, analysis) of a previously judged
+            # video is no replacement analysis. Its rows (predictions, audit flags, calibration
+            # ids; vetoed ones too, T4-3), its videos.json timing/calibration and its processed
+            # record stay as they are; only the status changes. With the record left as it
+            # was (or still mismatching the changed file), the next run retries the video.
+            log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
+            record_video_status(out_dir, path.name, status)
+            continue
         write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
         record_video_timing(
@@ -591,6 +623,7 @@ def run_batch(
             source_video=path.resolve(),
         )
         record_video_calibration(out_dir, path.name, snap)
+        record_video_status(out_dir, path.name, status)
         # Placeholder-only videos await corrected input and are retried (R56): their record
         # is removed, never left stale with an earlier success's id (ruling T4-5).
         if all(is_not_a_round(r.review_reasons) for r in results):

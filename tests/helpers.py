@@ -364,19 +364,28 @@ def placeholder(video: str, reason: str) -> dict:
                review_reasons=[reason])
 
 
-def videos_with_calibration(ids: dict) -> dict:
+def videos_with_calibration(ids: dict, statuses: dict | bool = True) -> dict:
     """``videos.json`` content: ``{"a": "S1", "c": None}`` -> entry ``a.mp4`` judged with snapshot
-    ``S1`` (auto) and ``c.mp4`` without a snapshot (``recalibrate``)."""
-    return {
-        f"{name}.mp4": {
+    ``S1`` (auto) and ``c.mp4`` without a snapshot (``recalibrate``).
+
+    ``analysis_status`` (R68) is ``ok`` for a snapshot and ``recalibrate`` without one, unless
+    ``statuses`` (``{"a": "decode_error"}``) overrides it; ``statuses=False`` omits it, as in a
+    results folder written before R68."""
+    out = {}
+    for name, sid in ids.items():
+        entry = {
             "duration_s": 10.0,
             "processing_s": 5.0,
             "calibration": None if sid is None else {
                 "id": sid, "kind": "auto", "name": "auto-test", "score": 0.9,
                 "template_id": "f" * 16},
         }
-        for name, sid in ids.items()
-    }
+        if statuses is not False:
+            default = "recalibrate" if sid is None else "ok"
+            overrides = statuses if isinstance(statuses, dict) else {}
+            entry["analysis_status"] = overrides.get(name, default)
+        out[f"{name}.mp4"] = entry
+    return out
 
 
 def _fixed_auto_snapshot(out_dir, seed: int):
@@ -404,6 +413,7 @@ def results_with_two_positions(tmp_path):
 
     from bxjudge.output import (
         record_video_calibration,
+        record_video_status,
         record_video_timing,
         write_results,
     )
@@ -417,6 +427,7 @@ def results_with_two_positions(tmp_path):
                            calibration_id=snap.id) for n in (1, 2)]
         record_video_timing(out, video, 30.0, 10.0)
         record_video_calibration(out, video, snap)
+        record_video_status(out, video, "ok")
     write_results(rounds, out, load_rules())
     return out
 

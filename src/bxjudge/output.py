@@ -270,6 +270,26 @@ def record_video_timing(
     _write_json(path, rows)
 
 
+# Ruling R68: the outcome of a video's latest analysis attempt, recorded explicitly so the
+# evaluation never infers it (e.g. from ``calibration: null``).
+ANALYSIS_STATUSES = ("ok", "recalibrate", "decode_error", "analysis_error")
+# Transient failures: a previously judged video keeps its rows on these (R68).
+TRANSIENT_FAILURES = frozenset({"decode_error", "analysis_error"})
+
+
+def record_video_status(out_dir: Path, video: str, status: str) -> None:
+    """Record ``videos.json[video]["analysis_status"]`` (one of ``ANALYSIS_STATUSES``) without
+    touching anything else in the entry, so a failed rerun that keeps a video's rows can say
+    so while the timing and calibration of those rows stay as they were (ruling R68). Call
+    after ``record_video_timing``, which replaces the entry."""
+    if status not in ANALYSIS_STATUSES:
+        raise ValueError(f"unknown analysis_status {status!r}; expected one of {ANALYSIS_STATUSES}")
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    rows.setdefault(video, {})["analysis_status"] = status
+    _write_json(path, rows)
+
+
 def record_video_calibration(out_dir: Path, video: str, snap: Snapshot | None) -> None:
     """Record in ``videos.json[video]["calibration"]`` the snapshot the video was judged with
     (``{"id", "kind", "name", "score", "template_id"}``; ``score`` is this video's similarity

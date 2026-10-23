@@ -171,17 +171,22 @@ class Metrics:
     finish_accuracy_unflagged_coverage: float = NAN
     # Calibration (spec 6.6b): vetoed / failed calibrations never leave the population.
     n_vetoed_rounds: int = 0  # real rounds judged with a vetoed snapshot (reviewed or not)
-    n_recalibrate_videos: int = 0  # videos whose calibration selection failed (recalibrate)
+    # Per-video failure counts from videos.json ``analysis_status`` (R68); None = unverified
+    # (no videos.json, or an entry without analysis_status: never inferred).
+    n_recalibrate_videos: int | None = None  # latest attempt: calibration selection failed
     n_vetoed_groups: int = 0  # vetoed calibration snapshots
     n_vetoed_videos: int = 0  # videos recorded (videos.json) with a vetoed snapshot
-    coverage: float = NAN  # videos judged with a non-vetoed snapshot / all videos in videos.json
-    n_pending_videos: int = 0  # recalibrate + vetoed videos (await recalibration or a rerun)
+    # videos whose latest attempt succeeded with a non-vetoed snapshot / all videos in
+    # videos.json; nan = unverified (as above)
+    coverage: float = NAN
+    # recalibrate + decode/analysis failures + vetoed videos (await recalibration or a rerun)
+    n_pending_videos: int | None = None
+    n_decode_error_videos: int | None = None  # latest attempt: decode / probe failure
+    n_analysis_error_videos: int | None = None  # latest attempt: unexpected analysis error
 
 
-# A video whose rows are only these placeholders was not judged, whatever snapshot it recorded.
-_FAILED_REASONS = frozenset({"recalibrate", "decode_error", "analysis_error"})
-# Failures that are not a calibration failure (their videos.json calibration is None as well).
-_NON_CALIBRATION_FAILURES = frozenset({"decode_error", "analysis_error"})
+_FAILURE_STATUSES = ("recalibrate", "decode_error", "analysis_error")
+STATUS_UNVERIFIED = "unverified (no analysis_status; rerun bxjudge run)"
 
 
 def _vetoed_pending(row: dict, vetoed: set[str]) -> bool:
@@ -191,44 +196,44 @@ def _vetoed_pending(row: dict, vetoed: set[str]) -> bool:
 
 def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
                          vetoed: set[str] | None = None) -> dict:
-    """Spec 6.6b calibration summary: vetoed rounds/videos/groups, ``recalibrate`` videos
-    (video level: they have no round, R53), effective coverage = videos of ``videos.json``
-    judged with a recorded, non-vetoed snapshot (and not only failure placeholders) / all of
-    them (nan without ``videos.json``), and pending = recalibrate + vetoed videos. Vetoed
-    videos come from ``videos.json`` (else, without it, from the vetoed rows).
+    """Spec 6.6b calibration summary: vetoed rounds/videos/groups, per-video failures of the
+    latest analysis attempt (``recalibrate`` / ``decode_error`` / ``analysis_error``: video
+    level, R53), effective coverage = videos of ``videos.json`` whose latest attempt succeeded
+    (``ok``) with a recorded, non-vetoed snapshot / all of them, and pending = failed + vetoed
+    videos. Vetoed videos come from ``videos.json`` (else, without it, from the vetoed rows).
 
-    ``recalibrate`` videos are those with a ``recalibrate`` placeholder row plus, from
-    ``videos.json``, every video whose latest analysis recorded ``"calibration": null`` without
-    a ``decode_error`` / ``analysis_error`` row (final review T4-M4: a reviewed round 1 is kept
-    on reanalysis, so the colliding round-1 placeholder is dropped and the failure would
-    otherwise vanish from the counts)."""
+    Ruling R68: failures and coverage come only from ``videos.json[video]["analysis_status"]``
+    (a failed rerun may keep a video's rows and calibration, and a reviewed round 1 may hide
+    the placeholder, T4-M4). When ``videos.json`` is missing or any entry lacks that status,
+    ``status_known`` is False: the failure lists, pending and coverage are unverified
+    (``None`` / nan), never inferred from ``calibration: null`` or placeholder rows."""
     vetoed = set(vetoed or ())
     real = real_rows(rows)
     vetoed_rows = [r for r in real if r.get("calibration_id") in vetoed]
-    recal = {r["video"] for r in rows if "recalibrate" in (r.get("review_reasons") or [])}
-    reasons: dict[str, list[set]] = {}
-    for r in rows:
-        reasons.setdefault(r["video"], []).append(set(r.get("review_reasons") or []))
-    failed = {v for v, rs in reasons.items() if all(_FAILED_REASONS & s for s in rs)}
 
     def recorded(entry) -> str | None:
         cal = entry.get("calibration") if isinstance(entry, dict) else None
         return cal.get("id") if isinstance(cal, dict) else None
 
+    def status(entry) -> str | None:
+        return entry.get("analysis_status") if isinstance(entry, dict) else None
+
+    status_known = timings is not None and all(status(e) is not None for e in timings.values())
+    failures: dict[str, list[str] | None] = {s: None for s in _FAILURE_STATUSES}
+    covered: list[str] | None = None
+    total = 0
     if timings is None:
         vetoed_videos = {r["video"] for r in vetoed_rows}
-        covered: list[str] = []
-        total = 0
     else:
-        other_failure = {v for v, rs in reasons.items()
-                         if any(_NON_CALIBRATION_FAILURES & s for s in rs)}
-        recal |= {v for v, e in timings.items()
-                  if isinstance(e, dict) and "calibration" in e and e["calibration"] is None
-                  and v not in other_failure}
         vetoed_videos = {v for v, e in timings.items() if recorded(e) in vetoed}
-        covered = sorted(v for v, e in timings.items() if recorded(e) is not None
-                         and recorded(e) not in vetoed and v not in failed)
         total = len(timings)
+    if status_known:
+        failures = {s: sorted(v for v, e in timings.items() if status(e) == s)
+                    for s in _FAILURE_STATUSES}
+        covered = sorted(v for v, e in timings.items() if status(e) == "ok"
+                         and recorded(e) is not None and recorded(e) not in vetoed)
+    pending = (None if not status_known
+               else sorted(vetoed_videos.union(*failures.values())))
     groups = {}
     for sid in sorted(vetoed):
         group_rows = [r for r in vetoed_rows if r["calibration_id"] == sid]
@@ -240,13 +245,16 @@ def calibration_coverage(rows: list[dict], timings: dict[str, dict] | None,
     return {
         "n_vetoed_rounds": len(vetoed_rows),
         "n_vetoed_unreviewed": sum(_vetoed_pending(r, vetoed) for r in vetoed_rows),
-        "recalibrate_videos": sorted(recal),
+        "status_known": status_known,
+        "recalibrate_videos": failures["recalibrate"],
+        "decode_error_videos": failures["decode_error"],
+        "analysis_error_videos": failures["analysis_error"],
         "vetoed_videos": sorted(vetoed_videos),
         "groups": groups,
-        "n_covered": len(covered),
+        "n_covered": None if covered is None else len(covered),
         "n_videos": total,
-        "coverage": _ratio(len(covered), total) if timings is not None else NAN,
-        "pending_videos": sorted(recal | vetoed_videos),
+        "coverage": NAN if covered is None else _ratio(len(covered), total),
+        "pending_videos": pending,
     }
 
 
@@ -477,12 +485,18 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         finish_accuracy_unflagged_high=u["high"],
         finish_accuracy_unflagged_coverage=u["coverage"],
         n_vetoed_rounds=cal["n_vetoed_rounds"],
-        n_recalibrate_videos=len(cal["recalibrate_videos"]),
+        n_recalibrate_videos=_n_videos(cal["recalibrate_videos"]),
         n_vetoed_groups=len(vetoed),
         n_vetoed_videos=len(cal["vetoed_videos"]),
         coverage=cal["coverage"],
-        n_pending_videos=len(cal["pending_videos"]),
+        n_pending_videos=_n_videos(cal["pending_videos"]),
+        n_decode_error_videos=_n_videos(cal["decode_error_videos"]),
+        n_analysis_error_videos=_n_videos(cal["analysis_error_videos"]),
     )
+
+
+def _n_videos(videos: list[str] | None) -> int | None:
+    return None if videos is None else len(videos)
 
 
 def _meets(value: float, target: tuple[str, float]) -> bool:
@@ -1222,27 +1236,35 @@ def _calibration_section(rows, timings, m: Metrics, vetoed: set[str] | None) -> 
     def names(videos: list[str]) -> str:
         return ", ".join(videos) or "none"
 
-    coverage = ("unverified (no videos.json)" if timings is None
-                else _frac(c["coverage"], c["n_covered"], c["n_videos"]))
+    unverified = ("unverified (no videos.json)" if timings is None
+                  else STATUS_UNVERIFIED if not c["status_known"] else None)
+    coverage = unverified or _frac(c["coverage"], c["n_covered"], c["n_videos"])
+
+    def failed(key: str) -> str:
+        videos = c[key]
+        return unverified or f"{len(videos)}: {names(videos)}"
+
     out = [
         "## 校準 Calibration",
         "",
         ("Vetoed rounds stay in every accuracy population with their original predictions; "
          "unreviewed ones count as needing human work in review_ratio and are left out of "
-         "matches.csv; the random audit sample (R62) is unchanged. `recalibrate` videos have "
-         "no round and are counted per video (spec 6.6b)."),
+         "matches.csv; the random audit sample (R62) is unchanged. Failures are counted per "
+         "video from the latest attempt's `analysis_status` (spec 6.6b, R68); a decode or "
+         "analysis failure of a previously judged video keeps its earlier rows."),
         "",
         "| 項目 Item | 數值 Value |",
         "|---|---|",
         (f"| 有效處理覆蓋率 Coverage | {coverage} videos judged with an accepted (non-vetoed) "
          "calibration |"),
-        (f"| 校準失敗影片 Recalibrate videos | {m.n_recalibrate_videos}: "
-         f"{names(c['recalibrate_videos'])} |"),
+        f"| 校準失敗影片 Recalibrate videos | {failed('recalibrate_videos')} |",
+        f"| 解碼失敗影片 Decode-error videos | {failed('decode_error_videos')} |",
+        f"| 分析失敗影片 Analysis-error videos | {failed('analysis_error_videos')} |",
         (f"| 被否決的校準組 Vetoed groups | {m.n_vetoed_groups} group(s); "
          f"{m.n_vetoed_videos} video(s); {m.n_vetoed_rounds} round(s), "
          f"{c['n_vetoed_unreviewed']} unreviewed |"),
-        (f"| 待處理影片 Pending videos | {m.n_pending_videos} (recalibrate + vetoed): "
-         f"{names(c['pending_videos'])} |"),
+        (f"| 待處理影片 Pending videos | {failed('pending_videos')} "
+         "(failed + vetoed) |"),
         "",
     ]
     out += [f"- vetoed `{sid}`: videos {names(g['videos'])}; {g['rounds']} round(s), "

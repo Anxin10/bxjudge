@@ -1119,17 +1119,21 @@ def test_veto_does_not_change_the_audit_sample_population():
 
 def test_calibration_metrics_without_vetoes_or_timings():
     m = evaluate([rev(calibration_id="S1")])
-    assert m.n_vetoed_rounds == 0 and m.n_vetoed_groups == 0 and m.n_pending_videos == 0
-    assert math.isnan(m.coverage)  # no videos.json: coverage unverified
+    assert m.n_vetoed_rounds == 0 and m.n_vetoed_groups == 0
+    # no videos.json: no analysis_status, so failure/pending counts and coverage are unverified
+    assert m.n_recalibrate_videos is None and m.n_pending_videos is None
+    assert math.isnan(m.coverage)
 
 
 def test_failed_analysis_with_a_snapshot_is_not_coverage():
-    timings = videos_with_calibration({"a": "S2", "b": "S2", "c": None})
+    timings = videos_with_calibration({"a": "S2", "b": "S2", "c": None},
+                                      {"b": "analysis_error"})
     rows = [rev(video="a.mp4", calibration_id="S2"), placeholder("b.mp4", "analysis_error"),
             placeholder("c.mp4", "recalibrate")]
     m = evaluate(rows, timings=timings, vetoed=set())
     assert m.coverage == pytest.approx(1 / 3)
-    assert m.n_recalibrate_videos == 1 and m.n_pending_videos == 1
+    assert m.n_recalibrate_videos == 1 and m.n_analysis_error_videos == 1
+    assert m.n_decode_error_videos == 0 and m.n_pending_videos == 2
 
 
 def test_reviewed_video_whose_calibration_later_fails_stays_counted():
@@ -1144,13 +1148,44 @@ def test_reviewed_video_whose_calibration_later_fails_stays_counted():
     assert cal["recalibrate_videos"] == ["a.mp4"] and cal["pending_videos"] == ["a.mp4"]
 
 
-def test_video_level_recalibrate_excludes_other_failures_and_unrecorded_videos():
-    timings = videos_with_calibration({"d": None, "e": "S1"})
-    timings["old.mp4"] = {"duration_s": 10.0, "processing_s": 5.0}  # no calibration key at all
+def test_failure_counts_come_from_analysis_status_not_calibration_null():
+    """R68: a decode failure (calibration null, or a kept reviewed row with its old snapshot)
+    is a decode failure, never a recalibrate inferred from ``calibration: null``."""
+    timings = videos_with_calibration({"d": None, "e": "S1", "k": "S1", "r": None},
+                                      {"d": "decode_error", "k": "decode_error"})
     rows = [placeholder("d.mp4", "decode_error"), rev(video="e.mp4", calibration_id="S1"),
-            rev(video="old.mp4")]
+            rev(video="k.mp4", calibration_id="S1"), rev(video="r.mp4", calibration_id="S1")]
     m = evaluate(rows, timings=timings, vetoed=set())
-    assert m.n_recalibrate_videos == 0 and m.n_pending_videos == 0
+    assert m.n_recalibrate_videos == 1 and m.n_decode_error_videos == 2
+    assert m.n_analysis_error_videos == 0 and m.n_pending_videos == 3
+    assert m.coverage == pytest.approx(1 / 4)  # only e.mp4: its latest attempt succeeded
+    cal = calibration_coverage(rows, timings, set())
+    assert cal["recalibrate_videos"] == ["r.mp4"]
+    assert cal["decode_error_videos"] == ["d.mp4", "k.mp4"]
+    assert cal["pending_videos"] == ["d.mp4", "k.mp4", "r.mp4"]
+
+
+def test_results_without_analysis_status_are_unverified_not_inferred(tmp_path):
+    """A results folder written before R68: no recalibrate count inferred from
+    ``calibration: null``; the calibration section says unverified."""
+    from bxjudge.evaluate import render_eval_report
+
+    timings = videos_with_calibration({"a": "S1", "c": None}, statuses=False)
+    rows = [rev(video="a.mp4", calibration_id="S1"), placeholder("c.mp4", "recalibrate")]
+    m = evaluate(rows, timings=timings, vetoed=set())
+    assert m.n_recalibrate_videos is None and m.n_decode_error_videos is None
+    assert m.n_analysis_error_videos is None and m.n_pending_videos is None
+    assert math.isnan(m.coverage)
+    # one entry with a status and one without is still unverified
+    mixed = {**timings, **videos_with_calibration({"b": "S1"})}
+    assert evaluate(rows, timings=mixed, vetoed=set()).n_recalibrate_videos is None
+    cfg = _cfg()
+    text = render_eval_report("res", rows, timings, m, passes(m, cfg),
+                              report_metrics(rows, timings, cfg), cfg, today="x", vetoed=set())
+    section = text[text.index("## 校準 Calibration"):]
+    section = section[:section.index("\n## ", 1)]
+    assert "unverified (no analysis_status; rerun bxjudge run)" in section
+    assert "c.mp4" not in section
 
 
 def test_cli_eval_reports_calibration_section(tmp_path):

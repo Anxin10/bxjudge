@@ -1572,3 +1572,129 @@ def test_run_batch_rejects_out_that_is_a_file(tmp_path, rules):
     out.write_text("x")
     with pytest.raises(ValueError):
         _run(videos, calib, out, rules)
+
+
+# --------------------------------------------------------------------------- transient re-analysis failures (ruling R68)
+
+
+def _status(out, video):
+    return json.loads((out / "videos.json").read_text())[video].get("analysis_status")
+
+
+def _break_judging(monkeypatch, mode):
+    """Make every judging attempt fail transiently: ``decode`` (a decode error mid-stream),
+    ``analysis`` (an unexpected exception: ``analysis_error``) or ``probe`` (ffprobe fails, so
+    the batch never gets as far as judging: ``decode_error``)."""
+    from bxjudge import manifest
+    from bxjudge.video import VideoDecodeError
+
+    def track_fails(*a, **k):
+        raise VideoDecodeError("corrupt mid-stream") if mode == "decode" else RuntimeError("OOM")
+
+    def probe_fails(path):
+        raise ValueError(f"ffprobe failed on {path}")
+
+    if mode == "probe":
+        monkeypatch.setattr(manifest, "probe", probe_fails)
+    else:
+        monkeypatch.setattr(pipeline, "track_frames", track_fails)
+
+
+@pytest.mark.parametrize("mode, status", [("decode", "decode_error"), ("probe", "decode_error"),
+                                          ("analysis", "analysis_error")])
+def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
+    tmp_path, rules, monkeypatch, mode, status
+):
+    from bxjudge.output import read_rounds, save_rounds
+    from tests.helpers import add_manual_calibration, stadium_scene
+
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    assert _status(out, "clip.mp4") == "ok"
+    rows = read_rounds(out)
+    rows[0]["audit_sample"] = True
+    save_rounds(rows, out, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before_db = (out / "processed_videos.json").read_bytes()
+    before_entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    old_id = before_entry["calibration"]["id"]
+    # A new manual calibration makes the video due for reanalysis (spec 6.3b item 4).
+    add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+    with monkeypatch.context() as m:
+        _break_judging(m, mode)
+        _run(videos, calib, out, rules)
+    assert (out / "rounds.json").read_bytes() == before_rows  # incl. audit_sample, calibration_id
+    kept = json.loads(before_rows)
+    assert kept[0]["audit_sample"] is True and kept[0]["calibration_id"] == old_id
+    assert (out / "processed_videos.json").read_bytes() == before_db  # left for retry
+    entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
+    assert entry == {**before_entry, "analysis_status": status}
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)  # the failure has cleared: retried
+    assert spy.videos == {"clip.mp4"}
+    assert _status(out, "clip.mp4") == "ok"
+    rows = json.loads((out / "rounds.json").read_text())
+    new_id = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]["id"]
+    assert new_id != old_id and rows and {r["calibration_id"] for r in rows} == {new_id}
+
+
+def test_transient_failure_of_a_vetoed_group_keeps_its_original_predictions(
+    tmp_path, rules, monkeypatch
+):
+    """R68 + T4-3: a usable non-vetoed alternative triggers reanalysis, the reanalysis fails:
+    the vetoed rows (unreviewed predictions, audit flag, calibration id) stay untouched."""
+    from tests.helpers import add_manual_calibration, stadium_scene
+
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before_db = (out / "processed_videos.json").read_bytes()
+    before = _eval(out)
+    add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+    with monkeypatch.context() as m:
+        _break_judging(m, "decode")
+        _run(videos, calib, out, rules)
+    assert (out / "rounds.json").read_bytes() == before_rows
+    clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["reviewed"] is False
+    assert (out / "processed_videos.json").read_bytes() == before_db
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip2.mp4"]["analysis_status"] == "decode_error"
+    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_decode_error_videos == 2 and after.n_recalibrate_videos == 0
+
+
+def test_first_ever_decode_failure_still_writes_the_placeholder(tmp_path, rules, monkeypatch):
+    videos, calib, out = _clip_setup(tmp_path)
+    _break_judging(monkeypatch, "decode")
+    _run(videos, calib, out, rules)
+    assert [r["review_reasons"] for r in json.loads((out / "rounds.json").read_text())] == [
+        ["decode_error"]]
+    assert _status(out, "clip.mp4") == "decode_error"
+    db = out / "processed_videos.json"
+    assert not db.exists() or json.loads(db.read_text()) == {}  # T4-5: retried as new
+
+
+def test_deliberate_recalibrate_of_a_judged_video_is_still_a_placeholder(tmp_path, rules):
+    """R68 covers transient failures only: selection returning None follows spec 6.3b."""
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    (calib / "scene.json").unlink()
+    _run(videos, calib, out, rules)
+    assert [r["review_reasons"] for r in json.loads((out / "rounds.json").read_text())] == [
+        ["recalibrate"]]
+    assert _status(out, "clip.mp4") == "recalibrate"
+
+
+def test_record_video_status_accepts_only_the_four_statuses(tmp_path):
+    from bxjudge.output import record_video_status
+
+    for status in ("ok", "recalibrate", "decode_error", "analysis_error"):
+        record_video_status(tmp_path, "a.mp4", status)
+        assert _status(tmp_path, "a.mp4") == status
+    for bad in ("success", "no_round", None):
+        with pytest.raises(ValueError, match="analysis_status"):
+            record_video_status(tmp_path, "a.mp4", bad)
