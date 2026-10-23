@@ -51,9 +51,11 @@ class AutoCalibConfig:
     ecc_epsilon: float
     max_boundary_error_px: float
     auto_review_score: float
+    snapshot_max_frame_side: int  # snapshot file bounds (C-X2(f), R40)
+    snapshot_max_coord: float
 
 
-_INT_FIELDS = ("work_width", "ecc_iterations")
+_INT_FIELDS = ("work_width", "ecc_iterations", "snapshot_max_frame_side")
 
 
 @config_loader
@@ -100,6 +102,12 @@ def load_autocalib_config(path: Path = Path("config/autocalib.yaml")) -> AutoCal
     if not c.min_score <= c.auto_review_score <= 1.0:
         raise ValueError(f"{path}: auto_review_score must be in [min_score, 1] = "
                          f"[{c.min_score}, 1], got {c.auto_review_score}")
+    if c.snapshot_max_frame_side < c.work_width:
+        raise ValueError(f"{path}: snapshot_max_frame_side must be >= work_width "
+                         f"({c.work_width}), got {c.snapshot_max_frame_side}")
+    if c.snapshot_max_coord < c.snapshot_max_frame_side:
+        raise ValueError(f"{path}: snapshot_max_coord must be >= snapshot_max_frame_side "
+                         f"({c.snapshot_max_frame_side}), got {c.snapshot_max_coord}")
     return c
 
 

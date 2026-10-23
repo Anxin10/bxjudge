@@ -1087,10 +1087,9 @@ def _run(videos, calib, out, rules, detector=None, **kw):
 def _freeze_audit(out):
     """R69: audit marks written by hand need their audit_sample.json record."""
     from bxjudge.output import _write_json, read_rounds
+    from tests.helpers import audit_of
 
-    marked = [[r["video"], r["round"]] for r in read_rounds(out) if r.get("audit_sample")]
-    _write_json(out / "audit_sample.json", {"seed": 0, "n": len(marked), "population": marked,
-                                            "selection": marked})
+    _write_json(out / "audit_sample.json", audit_of(read_rounds(out)))
 
 
 def _confirm_reviewed(out, video, round_no, rules):
@@ -1450,10 +1449,10 @@ def _veto_setup(tmp_path, rules):
 
 def _eval(out):
     from bxjudge.calibration_store import vetoed_ids
-    from bxjudge.evaluate import evaluate, read_results
+    from bxjudge.evaluate import evaluate, read_audit, read_results
 
     rows, timings, runs = read_results(out)
-    return evaluate(rows, timings, runs=runs, vetoed=vetoed_ids(out))
+    return evaluate(rows, timings, runs=runs, vetoed=vetoed_ids(out), audit=read_audit(out))
 
 
 def test_rerun_after_a_veto_keeps_the_rows_and_the_evaluation_population(tmp_path, rules):
@@ -1639,9 +1638,15 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     assert kept[0]["audit_sample"] is True and kept[0]["calibration_id"] == old_id
     assert (out / "processed_videos.json").read_bytes() == before_db  # left for retry
     entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
-    # R66: only the status and the failed attempt's own wall_s change; old timing stays.
-    assert entry == {**before_entry, "analysis_status": status, "wall_s": entry["wall_s"]}
-    assert entry["wall_s"] > 0 and entry["processing_s"] == before_entry["processing_s"]
+    # R66a: only the status, the attempt's own wall and the current file's probed duration
+    # (none when the probe failed) change; the rows' judged_wall_s and timing stay.
+    expected = {**before_entry, "analysis_status": status,
+                "attempt_wall_s": entry["attempt_wall_s"]}
+    if mode == "probe":
+        del expected["duration_s"]
+    assert entry == expected
+    assert entry["attempt_wall_s"] > 0 and entry["processing_s"] == before_entry["processing_s"]
+    assert entry["judged_wall_s"] == before_entry["judged_wall_s"]
     spy = _JudgeSpy(monkeypatch)
     _run(videos, calib, out, rules)  # the failure has cleared: retried
     assert spy.videos == {"clip.mp4"}
@@ -1711,3 +1716,21 @@ def test_record_video_status_accepts_only_the_four_statuses(tmp_path):
     for bad in ("success", "no_round", None):
         with pytest.raises(ValueError, match="analysis_status"):
             record_video_status(tmp_path, "a.mp4", bad)
+
+
+def test_unchanged_video_after_a_transient_failure_is_rejudged_not_marked_ok(
+    tmp_path, rules, monkeypatch
+):
+    """C-X2(a) / Codex T4 reproduction: a probe failure of a judged video (status
+    decode_error, record kept); next run the first second selects the recorded calibration
+    again. The video must be re-judged (R68 retry), never flipped to ok with zero judge calls."""
+    videos, calib, out = _clip_setup(tmp_path)
+    _run(videos, calib, out, rules)
+    with monkeypatch.context() as m:
+        _break_judging(m, "probe")
+        _run(videos, calib, out, rules)
+    assert _status(out, "clip.mp4") == "decode_error"
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules)
+    assert spy.videos == {"clip.mp4"}
+    assert _status(out, "clip.mp4") == "ok"

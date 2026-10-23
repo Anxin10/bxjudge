@@ -16,17 +16,28 @@ from bxjudge.evaluate import (
     derive_shake,
     derive_shake_px,
     error_groups,
-    evaluate,
     load_eval_config,
     match_truth,
     passes,
-    report_metrics,
     reversed_finish_check,
     shake_samples,
     spin_dir_check,
     thresholds_diff,
 )
-from tests.helpers import placeholder, rev, row, videos_with_calibration
+from bxjudge.evaluate import evaluate as _evaluate
+from bxjudge.evaluate import report_metrics as _report_metrics
+from tests.helpers import audit_of, placeholder, rev, row, videos_with_calibration
+
+
+# C-X2(d): marked rows always need their frozen record; these unit tests derive the record that
+# matches the rows they build (the freeze checks themselves are tested in test_audit.py).
+def evaluate(rows, *a, audit=None, **k):
+    return _evaluate(rows, *a, audit=audit if audit is not None else audit_of(rows), **k)
+
+
+def report_metrics(rows, *a, audit=None, **k):
+    return _report_metrics(rows, *a, audit=audit if audit is not None else audit_of(rows), **k)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 EVAL_CONFIG = ROOT / "config" / "evaluation.yaml"
@@ -157,9 +168,10 @@ def test_speed_without_timings_is_unverified_and_fails():
 def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     rows = _rows_of_videos("a.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0,
-                         "wall_s": 50.0, "analysis_status": "ok"}}
-    m = evaluate(rows, timings)
-    assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66: wall + VLM
+                         "judged_wall_s": 50.0, "attempt_wall_s": 50.0,
+                         "analysis_status": "ok"}}
+    m = evaluate(rows, timings, runs=[_run(60.0, {"a.mp4": 100.0})])
+    assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66a: wall + VLM
     assert m.speed_ratio_core == pytest.approx(0.5)
     assert m.n_speed_videos == 1 and m.n_vlm_videos == 1
     assert passes(m)["speed_ratio"] == "FAIL"
@@ -167,9 +179,10 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
 
 def test_speed_median_is_diagnostic_and_the_worst_video_decides():
     rows = _rows_of_videos("a.mp4", "b.mp4", "c.mp4")
-    timings = {v: {"duration_s": 100.0, "processing_s": s, "wall_s": s, "analysis_status": "ok"}
+    timings = {v: {"duration_s": 100.0, "processing_s": s, "judged_wall_s": s,
+                   "attempt_wall_s": s, "analysis_status": "ok"}
                for v, s in (("a.mp4", 50.0), ("b.mp4", 80.0), ("c.mp4", 200.0))}
-    m = evaluate(rows, timings)
+    m = evaluate(rows, timings, runs=[_run(150.0, {v: 100.0 for v in timings})])
     assert m.speed_ratio_sum == pytest.approx(0.8) == m.speed_ratio_core  # was the R61 pass
     assert m.speed_ratio == pytest.approx(2.0) and m.speed_slowest_video == "c.mp4"
     assert m.n_vlm_videos == 0
@@ -458,11 +471,8 @@ def _results(dirpath, rows, timings):
     dirpath.mkdir(parents=True)
     (dirpath / "rounds.json").write_text(json.dumps(rows), encoding="utf-8")
     (dirpath / "videos.json").write_text(json.dumps(timings), encoding="utf-8")
-    marked = [[r["video"], r["round"]] for r in rows if r.get("audit_sample") is True]
-    if marked:  # R69: marks come with their frozen draw
-        (dirpath / "audit_sample.json").write_text(json.dumps(
-            {"seed": 0, "n": len(marked), "population": marked, "selection": marked}),
-            encoding="utf-8")
+    if audit_of(rows):  # R69: marks come with their frozen draw
+        (dirpath / "audit_sample.json").write_text(json.dumps(audit_of(rows)), encoding="utf-8")
     return dirpath
 
 
@@ -860,15 +870,16 @@ def test_tradeoff_intervals_propagate_the_audit_interval():
 def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
     rows = _rows_of_videos("a.mp4", "b.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
-               "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "wall_s": 50.0,
-                         "analysis_status": "ok"}}
+               "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "judged_wall_s": 50.0,
+                         "attempt_wall_s": 50.0, "analysis_status": "ok"}}
     runs = [_run(80.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s["basis"] == "unverified" and math.isnan(s["ratio"])  # a.mp4 has no wall_s
     assert s["pass_rate"] == 0.5 and s["slowest"] == "b.mp4"
-    timings["a.mp4"].update(wall_s=150.0, analysis_status="ok")
+    timings["a.mp4"].update(judged_wall_s=150.0, attempt_wall_s=150.0, analysis_status="ok")
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
-    assert s == {"basis": "worst-video", "ratio": 1.5, "pass_rate": 0.5, "slowest": "a.mp4"}
+    assert s == {"basis": "worst-video+batch", "ratio": 1.5, "pass_rate": 0.5,
+                 "slowest": "a.mp4"}
 
 
 def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):

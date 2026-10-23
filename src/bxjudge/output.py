@@ -263,15 +263,17 @@ def record_video_timing(
     source_video: Path | None = None,
     wall_s: float | None = None,
 ) -> None:
-    """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (ruling R66) is
-    the observed wall time of the attempt: from that video's first decode (including its
-    calibration selection pass) through its result write; ``None`` leaves it unrecorded."""
+    """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (rulings R66/R66a)
+    is the observed wall time of the attempt, ONE timer from that video's first decode
+    (including its calibration selection pass) to its result write. This attempt produced the
+    current rows, so it is stored as both ``judged_wall_s`` (the rows' run) and
+    ``attempt_wall_s`` (the latest attempt); ``None`` leaves both unrecorded."""
     _check_wall(wall_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
     if wall_s is not None:
-        rows[video]["wall_s"] = wall_s
+        rows[video]["judged_wall_s"] = rows[video]["attempt_wall_s"] = wall_s
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
     _write_json(path, rows)
@@ -292,25 +294,37 @@ ANALYSIS_STATUSES = ("ok", "recalibrate", "decode_error", "analysis_error")
 TRANSIENT_FAILURES = frozenset({"decode_error", "analysis_error"})
 
 
+_KEEP = object()  # record_video_status: leave duration_s as it is
+
+
 def record_video_status(
-    out_dir: Path, video: str, status: str, *, wall_s: float | None = None
+    out_dir: Path, video: str, status: str, *, wall_s: float | None = None,
+    duration_s: float | None | object = _KEEP,
 ) -> None:
     """Record ``videos.json[video]["analysis_status"]`` (one of ``ANALYSIS_STATUSES``) without
     touching anything else in the entry, so a failed rerun that keeps a video's rows can say
     so while the timing and calibration of those rows stay as they were (ruling R68). Call
     after ``record_video_timing``, which replaces the entry.
 
-    ``wall_s`` (ruling R66): the observed wall time of this latest attempt, written with its
-    status, so a failed attempt's time is never hidden behind the kept ``processing_s``."""
+    ``wall_s`` (rulings R66/R66a): the observed wall time of this latest attempt, stored as
+    ``attempt_wall_s`` beside the kept ``judged_wall_s`` of the rows, so neither hides the other.
+    ``duration_s``: the latest probe of the CURRENT source file (a replaced file's new length);
+    ``None`` removes it (the probe failed: there is no duration to measure against)."""
     if status not in ANALYSIS_STATUSES:
         raise ValueError(f"unknown analysis_status {status!r}; expected one of {ANALYSIS_STATUSES}")
     _check_wall(wall_s)
+    if duration_s is not _KEEP and duration_s is not None:
+        _check_wall(duration_s)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     entry = rows.setdefault(video, {})
     entry["analysis_status"] = status
     if wall_s is not None:
-        entry["wall_s"] = wall_s
+        entry["attempt_wall_s"] = wall_s
+    if duration_s is None:
+        entry.pop("duration_s", None)
+    elif duration_s is not _KEEP:
+        entry["duration_s"] = duration_s
     _write_json(path, rows)
 
 

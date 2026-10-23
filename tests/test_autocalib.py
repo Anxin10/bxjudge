@@ -66,6 +66,8 @@ def test_config_loads_shipped_values():
     assert (c.min_scale, c.max_scale, c.max_perspective) == (0.85, 1.15, 0.0005)
     assert (c.ecc_iterations, c.ecc_epsilon, c.max_boundary_error_px) == (200, 1.0e-6, 8.0)
     assert c.auto_review_score == 0.75  # ruling F-1: review band above min_score
+    # C-X2(f): snapshot shape bounds are policy in the YAML (R40), not Python constants
+    assert (c.snapshot_max_frame_side, c.snapshot_max_coord) == (100_000, 1.0e7)
 
 
 @pytest.mark.parametrize("key, value", [
@@ -73,6 +75,9 @@ def test_config_loads_shipped_values():
     ("max_perspective", ".nan"), ("ecc_epsilon", ".inf"), ("work_width", "640.0"),
     ("ecc_iterations", "true"), ("extra_key", "1"),
     ("auto_review_score", "0.59"), ("auto_review_score", "1.01"), ("auto_review_score", ".nan"),
+    ("snapshot_max_frame_side", "0"), ("snapshot_max_frame_side", "1.5e5"),
+    ("snapshot_max_frame_side", "100"), ("snapshot_max_coord", ".inf"),
+    ("snapshot_max_coord", "0"), ("snapshot_max_coord", "-1"), ("snapshot_max_coord", "true"),
 ])
 def test_config_rejects_each_bad_value(tmp_path, key, value):
     from pathlib import Path

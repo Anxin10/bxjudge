@@ -25,3 +25,9 @@ ecc_epsilon: 1.0e-6
 auto_review_score: 0.75
 # Acceptance threshold for the mean boundary error between auto and manual zones (inference px).
 max_boundary_error_px: 8.0
+# Snapshot file shape bounds (codex port Task 1, R40): a stored calibration snapshot whose
+# frame_size side exceeds snapshot_max_frame_side (whole pixels, >= work_width) or any zone
+# coordinate whose magnitude exceeds snapshot_max_coord (px, >= snapshot_max_frame_side) is
+# malformed and rejected with ValueError instead of overflowing later.
+snapshot_max_frame_side: 100000
+snapshot_max_coord: 1.0e+7

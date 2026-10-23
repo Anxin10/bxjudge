@@ -441,3 +441,21 @@ def test_load_snapshot_rejects_a_non_finite_or_huge_polygon_coordinate(tmp_path,
     _edit_snapshot_json(jpath, lambda doc: doc[ZONES[0][0]].append([bad, 1.0]))
     with pytest.raises(ValueError, match="malformed"):
         load_snapshot(out, snap.id)
+
+
+# --------------------------------------------------------------------------- C-X2(f): bounds are policy (R40)
+
+
+def test_snapshot_bounds_come_from_the_autocalib_config(tmp_path):
+    import bxjudge.calibration_store as store
+
+    assert not hasattr(store, "_MAX_FRAME_SIDE") and not hasattr(store, "_MAX_COORD")
+    out, snap, _ = _stored_manual_snapshot(tmp_path)
+    shipped = load_autocalib_config()
+    assert load_snapshot(out, snap.id, autocalib=shipped).id == snap.id
+    small_frame = replace(shipped, snapshot_max_frame_side=1000)  # 1280 px frame is over it
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id, autocalib=small_frame)
+    small_coord = replace(shipped, snapshot_max_coord=10.0)  # zone points lie beyond 10 px
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(out, snap.id, autocalib=small_coord)

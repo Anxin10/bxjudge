@@ -466,6 +466,16 @@ def needs_reanalysis(
     return current != recorded
 
 
+def _read_statuses(out_dir: Path) -> dict[str, str | None]:
+    """Latest ``analysis_status`` per video from ``videos.json`` (R68); absent = None."""
+    path = Path(out_dir) / "videos.json"
+    rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if not isinstance(rows, dict):
+        raise ValueError(f"{path}: expected a JSON object keyed by video")  # noqa: TRY004
+    return {v: e.get("analysis_status") if isinstance(e, dict) else None
+            for v, e in rows.items()}
+
+
 def run_batch(
     folder: Path,
     calib_dir: Path,
@@ -482,6 +492,7 @@ def run_batch(
     vlm_config: Path | None = None,
     autocalib_config: Path = Path("config/autocalib.yaml"),
     autocalib: AutoCalibConfig | None = None,
+    rejudge: bool = False,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -546,44 +557,52 @@ def run_batch(
 
     infos = scan(folder, db, on_error=on_error)
     # Spec section 6.3b: an unchanged processed video is reanalysed when its calibration
-    # changed. Selection needs only the first second, so it runs for every processed video;
-    # a reanalysed video is judged with this same selection (not selected twice).
-    # Rulings T4-1/T4-3: a vetoed auto snapshot is never selected again; a video recorded with
-    # one keeps its rows until selection yields a non-vetoed snapshot (then it is reanalysed).
+    # changed. Selection needs only the first second, so it runs for every processed video
+    # (right before that video would be judged); a reanalysed video is judged with this same
+    # selection (not selected twice). Rulings T4-1/T4-3: a vetoed auto snapshot is never
+    # selected again; a video recorded with one keeps its rows until selection yields a
+    # non-vetoed snapshot (then it is reanalysed). Ruling R66b: ``rejudge`` ignores the
+    # processed cache and re-analyses every video (reviewed rows are kept, R36).
     vetoed = vetoed_ids(out_dir)
-    preselected: dict[Path, Snapshot | None] = {}
-    # Ruling R66: a reanalysed video's selection pass is its first decode, so its time is
-    # part of that video's observed wall_s.
-    selection_s: dict[Path, float] = {}
-    for info in processed_videos(folder, db, on_error=on_error):
-        selecting = time.perf_counter()
-        try:
-            frame = first_second_frame(info, th)
-            snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
-        except Exception:
-            # e.g. an unreadable first second: the normal per-video flow handles it.
-            log.exception("cannot re-select the calibration of %s; reanalysing it", info.path)
-            infos.append(info)
-            selection_s[info.path] = time.perf_counter() - selecting
-            continue
-        current = snap.id if snap is not None else None
-        if needs_reanalysis(processed_calibration(db, info.path), current, vetoed):
-            infos.append(info)
-            preselected[info.path] = snap
-            selection_s[info.path] = time.perf_counter() - selecting
-        else:
-            # Unchanged and readable again: its rows stand for the current calibration, so an
-            # earlier transient failure (R68) has cleared without re-judging.
-            record_video_status(out_dir, info.path.name, "ok")
+    processed = processed_videos(folder, db, on_error=on_error)
+    if rejudge:
+        infos, processed = [*infos, *processed], []
+    statuses = _read_statuses(out_dir)
     # Ruling R68: "previously judged" = at least one real (non-placeholder) row on disk.
     judged_before = {
         r["video"] for r in read_rounds(out_dir) if not is_not_a_round(r["review_reasons"])
     }
-    entries = sorted([(i.path, i) for i in infos] + [(p, None) for p, _ in failures])
-    if limit is not None:
-        entries = entries[:limit]
-    for path, info in entries:
+    candidates = sorted(
+        [(i.path, i, False) for i in infos]
+        + [(p, None, False) for p, _ in failures]
+        + [(i.path, i, True) for i in processed]
+    )
+    entries: list[tuple[Path, VideoInfo | None]] = []
+    for path, info, cached in candidates:
+        if limit is not None and len(entries) >= limit:
+            break
+        # Ruling R66a: ONE timer per video, from its first decode (the selection pass of a
+        # processed video, else judge_video's own) to its result write; selection and
+        # judging run back to back, so no other video's work falls inside it.
         began = time.perf_counter()
+        preselected: dict = {}
+        if cached:
+            try:
+                frame = first_second_frame(info, th)
+                snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
+            except Exception:
+                # e.g. an unreadable first second: the normal per-video flow handles it.
+                log.exception("cannot re-select the calibration of %s; reanalysing it",
+                              info.path)
+            else:
+                current = snap.id if snap is not None else None
+                # C-X2(a): only a latest status of ``ok`` lets an unchanged video keep its rows
+                # unjudged; any other (a transient failure, R68, or none recorded) is re-judged.
+                if (statuses.get(path.name) == "ok" and not needs_reanalysis(
+                        processed_calibration(db, info.path), current, vetoed)):
+                    continue
+                preselected = {"snapshot": snap}
+        entries.append((path, info))
         chosen: list[Snapshot | None] = []
         if info is None:
             results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
@@ -601,7 +620,7 @@ def run_batch(
                     autocalib=autocalib,
                     on_snapshot=chosen.append,
                     vetoed=vetoed,
-                    **({"snapshot": preselected[path]} if path in preselected else {}),
+                    **preselected,
                 )
             except Exception:
                 log.exception("analysis failed for %s; continuing batch", path)
@@ -613,15 +632,16 @@ def run_batch(
         if status in TRANSIENT_FAILURES and path.name in judged_before:
             # Ruling R68: a transient failure (decode, probe, analysis) of a previously judged
             # video is no replacement analysis. Its rows (predictions, audit flags, calibration
-            # ids; vetoed ones too, T4-3), its videos.json timing/calibration and its processed
-            # record stay as they are; only the status changes. With the record left as it
-            # was (or still mismatching the changed file), the next run retries the video.
-            # R66: the failed attempt's own wall time is recorded with its status, so the
-            # kept processing_s of the old rows cannot hide it.
+            # ids; vetoed ones too, T4-3), its judged_wall_s, processing_s, VLM time and
+            # calibration, and its processed record stay as they are. With the record left as
+            # it was (or still mismatching the changed file), the next run retries the video.
+            # R66a: the attempt's own wall (attempt_wall_s) and the duration of the CURRENT
+            # source file (its latest probe; none when the probe failed) are recorded with
+            # the status, so neither the kept rows nor an old file's length can hide it.
             log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
             record_video_status(
-                out_dir, path.name, status,
-                wall_s=selection_s.get(path, 0.0) + time.perf_counter() - began,
+                out_dir, path.name, status, wall_s=time.perf_counter() - began,
+                duration_s=info.duration if info is not None else None,
             )
             continue
         write_results(results, out_dir, rules)
@@ -632,7 +652,7 @@ def run_batch(
             info.duration if info else 0.0,
             processing,
             source_video=path.resolve(),
-            wall_s=selection_s.get(path, 0.0) + processing,
+            wall_s=processing,
         )
         record_video_calibration(out_dir, path.name, snap)
         record_video_status(out_dir, path.name, status)

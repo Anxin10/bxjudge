@@ -174,7 +174,6 @@ def test_unchanged_sample_behaves_as_before(tmp_path, rules):
     _review_all(out, rules)
     rows, timings, runs = read_results(out)
     with_meta = evaluate(rows, timings, runs=runs, audit=read_audit(out))
-    assert with_meta == evaluate(rows, timings, runs=runs)
     assert with_meta.finish_accuracy_unflagged_method == "audit_sample"
     assert passes(with_meta)["finish_accuracy_unflagged"] == "INCONCLUSIVE"  # R64: n < min
 
@@ -204,3 +203,72 @@ def test_exact_basis_beats_invalidation_when_every_unflagged_round_is_reviewed(t
     m = _eval(out)
     assert m.finish_accuracy_unflagged_method == "exact"
     assert passes(m)["finish_accuracy_unflagged"] != "INVALIDATED"
+
+
+# ---- fix round 2: C-X2 (c)-(e) ----------------------------------------------------
+
+
+def test_new_unflagged_rounds_change_the_frozen_population_and_invalidate(tmp_path, rules):
+    # Codex T5: new unflagged real rounds join after the draw; the old sample no longer
+    # represents the evaluated population (R69).
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 3, seed=7, rules=rules)
+    _review_all(out, rules)
+    assert _eval(out).finish_accuracy_unflagged_method == "audit_sample"
+    write_results([rr("spin", "X", video="new.mp4")], out, rules)  # unflagged, unreviewed
+    m = _eval(out)
+    assert m.finish_accuracy_unflagged_method == "invalidated"
+    assert passes(m)["finish_accuracy_unflagged"] == "INVALIDATED"
+
+
+def test_removed_unflagged_rounds_change_the_frozen_population_and_invalidate(tmp_path, rules):
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 2, seed=7, rules=rules)
+    _review_all(out, rules)
+    rows, timings, runs = read_results(out)
+    gone = next(r for r in rows if r["video"].startswith("v")
+                and (r["video"], r["round"]) not in picked)
+    rows = [r for r in rows if r is not gone]  # an unsampled population member vanished
+    m = evaluate(rows, timings, runs=runs, audit=read_audit(out))
+    assert m.finish_accuracy_unflagged_method == "invalidated"
+
+
+def test_evaluate_without_audit_metadata_on_marked_rows_is_an_error(tmp_path, rules):
+    # Codex T5: read_results -> evaluate without the frozen record silently skipped the
+    # freeze checks and could PASS on a shrunk sample.
+    from bxjudge.evaluate import load_eval_config, report_metrics, unflagged_accuracy
+
+    out = _results(tmp_path, rules)
+    picked = mark_audit_sample(out, 2, seed=7, rules=rules)
+    rows, timings, runs = read_results(out)
+    rows = [r for r in rows if (r["video"], r["round"]) != picked[0]]  # shrunk sample
+    with pytest.raises(ValueError, match="audit"):
+        evaluate(rows, timings, runs=runs)
+    with pytest.raises(ValueError, match="audit"):
+        report_metrics(rows, timings, load_eval_config(), runs=runs)
+    with pytest.raises(ValueError, match="audit"):
+        unflagged_accuracy(rows, 0.95)
+
+
+def _write_meta(out, meta):
+    (out / "audit_sample.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+@pytest.mark.parametrize("meta", [
+    {"seed": 7, "n": 1, "keys": [["v0.mp4", 1]]},  # legacy record: no compatibility path
+    {"selection": [1]},
+    {"seed": 7, "n": 1, "population": [["v0.mp4", 1]], "selection": [1]},
+    {"seed": 7, "n": 1, "population": [["v0.mp4", 1]], "selection": [["v0.mp4", "1"]]},
+    {"seed": 7, "n": 1, "population": 3, "selection": [["v0.mp4", 1]]},
+    {"seed": "7", "n": 1, "population": [["v0.mp4", 1]], "selection": [["v0.mp4", 1]]},
+    {"seed": 7, "n": True, "population": [["v0.mp4", 1]], "selection": [["v0.mp4", 1]]},
+])
+def test_malformed_or_legacy_audit_records_are_rejected_with_valueerror(tmp_path, rules, meta):
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 1, seed=7, rules=rules)
+    rows, timings, runs = read_results(out)
+    with pytest.raises(ValueError, match="audit"):
+        evaluate(rows, timings, runs=runs, audit=meta)
+    _write_meta(out, meta)
+    with pytest.raises(ValueError, match="audit"):
+        read_audit(out)

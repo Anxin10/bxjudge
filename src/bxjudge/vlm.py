@@ -712,7 +712,8 @@ def review_results_dir(
     only from each row's recorded calibration snapshot (``calibration_id``); a row without
     one gets ``vlm_unavailable: no calibration record``, and a row whose snapshot is vetoed
     (``calibration_vetoes.json``) gets ``vlm_unavailable: calibration vetoed`` without its
-    zones being drawn or sent (ruling T5-2); the batch continues. Each
+    zones being drawn or sent (ruling T5-2); the batch continues. A video whose latest
+    ``analysis_status`` is not ``ok`` is skipped, its kept rows untouched (C-X2(b)). Each
     video's notes are persisted through ``write_results`` as a complete snapshot and its
     VLM time is recorded as ``vlm_s`` beside the core ``processing_s``.
     """
@@ -727,8 +728,16 @@ def review_results_dir(
     timing_path = out_dir / "videos.json"
     timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     summary = {"asked": 0, "answered": 0, "unavailable": 0}
+    def latest_failed(video: str) -> bool:
+        # C-X2(b): a video whose latest attempt failed keeps its earlier rows byte-identical
+        # (R68); they are not touched again until a re-analysis succeeds.
+        entry = timing.get(video)
+        status = entry.get("analysis_status") if isinstance(entry, dict) else None
+        return status is not None and status != "ok"
+
     targets = [video for video, results in sorted(by_video.items())
-               if (videos is None or video in videos) and any(map(needs_vlm, results))]
+               if (videos is None or video in videos) and not latest_failed(video)
+               and any(map(needs_vlm, results))]
     reason = preflight(session.config) if targets else None
     if reason is not None:
         # R65: skip the phase before any calibration/frame work; one warning, explicit notes

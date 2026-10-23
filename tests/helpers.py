@@ -610,3 +610,17 @@ class FakeDetector:
         return [Detection(frame, "bey", (cx - self.half, cy - self.half, cx + self.half,
                                          cy + self.half), 0.9)
                 for cx, cy in self.centers]
+
+
+def audit_of(rows: list[dict], seed: int = 0) -> dict | None:
+    """The R69 frozen audit record matching ``rows`` as they are now (population = unflagged
+    real rounds, selection = the marked rows); None when no row is marked."""
+    from bxjudge.rules import is_not_a_round
+
+    selection = sorted([r["video"], r["round"]] for r in rows if r.get("audit_sample") is True)
+    if not selection:
+        return None
+    population = sorted([r["video"], r["round"]] for r in rows
+                        if not is_not_a_round(r.get("review_reasons") or [])
+                        and r["needs_review"] is False)
+    return {"seed": seed, "n": len(selection), "population": population, "selection": selection}
