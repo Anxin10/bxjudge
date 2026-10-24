@@ -160,8 +160,8 @@ def batch(tmp_path, rules, monkeypatch):
     broken = rr(None, None, video="c.mp4", round=1, review_reasons=["recalibrate"], launch=False)
     broken.needs_review = True
     write_results([real, other, broken], out, rules)
-    record_video_timing(out, "a.mp4", 3.0, 1.0, source_video=source)
-    record_video_timing(out, "c.mp4", 3.0, 1.0, source_video=tmp_path / "c.mp4")
+    record_video_timing(out, "a.mp4", 3.0, 1.0, source_video=source, produced_rounds={1})
+    record_video_timing(out, "c.mp4", 3.0, 1.0, source_video=tmp_path / "c.mp4", produced_rounds={1})
     (out / "trajectories").mkdir()
     import cv2
 
@@ -307,8 +307,9 @@ def _calibrated_results(tmp_path, snap_kind="auto", rounds=(1,), *, with_ids=Tru
         if snap is not None:
             r.calibration_id = snap.id
         results.append(r)
-    write_results(results, out, load_rules())
-    record_video_timing(out, "clip.mp4", 3.0, 1.0, source_video=source)
+    written = write_results(results, out, load_rules())
+    record_video_timing(out, "clip.mp4", 3.0, 1.0, source_video=source,
+                        produced_rounds={n for _, n in written})
     if snap is not None:
         record_video_calibration(out, "clip.mp4", snap)
     return out

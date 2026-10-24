@@ -176,7 +176,7 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     rows = _rows_of_videos("a.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0,
                          "judged_wall_s": 50.0, "attempt_wall_s": 50.0,
-                         "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1", "vlm_run_ids": ["r1"]}}
+                         "analysis_status": "ok", "judgment_sources": [{"rounds": [1], "run_id": "r1", "wall_s": 50.0, "processing_s": 50.0}], "attempt_run_id": "r1", "vlm_run_ids": ["r1"]}}
     m = evaluate(rows, timings, runs=[_run(60.0, {"a.mp4": 100.0})])
     assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66a: wall + VLM
     assert m.speed_ratio_core == pytest.approx(0.5)
@@ -187,7 +187,7 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
 def test_speed_median_is_diagnostic_and_the_worst_video_decides():
     rows = _rows_of_videos("a.mp4", "b.mp4", "c.mp4")
     timings = {v: {"duration_s": 100.0, "processing_s": s, "judged_wall_s": s,
-                   "attempt_wall_s": s, "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1"}
+                   "attempt_wall_s": s, "analysis_status": "ok", "judgment_sources": [{"rounds": [1], "run_id": "r1", "wall_s": s, "processing_s": s}], "attempt_run_id": "r1"}
                for v, s in (("a.mp4", 50.0), ("b.mp4", 80.0), ("c.mp4", 200.0))}
     m = evaluate(rows, timings, runs=[_run(150.0, {v: 100.0 for v in timings})])
     assert m.speed_ratio_sum == pytest.approx(0.8) == m.speed_ratio_core  # was the R61 pass
@@ -904,13 +904,15 @@ def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
     rows = _rows_of_videos("a.mp4", "b.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
                "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "judged_wall_s": 50.0,
-                         "attempt_wall_s": 50.0, "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1"}}
+                         "attempt_wall_s": 50.0, "analysis_status": "ok", "judgment_sources": [{"rounds": [1], "run_id": "r1", "wall_s": 50.0, "processing_s": 50.0}], "attempt_run_id": "r1"}}
     runs = [_run(80.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s["basis"] == "unverified" and math.isnan(s["ratio"])  # a.mp4 has no wall_s
     assert s["pass_rate"] == 0.5 and s["slowest"] == "b.mp4"
     timings["a.mp4"].update(judged_wall_s=150.0, attempt_wall_s=150.0, analysis_status="ok",
-                            judged_run_id="r1", attempt_run_id="r1")
+                            judgment_sources=[{"rounds": [1], "run_id": "r1",
+                                               "wall_s": 150.0, "processing_s": 150.0}],
+                            attempt_run_id="r1")
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s == {"basis": "worst-video+batch", "ratio": 1.5, "pass_rate": 0.5,
                  "slowest": "a.mp4"}

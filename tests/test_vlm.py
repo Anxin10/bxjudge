@@ -710,16 +710,15 @@ def _results(tmp_path, rules, source):
     for r in (a1, a2, a3, a4, b1):
         r.calibration_id = sid
     c1 = res("c.mp4", 1, needs_review=True, reasons=["recalibrate"], launch=False)
-    output.write_results([a1, a2, a3, a4], out, rules)
-    output.write_results([b1], out, rules)
-    output.write_results([c1], out, rules)
+    written = output.write_results([a1, a2, a3, a4, b1, c1], out, rules)
     rows = json.loads((out / "rounds.json").read_text())
     rows[3]["reviewed"] = True  # a.mp4 round 4: human truth
     rows[3]["reviewer_fix"] = {"finish": "spin", "winner": "B", "points": 1}
     (out / "rounds.json").write_text(json.dumps(rows))
     output.write_results([], out, rules)  # refresh CSV/matches exports after the review
     for video, src in (("a.mp4", source), ("b.mp4", None), ("c.mp4", source)):
-        output.record_video_timing(out, video, 10.0, 2.5, source_video=src)
+        output.record_video_timing(out, video, 10.0, 2.5, source_video=src,
+                                   produced_rounds={n for v, n in written if v == video})
     return out
 
 
@@ -741,7 +740,7 @@ def mixed_results(tmp_path, rules):
     output.write_results(rows, out, rules)
     for video in ("new.mp4", "old.mp4", "gone.mp4", "done.mp4", "diag.mp4"):
         source = make_video(tmp_path / video, seconds=2, fps=30, size=(320, 180))
-        output.record_video_timing(out, video, 2.0, 1.0, source_video=source)
+        output.record_video_timing(out, video, 2.0, 1.0, source_video=source, produced_rounds={1})
     return out
 
 
@@ -784,7 +783,7 @@ def test_vlm_never_sends_vetoed_zones_and_other_rows_continue(tmp_path, monkeypa
     output.write_results(rows, out, rules)
     for video in ("bad.mp4", "good.mp4"):
         source = make_video(tmp_path / video, seconds=2, fps=30, size=(320, 180))
-        output.record_video_timing(out, video, 2.0, 1.0, source_video=source)
+        output.record_video_timing(out, video, 2.0, 1.0, source_video=source, produced_rounds={1})
     veto_calibration(out, bad, rules=rules, autocalib=shipped_autocalib())
     drawn = []
     real_frames = vlm.event_frames
@@ -808,6 +807,8 @@ def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypat
     source.write_bytes(b"")
     out = _results(tmp_path, rules, source.resolve())
     before = json.loads((out / "rounds.json").read_text())
+    sources_before = {v: e["judgment_sources"] for v, e in
+                      json.loads((out / "videos.json").read_text()).items()}
     matches_before = (out / "matches.csv").read_text()
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"lid-answer-7","reason":"r"}'))
     asked = []
@@ -834,6 +835,7 @@ def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypat
     assert asked == [(source.resolve(), before[0]["t_end"]), (source.resolve(), before[2]["t_end"])]
     timing = json.loads((out / "videos.json").read_text())
     assert timing["a.mp4"]["processing_s"] == 2.5 and timing["a.mp4"]["vlm_s"] >= 0
+    assert {v: e["judgment_sources"] for v, e in timing.items()} == sources_before
     assert "vlm_s" in timing["b.mp4"] and "vlm_s" not in timing["c.mp4"]
     assert summary["answered"] == 2 and summary["unavailable"] == 1
     # R60: one record per request actually sent; frame failures send nothing

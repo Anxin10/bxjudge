@@ -36,7 +36,9 @@ def _entry(duration, judged, *, attempt=None, processing=None, status="ok", vlm=
          "processing_s": processing if processing is not None else (judged or 1.0),
          "analysis_status": status}
     if judged is not None:
-        e["judged_wall_s"], e["judged_run_id"] = judged, run_id
+        e["judged_wall_s"] = judged
+        e["judgment_sources"] = [{"rounds": [1], "run_id": run_id, "wall_s": judged,
+                                  "processing_s": e["processing_s"]}]
     attempt = judged if attempt is None else attempt
     if attempt is not None:
         e["attempt_wall_s"], e["attempt_run_id"] = attempt, run_id
@@ -123,7 +125,7 @@ def test_a_real_video_without_wall_times_makes_speed_unverified():
     assert r.observed["missing"] == ["b.mp4"]
 
 
-@pytest.mark.parametrize("drop", ["judged_wall_s", "attempt_wall_s", "analysis_status"])
+@pytest.mark.parametrize("drop", ["judgment_sources", "attempt_wall_s", "analysis_status"])
 def test_each_missing_field_makes_speed_unverified(drop):
     timings = {"a.mp4": _entry(100.0, 10.0)}
     del timings["a.mp4"][drop]
@@ -211,7 +213,7 @@ def test_unverified_speed_remedy_points_to_rejudge(tmp_path, capsys):
 
 
 def test_record_video_timing_stores_both_wall_times(tmp_path):
-    record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=3.0)
+    record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=3.0, produced_rounds={1})
     entry = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
     assert entry["judged_wall_s"] == entry["attempt_wall_s"] == 3.0
     assert entry["processing_s"] == 2.0 and "wall_s" not in entry
@@ -251,6 +253,8 @@ class Batch:
         self.select_s = {n: 0.0 for n in names}
         self.fail: set[str] = set()
         self.flagged = False
+        self.round_numbers = [1]
+        self.calibration_id = None
         self.new, self.processed = set(names), set()
         self.due = False
         self.scan_s = 0.0
@@ -264,9 +268,11 @@ class Batch:
             clock.now += self.work[name]
             if name in self.fail:
                 raise RuntimeError("OOM")
-            r = rr("spin", "X", video=name)
-            r.needs_review = self.flagged
-            return [r]
+            results = [rr("spin", "X", video=name, round=n) for n in self.round_numbers]
+            for r in results:
+                r.needs_review = self.flagged
+                r.calibration_id = self.calibration_id
+            return results
 
         def first_second(info, th):
             self.events.append(("decode", info.path.name, clock.now))
@@ -275,9 +281,10 @@ class Batch:
         real_write = pipeline.write_results
 
         def write(results, out_dir, rules):
-            real_write(results, out_dir, rules)
+            written = real_write(results, out_dir, rules)
             for v in {r.video for r in results}:
                 self.events.append(("write", v, clock.now))
+            return written
 
         def scan(*a, **k):
             clock.now += self.scan_s
@@ -407,7 +414,7 @@ def test_rejudge_gives_unchanged_videos_their_wall_times_back(tmp_path, monkeypa
                     if r["video"] == "b.mp4")
     old = b.timings()
     for entry in old.values():  # as written before R66a
-        del entry["judged_wall_s"], entry["attempt_wall_s"]
+        del entry["judgment_sources"], entry["judged_wall_s"], entry["attempt_wall_s"]
     (b.out / "videos.json").write_text(json.dumps(old), encoding="utf-8")
     b.run()
     assert b.judged == []
@@ -416,11 +423,13 @@ def test_rejudge_gives_unchanged_videos_their_wall_times_back(tmp_path, monkeypa
     b.run(rejudge=True)
     assert sorted(b.judged) == ["a.mp4", "b.mp4"]
     t = b.timings()
-    assert (t["a.mp4"]["judged_wall_s"], t["b.mp4"]["judged_wall_s"]) == (5.0, 6.0)
+    assert t["a.mp4"]["judged_wall_s"] == 5.0
+    assert t["b.mp4"]["attempt_wall_s"] == 6.0
     kept = next(r for r in json.loads((b.out / "rounds.json").read_text())
                 if r["video"] == "b.mp4")
     assert kept == reviewed
-    assert b.evaluate().speed_basis == "worst-video+batch"
+    # An old reviewed prediction has no measured producer to recover by rejudging.
+    assert b.evaluate().speed_basis == "unverified"
 
 
 def test_run_cli_passes_rejudge(tmp_path, monkeypatch):
@@ -531,15 +540,16 @@ def test_stale_batch_record_never_verifies_a_newer_unrecorded_timing():
     assert evaluate(rows, timings, runs=done).speed_basis == "worst-video+batch"
 
 
-@pytest.mark.parametrize("field", ["judged_run_id", "attempt_run_id", "vlm_run_ids"])
+@pytest.mark.parametrize("field", ["run_id", "attempt_run_id", "vlm_run_ids"])
 def test_timing_without_a_matching_run_id_is_unverified(field):
     rows = _rows("a.mp4")
     timings = {"a.mp4": _entry(100.0, 40.0, vlm=1.0)}
     runs = [_run(50.0, {"a.mp4": 100.0})]
     assert evaluate(rows, timings, runs=runs).speed_basis == "worst-video+batch"
-    timings["a.mp4"][field] = ["r9"] if field == "vlm_run_ids" else "r9"
+    target = timings["a.mp4"]["judgment_sources"][0] if field == "run_id" else timings["a.mp4"]
+    target[field] = ["r9"] if field == "vlm_run_ids" else "r9"
     assert evaluate(rows, timings, runs=runs).speed_basis == "unverified"
-    del timings["a.mp4"][field]  # no id at all (pre-C-X4 entry): no compatibility path
+    del target[field]  # no id at all (pre-C-X4 entry): no compatibility path
     assert evaluate(rows, timings, runs=runs).speed_basis == "unverified"
 
 
@@ -562,7 +572,7 @@ def test_interrupted_rejudge_after_a_complete_batch_does_not_pass(
     t = b.timings()["a.mp4"]
     assert t["judged_wall_s"] == 80.0
     [run] = json.loads((b.out / "runs.json").read_text())
-    assert t["judged_run_id"] == t["attempt_run_id"] != run["run_id"]
+    assert t["judgment_sources"][0]["run_id"] == t["attempt_run_id"] != run["run_id"]
     m = b.evaluate()
     assert m.speed_basis == "unverified"
     assert passes(m)["speed_ratio"] != "PASS"
@@ -579,9 +589,9 @@ def test_run_batch_stamps_one_run_id_on_timings_and_the_batch_record(
     first, second = json.loads((b.out / "runs.json").read_text())
     assert first["run_id"] != second["run_id"]
     t = b.timings()
-    assert t["a.mp4"]["judged_run_id"] == t["a.mp4"]["attempt_run_id"] == second["run_id"]
+    assert t["a.mp4"]["judgment_sources"][0]["run_id"] == t["a.mp4"]["attempt_run_id"] == second["run_id"]
     # b.mp4 failed in run 2: its kept rows still belong to run 1, its attempt to run 2
-    assert t["b.mp4"]["judged_run_id"] == first["run_id"]
+    assert t["b.mp4"]["judgment_sources"][0]["run_id"] == first["run_id"]
     assert t["b.mp4"]["attempt_run_id"] == second["run_id"]
 
 

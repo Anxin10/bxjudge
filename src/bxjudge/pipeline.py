@@ -740,7 +740,7 @@ def run_batch(
             )
             work[path.name], real[path.name] = wall, True  # its rows are kept
             continue
-        write_results(results, out_dir, rules)
+        written = write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
         record_video_timing(
             out_dir,
@@ -750,6 +750,7 @@ def run_batch(
             source_video=path.resolve(),
             wall_s=processing,
             run_id=run_id,
+            produced_rounds={n for v, n in written if v == path.name},
         )
         work[path.name] = processing
         real[path.name] = _has_real_rows(out_dir, path.name)

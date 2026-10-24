@@ -327,23 +327,46 @@ def _speed_videos(rows: list[dict], timings: dict | None, max_s: float):
     return videos, excluded
 
 
+def _judgment_sources(rows: list[dict], entry: dict, video: str) -> list[dict] | None:
+    """Require explicit producing measurements covering every current raw prediction once."""
+    sources = entry.get("judgment_sources")
+    if not isinstance(sources, list) or not sources:
+        return None
+    expected = {r["round"] for r in rows if r["video"] == video}
+    covered = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            return None
+        rounds = source.get("rounds")
+        rid, wall, core = source.get("run_id"), source.get("wall_s"), source.get("processing_s")
+        if not (isinstance(rounds, list) and rounds and all(type(n) is int for n in rounds)
+                and len(set(rounds)) == len(rounds) and not covered.intersection(rounds)
+                and isinstance(rid, str) and rid and _number(wall) and wall > 0
+                and _number(core) and core > 0):
+            return None
+        covered.update(rounds)
+    return sources if covered == expected else None
+
+
 def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dict:
     """Rulings R66/R66a: the observed per-video wall of every measured real video.
 
     Required: each video with at least one real round whose playback duration is not over
     ``max_s`` (an unknown duration stays required). Its observed time is
-    ``max(judged_wall_s + vlm_s, attempt_wall_s)``: the run that produced its current rows
-    plus their VLM time (never hidden, R59), or its latest attempt (a failed one, R68,
-    keeps the rows but not their wall), whichever is slower, over ``duration_s``, the latest
+    ``max(max(source.wall_s) + vlm_s, attempt_wall_s)``: every producing run behind its
+    current rows is retained in ``judgment_sources``, plus their accumulated VLM time (R59),
+    or its latest attempt (a failed one keeps the rows but not their wall, R68), whichever is slower, over ``duration_s``, the latest
     probe of the current source file. A required video without positive wall times, a valid
-    duration or an ``analysis_status`` is ``missing`` -> unverified (a legacy ``wall_s`` field
-    is not read: no compatibility path)."""
+    duration, complete producing-source coverage or an ``analysis_status`` is ``missing``
+    -> unverified (a legacy ``wall_s`` field is not read: no compatibility path)."""
     videos, missing = [], []
     for video in sorted({r["video"] for r in real_rows(rows)}):
         entry = (timings or {}).get(video)
         entry = entry if isinstance(entry, dict) else {}
         duration = entry.get("duration_s")
-        judged, attempt = entry.get("judged_wall_s"), entry.get("attempt_wall_s")
+        sources = _judgment_sources(rows, entry, video)
+        judged = max(s["wall_s"] for s in sources) if sources else None
+        attempt = entry.get("attempt_wall_s")
         status, vlm = entry.get("analysis_status"), entry.get("vlm_s", 0.0)
         if _number(duration) and duration > max_s:
             continue
@@ -357,7 +380,7 @@ def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dic
                        "attempt_wall_s": attempt, "vlm_s": vlm, "observed_s": observed,
                        "ratio": observed / duration, "status": status,
                        # C-X4(b): the runs that measured this timing
-                       "judged_run_id": entry.get("judged_run_id"),
+                       "judgment_sources": sources,
                        "attempt_run_id": entry.get("attempt_run_id"),
                        "has_vlm": "vlm_s" in entry,
                        "vlm_run_ids": entry.get("vlm_run_ids")})
@@ -374,7 +397,7 @@ def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dic
 
 def _linked_to_complete_runs(video: dict, runs: list[dict] | None) -> bool:
     """Ruling C-X4(b): the CURRENT timing of ``video`` was measured by runs that completed.
-    Its ``judged_run_id`` and ``attempt_run_id`` must each name a ``run`` record listing the
+    Every ``judgment_sources`` run and ``attempt_run_id`` must name a ``run`` record listing the
     video, and every id in ``vlm_run_ids`` (when it has VLM time) must name a record. A
     missing id (an interrupted run, or a pre-C-X4 entry) is never linked."""
     listing: dict[str, set] = {}
@@ -386,7 +409,8 @@ def _linked_to_complete_runs(video: dict, runs: list[dict] | None) -> bool:
     def lists(rid) -> bool:
         return isinstance(rid, str) and video["video"] in listing.get(rid, ())
 
-    ok = lists(video["judged_run_id"]) and lists(video["attempt_run_id"])
+    ok = (all(lists(s["run_id"]) for s in video["judgment_sources"])
+          and lists(video["attempt_run_id"]))
     if video["has_vlm"]:
         ids = video["vlm_run_ids"]
         ok = ok and isinstance(ids, list) and bool(ids) and all(
@@ -404,13 +428,14 @@ def speed_gate(observed: dict, batch: dict, runs: list[dict] | None = None) -> t
     have been measured by runs whose batch records are complete (``_linked_to_complete_runs``),
     so a stale record of an earlier run never verifies a newer, unrecorded timing.
     Ruling C-X5(b): the gated ratio also takes the batch ratio of EACH run that measured a
-    video's current timing (``judged_run_id`` and ``attempt_run_id``), so a fast failed retry
+    video's current timing (``judgment_sources`` and ``attempt_run_id``), so a fast failed retry
     never hides the batch overhead of the run that produced the kept rows; any of those
     ratios missing or not finite leaves speed unverified."""
     covered = set(batch.get("videos", ()))
     run_ratios = batch.get("run_ratios", {})
-    linked = [run_ratios.get(v[k]) if isinstance(v[k], str) else None
-              for v in observed["videos"] for k in ("judged_run_id", "attempt_run_id")]
+    linked = [run_ratios.get(rid) if isinstance(rid, str) else None
+              for v in observed["videos"]
+              for rid in [*(s["run_id"] for s in v["judgment_sources"]), v["attempt_run_id"]]]
     if (observed["complete"] and math.isfinite(batch["ratio"])
             and all(v["video"] in covered and _linked_to_complete_runs(v, runs)
                     for v in observed["videos"])
@@ -1306,7 +1331,8 @@ _SMOKE = (
     "and say nothing about real-video accuracy or spec section 11 compliance."
 )
 _TIMING_NOTE = (
-    "Timing definitions: **core** = `processing_s` per video (judge, trajectories and result "
+    "Timing definitions: **core** = `processing_s`, the slowest surviving producing "
+    "measurement per video (judge, trajectories and result "
     "export; excludes the one-time detector/model init and the scan/probe of the batch; "
     "includes first-inference warm-up). **VLM** = `vlm_s`, the separate VLM phase (frame "
     "decoding + requests; absent = no VLM phase for that video). **End-to-end** = core + VLM "
@@ -1315,16 +1341,19 @@ _TIMING_NOTE = (
     "standalone `bxjudge vlm` phases, minus the measured work of ineligible videos, over "
     "the playback duration of the speed-eligible videos (real round, measured, "
     "≤ speed_max_video_s; each once, in its last run) (R61). **Observed per-video wall** "
-    "= max(`judged_wall_s` + `vlm_s`, `attempt_wall_s`) from videos.json: one timer from the "
+    "= max(max(`judgment_sources[].wall_s`) + `vlm_s`, `attempt_wall_s`) from videos.json: "
+    "producing runs cover every retained/new raw round; one timer from the "
     "video's first decode (incl. its calibration selection pass) to its result write, for "
-    "the run that produced its current rows and for its latest attempt (a failed attempt "
+    "each run that produced its current rows and for its latest attempt (a failed attempt "
     "keeps the rows, R68, but never hides them), over `duration_s`, the latest probe of the "
     "current source file. Speed pass/fail (R66a) needs BOTH the WORST observed per-video "
     "ratio over every real video ≤ speed_max_video_s AND the pooled batch wall-clock ratio "
     "to be ≤ the target; a real video without wall times, or a batch record that does not "
     "cover every measured real video, or whose run id differs from the run id stamped on a "
     "video's current timing (e.g. an interrupted run or --rejudge), makes speed "
-    "unverified (re-judge with `bxjudge run --rejudge`). The median per-video ratio, the "
+    "unverified. Re-judge with `bxjudge run --rejudge`; retained reviewed predictions "
+    "without source evidence remain unverified: use a fresh --out and evaluate it with "
+    "--truth pointing to the old results. The median per-video ratio, the "
     "sum-based median and core-only are diagnostics (R59/R61). VLM request latency "
     "is per request actually sent (`vlm_requests`); *cold* = first answer by that model in "
     "the phase (models are unloaded at phase end). Durations are the playback seconds "
@@ -1487,10 +1516,13 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
                 ""]
     if o["videos"]:
         out += [("| video | status | duration s | judged wall s | VLM s | attempt wall s | "
-                 "observed / duration |"), "|---|---|---|---|---|---|---|"]
+                 "producing runs (rounds; wall s) | attempt run | observed / duration |"),
+                "|---|---|---|---|---|---|---|---|---|"]
         out += [f"| {v['video']} | {v['status']} | {v['duration_s']:.2f} | "
                 f"{v['judged_wall_s']:.2f} | {v['vlm_s']:.2f} | {v['attempt_wall_s']:.2f} | "
-                f"{v['ratio']:.3f} |"
+                + "; ".join(f"{s['run_id']} ({','.join(map(str, s['rounds']))}; {s['wall_s']:.2f})"
+                            for s in v["judgment_sources"])
+                + f" | {v['attempt_run_id']} | {v['ratio']:.3f} |"
                 for v in sorted(o["videos"], key=lambda v: -v["ratio"])]
         out.append("")
     if x.videos:

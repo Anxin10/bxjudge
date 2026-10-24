@@ -168,8 +168,12 @@ def _csv(path: Path, fields: list[str], rows: list[dict]) -> None:
             )
 
 
-def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
-    """Replace complete affected-video analyses, preserving all reviewed rows."""
+def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> set[tuple[str, int]]:
+    """Replace affected-video analyses, preserving reviewed rows; return newly written keys.
+
+    The returned keys describe the actual merge, so timing can distinguish new predictions
+    from retained ones without repeating the review-preservation rule.
+    """
     incoming = {}
     for r in new:
         key = (r.video, r.round)
@@ -187,9 +191,11 @@ def write_results(new: list[RoundResult], out_dir: Path, rules: Rules) -> None:
         seen.add(key)
         if row["video"] not in affected or row["reviewed"]:
             rows[key] = row
+    written = set(incoming) - set(rows)
     for key, row in incoming.items():
         rows.setdefault(key, row)
     save_rounds(list(rows.values()), out_dir, rules)
+    return written
 
 
 def scoring_rows(rows: list[dict], vetoed: AbstractSet[str] = frozenset()) -> list[dict]:
@@ -260,27 +266,59 @@ def record_video_timing(
     duration_s: float,
     processing_s: float,
     *,
+    produced_rounds: set[int],
     source_video: Path | None = None,
     wall_s: float | None = None,
     run_id: str | None = None,
 ) -> None:
-    """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (rulings R66/R66a)
-    is the observed wall time of the attempt, ONE timer from that video's first decode
-    (including its calibration selection pass) to its result write. This attempt produced the
-    current rows, so it is stored as both ``judged_wall_s`` (the rows' run) and
-    ``attempt_wall_s`` (the latest attempt); ``None`` leaves both unrecorded. ``run_id``
-    (ruling C-X4(b)) is the id of the ``bxjudge run`` that measured them, stored as
-    ``judged_run_id`` and ``attempt_run_id`` so the speed gate can link them to that run's
-    batch record in ``runs.json``."""
+    """Record the latest attempt and the measurements behind the surviving predictions.
+
+    ``produced_rounds`` must be the keys newly written by ``write_results``. Each explicit
+    ``judgment_sources`` entry links round numbers to their producing run and measurement.
+    Retained rounds keep their sources; only superseded predictions shed one. Missing old
+    source metadata remains explicitly unknown, never inferred from an older scalar timing.
+    ``judged_wall_s`` and ``processing_s`` summarize the slowest surviving source; the latest
+    attempt has its own wall/run id and CURRENT probed duration. Accumulated VLM evidence is
+    retained when any old prediction survives, since its notes may still be present.
+    """
     _check_wall(wall_s)
     _check_run_id(run_id)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
-    rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
+    previous = rows.get(video, {})
+    entry = {"duration_s": duration_s}
+    current = {r["round"] for r in read_rounds(out_dir) if r["video"] == video}
+    retained = current - produced_rounds
+    sources = []
+    covered = set()
+    old_sources = previous.get("judgment_sources")
+    for source in old_sources if isinstance(old_sources, list) else []:
+        if not isinstance(source, dict) or not isinstance(source.get("rounds"), list):
+            continue
+        kept = [n for n in source["rounds"] if type(n) is int and n in retained]
+        if kept:
+            sources.append({**source, "rounds": sorted(kept)})
+            covered.update(kept)
+    if retained - covered:
+        sources.append({"rounds": sorted(retained - covered), "run_id": None,
+                        "wall_s": None, "processing_s": None})
+    if produced_rounds:
+        sources.append({"rounds": sorted(produced_rounds), "run_id": run_id,
+                        "wall_s": wall_s, "processing_s": processing_s})
+    entry["judgment_sources"] = sources
+    for field, key in (("judged_wall_s", "wall_s"), ("processing_s", "processing_s")):
+        values = [s.get(key) for s in sources]
+        if values and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                          and math.isfinite(v) and v > 0 for v in values):
+            entry[field] = max(values)
+    if retained:
+        entry.update({k: previous[k] for k in ("vlm_s", "vlm_requests", "vlm_run_ids")
+                      if k in previous})
     if wall_s is not None:
-        rows[video]["judged_wall_s"] = rows[video]["attempt_wall_s"] = wall_s
+        entry["attempt_wall_s"] = wall_s
         if run_id is not None:
-            rows[video]["judged_run_id"] = rows[video]["attempt_run_id"] = run_id
+            entry["attempt_run_id"] = run_id
+    rows[video] = entry
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
     _write_json(path, rows)
@@ -413,8 +451,9 @@ def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[di
     ``requests`` holds one record per request actually sent in this phase
     (``VLM_REQUEST_KEYS``: round, seconds, answering model or None, ok, cold = first
     answer by that model in the phase or None when it failed); they accumulate in
-    ``vlm_requests``. A later core analysis (``record_video_timing``) replaces the entry
-    and its rounds, so accumulated VLM time always belongs to the current round set.
+    ``vlm_requests``. A later core analysis (``record_video_timing``) clears VLM evidence
+    only when every old prediction is replaced. With retained predictions it keeps the
+    accumulated evidence conservatively, since their notes may still be present.
     ``run_id`` (C-X4(b)): the run (``bxjudge run`` or ``bxjudge vlm``) whose phase this is,
     appended to ``vlm_run_ids`` (``None`` is kept as an unlinked phase: speed unverified).
     """

@@ -88,11 +88,14 @@ def test_duplicate_new_keys_rejected_before_writes(tmp_path, rules):
 
 
 def test_video_timing_updates_one_key(tmp_path):
-    output.record_video_timing(tmp_path, "a.mp4", 10, 2)
-    output.record_video_timing(tmp_path, "b.mp4", 20, 3)
-    output.record_video_timing(tmp_path, "a.mp4", 10, 1)
+    output.record_video_timing(tmp_path, "a.mp4", 10, 2, produced_rounds={1})
+    output.record_video_timing(tmp_path, "b.mp4", 20, 3, produced_rounds={1})
+    output.record_video_timing(tmp_path, "a.mp4", 10, 1, produced_rounds={1})
     data = json.loads((tmp_path / "videos.json").read_text())
-    assert len(data) == 2 and data["a.mp4"] == {"duration_s": 10, "processing_s": 1}
+    assert len(data) == 2 and data["a.mp4"] == {
+        "duration_s": 10, "processing_s": 1,
+        "judgment_sources": [{"rounds": [1], "run_id": None, "wall_s": None, "processing_s": 1}],
+    }
 
 
 def test_trajectory_all_zones_source_indices_and_scaled_reference(
@@ -200,7 +203,7 @@ def test_burst_finish_marker_uses_trailing_part_observation(tmp_path, monkeypatc
 
 
 def test_vlm_timing_is_separate_and_accumulates(tmp_path):
-    output.record_video_timing(tmp_path, "a.mp4", 10, 2, source_video=tmp_path / "a.mp4")
+    output.record_video_timing(tmp_path, "a.mp4", 10, 2, source_video=tmp_path / "a.mp4", produced_rounds={1})
     first = {"round": 1, "seconds": 30.0, "model": "m", "ok": True, "cold": True}
     second = {"round": 2, "seconds": 1.0, "model": None, "ok": False, "cold": None}
     output.record_vlm_timing(tmp_path, "a.mp4", 30.5, [first])
@@ -211,7 +214,7 @@ def test_vlm_timing_is_separate_and_accumulates(tmp_path):
     assert data["a.mp4"]["vlm_requests"] == [first, second]
     assert data["a.mp4"]["source_video"] == str(tmp_path / "a.mp4")
     # A fresh core analysis replaces the rounds, so earlier VLM time no longer applies.
-    output.record_video_timing(tmp_path, "a.mp4", 10, 3)
+    output.record_video_timing(tmp_path, "a.mp4", 10, 3, produced_rounds={1})
     entry = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
     assert "vlm_s" not in entry and "vlm_requests" not in entry
 
@@ -317,18 +320,21 @@ def test_read_rounds_rejects_a_non_list_rounds_json(tmp_path, payload):
         output.read_rounds(tmp_path)
 
 
-def test_vlm_timing_run_ids_accumulate_and_a_new_analysis_resets_them(tmp_path):
+def test_vlm_timing_run_ids_accumulate_and_a_new_analysis_resets_them(tmp_path, rules):
     """C-X4(b): each VLM phase's run id is kept beside the time it added."""
-    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r1")
+    output.write_results([rr("spin", "X", video="a.mp4")], tmp_path, rules)
+    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r1",
+                               produced_rounds={1})
     output.record_vlm_timing(tmp_path, "a.mp4", 1.0, [], run_id="r1")
     output.record_vlm_timing(tmp_path, "a.mp4", 1.5, [], run_id="v2")
     e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
-    assert e["vlm_run_ids"] == ["r1", "v2"] and e["judged_run_id"] == e["attempt_run_id"] == "r1"
+    assert e["vlm_run_ids"] == ["r1", "v2"] and e["judgment_sources"][0]["run_id"] == e["attempt_run_id"] == "r1"
     output.record_video_status(tmp_path, "a.mp4", "analysis_error", wall_s=0.5, run_id="r3")
     e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
-    assert (e["judged_run_id"], e["attempt_run_id"]) == ("r1", "r3")
-    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r4")
+    assert (e["judgment_sources"][0]["run_id"], e["attempt_run_id"]) == ("r1", "r3")
+    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r4",
+                               produced_rounds={1})
     e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
-    assert "vlm_run_ids" not in e and e["judged_run_id"] == "r4"
+    assert "vlm_run_ids" not in e and e["judgment_sources"][0]["run_id"] == "r4"
     with pytest.raises(ValueError, match="run_id"):
-        output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="")
+        output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="", produced_rounds={1})

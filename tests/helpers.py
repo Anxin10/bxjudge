@@ -425,7 +425,7 @@ def results_with_two_positions(tmp_path):
         snap = _fixed_auto_snapshot(out, seed)
         rounds += [replace(rr("spin", "X", video=video, round=n, t_launch=10.0 * n),
                            calibration_id=snap.id) for n in (1, 2)]
-        record_video_timing(out, video, 30.0, 10.0)
+        record_video_timing(out, video, 30.0, 10.0, produced_rounds={1, 2})
         record_video_calibration(out, video, snap)
         record_video_status(out, video, "ok")
     write_results(rounds, out, load_rules())
