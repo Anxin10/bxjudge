@@ -290,6 +290,7 @@ def main() -> None:
         return
     labels = {
         _row_key(r): (f"{ui.VETOED_PREFIX} · " if state_of[id(r)] == "vetoed" else "")
+        + (f"{ui.ANALYSIS_FAILED_PREFIX} · " if ui.failed_analysis_status(videos, r) else "")
         + f"{r['video']} · 第 {r['round']} 回合 · {ui.status(r)}"
         + (" · 抽樣稽核" if r.get("audit_sample") is True else "")
         for r in shown
@@ -330,6 +331,9 @@ def main() -> None:
             "synthetic_detector：此判定來自合成資料訓練的偵測器，只是流程（smoke）測試，"
             "不是可信的正式判定。"
         )
+    failed = ui.failed_analysis_status(videos, row)
+    if failed:
+        st.warning(ui.analysis_failed_warning(failed))
     source = ui.source_video(videos, row["video"])
     if ui.is_diagnostic(row):
         st.error(

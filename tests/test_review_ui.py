@@ -594,3 +594,23 @@ def test_review_app_default_autocalib_is_the_repositorys(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["review_app.py", str(tmp_path)])
     repo = _P(__file__).resolve().parents[1]
     assert _P(review_app._args().autocalib) == repo / "config" / "autocalib.yaml"
+
+
+def test_app_warns_when_kept_rows_come_from_a_failed_latest_analysis(batch):
+    """Codex final review / R68: a failed latest analysis keeps the old rows; the round list
+    marks them and the round page says the shown judgment may belong to a replaced video."""
+    from bxjudge.output import record_video_status
+
+    record_video_status(batch, "a.mp4", "decode_error")
+    at = app().run()
+    assert not at.exception, at.exception
+    box = widget(at.sidebar.selectbox, "回合")
+    assert f"{review_ui.ANALYSIS_FAILED_PREFIX} · a.mp4 · 第 1 回合 · 待覆核" in box.options
+    assert not [o for o in box.options if o.startswith("⚠") and "b.mp4" in o]
+    pick(at, "a.mp4::1")
+    # st.warning turns the leading ⚠ into its icon, so the element value starts after it
+    warning = "最近一次分析失敗（decode_error），顯示的是先前的判定結果，請確認影片是否已更換"
+    assert review_ui.analysis_failed_warning("decode_error") == "⚠ " + warning
+    assert warning in [w.value for w in at.warning]
+    pick(at, "b.mp4::1")
+    assert warning not in [w.value for w in at.warning]

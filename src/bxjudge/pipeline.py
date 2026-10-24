@@ -659,6 +659,7 @@ def run_batch(
                     log.exception("%s: calibration selection failed (%s); keeping its "
                                   "vetoed rows", path.name, status)
                     entries.append((path, info))
+                    kept_only.add(path.name)  # C-X9: kept, not judged: no --limit use
                     wall = time.perf_counter() - began
                     record_video_status(out_dir, path.name, status, wall_s=wall,
                                         duration_s=info.duration, run_id=run_id)

@@ -189,6 +189,10 @@ class Metrics:
     n_pending_videos: int | None = None
     n_decode_error_videos: int | None = None  # latest attempt: decode / probe failure
     n_analysis_error_videos: int | None = None  # latest attempt: unexpected analysis error
+    # R67 (same values as ReportMetrics.tradeoff): reviewed-and-right / ALL real rounds, and
+    # the exact value only with full truth coverage (None = unverified).
+    accuracy_lower_bound: float = NAN
+    overall_accuracy: float | None = None
 
 
 _FAILURE_STATUSES = ("recalibrate", "decode_error", "analysis_error")
@@ -682,6 +686,7 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level,
                            audit)
     cal = calibration_coverage(rows, timings, vetoed)
+    lower_bound, overall = _accuracy_bounds(real)
     return Metrics(
         finish_accuracy_unflagged=u["estimate"],
         touch_recall=_ratio(sum(touch), len(touch)),
@@ -719,7 +724,19 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
         n_pending_videos=_n_videos(cal["pending_videos"]),
         n_decode_error_videos=_n_videos(cal["decode_error_videos"]),
         n_analysis_error_videos=_n_videos(cal["analysis_error_videos"]),
+        accuracy_lower_bound=lower_bound,
+        overall_accuracy=overall,
     )
+
+
+def _accuracy_bounds(real: list[dict]) -> tuple[float, float | None]:
+    """R67: (lower bound, overall accuracy) over the real rounds; one definition shared by
+    ``Metrics`` and the report's trade-off block."""
+    n = len(real)
+    reviewed = [r for r in real if r.get("reviewed") is True]
+    correct = sum(map(_finish_right, reviewed))
+    return (correct / n if n else NAN,
+            correct / n if n and len(reviewed) == n else None)
 
 
 def _n_videos(videos: list[str] | None) -> int | None:
@@ -931,13 +948,13 @@ def _tradeoff(real: list[dict], u: dict, speed: dict,
     """
     n = len(real)
     reviewed = [r for r in real if r.get("reviewed") is True]
-    correct = sum(map(_finish_right, reviewed))
+    lower_bound, overall = _accuracy_bounds(real)
     flagged = [r for r in real if r["needs_review"] is True or _vetoed_pending(r, vetoed)]
     flagged_reviewed = [r for r in flagged if r.get("reviewed") is True]
     return {
         "automation_rate": _ratio(n - len(flagged), n),
-        "accuracy_lower_bound": correct / n if n else NAN,
-        "overall_accuracy": correct / n if n and len(reviewed) == n else None,
+        "accuracy_lower_bound": lower_bound,
+        "overall_accuracy": overall,
         "truth_coverage": (len(reviewed), n),
         "flagged_reviewed": (len(flagged_reviewed), len(flagged)),
         "unflagged_method": u["method"],

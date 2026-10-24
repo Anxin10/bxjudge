@@ -1981,3 +1981,35 @@ def test_veto_kept_videos_do_not_use_up_the_limit(tmp_path, rules, monkeypatch):
     spy.videos.clear()
     _run(videos, calib, out, rules, limit=1)  # nothing new left to judge
     assert spy.videos == set()
+
+
+def test_vetoed_video_whose_selection_fails_does_not_use_up_the_limit(
+    tmp_path, rules, monkeypatch
+):
+    """Codex final review / C-X9: a vetoed, judged video whose selection raises is kept (not
+    judged), so with a new plain.mp4 and --limit 1 plain.mp4 is still judged; the failed
+    attempt keeps its record, run listing and transient status."""
+    from bxjudge.video import VideoDecodeError
+    from tests.helpers import stadium_scene, write_scene_video
+
+    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    before_rows = json.loads((out / "rounds.json").read_text())
+    write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
+    real = pipeline.first_second_frame
+
+    def fails_for_vetoed(info, th):
+        if info.path.name != "plain.mp4":
+            raise VideoDecodeError("first second unreadable")
+        return real(info, th)
+
+    monkeypatch.setattr(pipeline, "first_second_frame", fails_for_vetoed)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, limit=1)
+    assert spy.videos == {"plain.mp4"}
+    rows = json.loads((out / "rounds.json").read_text())
+    assert [r for r in rows if r["video"] != "plain.mp4"] == before_rows
+    [*_, run] = json.loads((out / "runs.json").read_text())
+    v = json.loads((out / "videos.json").read_text())
+    for kept in ("clip.mp4", "clip2.mp4"):
+        assert v[kept]["analysis_status"] == "decode_error"
+        assert v[kept]["attempt_run_id"] == run["run_id"] and kept in run["videos"]

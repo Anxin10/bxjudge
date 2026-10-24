@@ -28,6 +28,8 @@ from .vlm import overlay_zones, recorded_source
 # 抽樣稽核 = R62 random audit sample; 校準被否決 = unreviewed rounds of a vetoed calibration
 FILTERS = ("全部", "需覆核", "已覆核", "抽樣稽核", "校準被否決")
 VETOED_PREFIX = "⛔ 校準被否決"
+# R68: the latest analysis of the video failed, so its rows are the kept earlier ones
+ANALYSIS_FAILED_PREFIX = "⚠ 分析失敗"
 
 # Calibration copy (spec section 6.5)
 NO_RECORD = "此結果沒有校準紀錄，請用新版重新執行 bxjudge run"
@@ -83,6 +85,20 @@ class ReviewMediaError(RuntimeError):
 def is_diagnostic(row: dict) -> bool:
     """recalibrate / no_round / decode_error / analysis_error placeholders (R53)."""
     return is_not_a_round(row.get("review_reasons") or [])
+
+
+def failed_analysis_status(videos: dict, row: dict) -> str | None:
+    """The video's latest ``analysis_status`` when it is not ``ok`` and the row is a real
+    round (R68: such a round is a kept earlier judgment); None otherwise or when unrecorded."""
+    if is_diagnostic(row):
+        return None
+    entry = videos.get(row["video"]) if isinstance(videos, dict) else None
+    value = entry.get("analysis_status") if isinstance(entry, dict) else None
+    return value if isinstance(value, str) and value != "ok" else None
+
+
+def analysis_failed_warning(status: str) -> str:
+    return f"⚠ 最近一次分析失敗（{status}），顯示的是先前的判定結果，請確認影片是否已更換"
 
 
 def status(row: dict) -> str:

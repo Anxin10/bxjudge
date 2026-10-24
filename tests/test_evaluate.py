@@ -872,6 +872,18 @@ def test_tradeoff_lower_bound_counts_only_reviewed_correct_over_all_real_rounds(
     assert t["overall_accuracy"] is None and t["truth_coverage"] == (4, 10)
 
 
+def test_metrics_carry_the_tradeoff_accuracy_fields():
+    """Codex final review: Task 7 puts accuracy_lower_bound / overall_accuracy on Metrics,
+    with the very values of the report's trade-off block."""
+    rows = _unflagged(10, reviewed={1, 2, 3, 4}, wrong={4})  # 4 reviewed, 3 correct
+    m, t = evaluate(rows), report_metrics(rows, None, _cfg()).tradeoff
+    assert m.accuracy_lower_bound == pytest.approx(0.3) == pytest.approx(t["accuracy_lower_bound"])
+    assert m.overall_accuracy is None and t["overall_accuracy"] is None
+    full = _unflagged(10, reviewed=set(range(1, 11)), wrong={1, 2})
+    assert evaluate(full).overall_accuracy == pytest.approx(0.8)
+    assert math.isnan(evaluate([]).accuracy_lower_bound)
+
+
 def test_tradeoff_overall_accuracy_is_exact_once_every_real_round_is_reviewed():
     rows = _unflagged(10, reviewed=set(range(1, 11)), wrong={1, 2})
     t = report_metrics(rows, None, _cfg()).tradeoff
