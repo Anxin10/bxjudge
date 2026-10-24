@@ -103,3 +103,45 @@ def test_warp_calibration_moves_all_zones_and_clears_ref_frame():
         assert np.abs(np.array(getattr(got, zone)) - np.array(getattr(truth, zone))).max() < 3.0
     assert a.rotation_deg == pytest.approx(-2.0, abs=0.3)
     assert a.scale == pytest.approx(0.95, abs=0.01)
+
+
+# Known weaknesses (final-review I1): the aligner accepts these misaligned. Pinned as strict
+# xfail so a fix flips them to XPASS(strict) and forces this marker to be removed.
+_KNOWN_I1 = pytest.mark.xfail(
+    strict=True, reason="known: accepted misaligned; see final-review I1")
+
+
+@_KNOWN_I1
+@pytest.mark.parametrize("block", [(24, 8, 334, 358), (900, 8, 334, 358)])
+def test_ghost_displaced_structure_25px_is_accurate_or_rejected(block):
+    import cv2
+
+    tpl_img, tpl = stadium_scene()
+    frame, truth = stadium_scene(shift=(49.019032876749094, -34.65765420413904),
+                                 rotation_deg=-0.9879950469803092, scale=1.018190471590685)
+    displaced = cv2.warpAffine(frame, np.float32([[1, 0, 25], [0, 1, 0]]), (1280, 720))
+    x, y, w, h = block
+    frame[y:y + h, x:x + w] = displaced[y:y + h, x:x + w]
+    a = estimate_alignment(frame, tpl, tpl_img, load_autocalib_config())
+    if a is not None:
+        got = warp_calibration(tpl, a, (1280, 720), "auto")
+        assert mean_boundary_error(got, truth, 1280) < 8.0
+
+
+@_KNOWN_I1
+@pytest.mark.parametrize("sx, sy", [(0.9, 1.13), (0.94, 1.06)])
+def test_anisotropic_structure_15px_is_accurate_or_rejected(sx, sy):
+    import cv2
+
+    from bxjudge.autocalib import Alignment
+
+    image, template = stadium_scene()
+    matrix = np.array([[sx, 0, 45 + 640 * (1 - sx)],
+                       [0, sy, 20 + 360 * (1 - sy)], [0, 0, 1]])
+    frame = cv2.warpPerspective(image, matrix, (1280, 720))
+    truth = warp_calibration(template, Alignment(tuple(map(tuple, matrix)), 1, 0, 0, 1, 0),
+                             (1280, 720), "truth")
+    alignment = estimate_alignment(frame, template, image, load_autocalib_config())
+    if alignment is not None:
+        got = warp_calibration(template, alignment, (1280, 720), "auto")
+        assert mean_boundary_error(got, truth, 1280) < 8.0

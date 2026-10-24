@@ -843,8 +843,7 @@ def test_no_human_truth_leaves_every_accuracy_unverified():
     r = report_metrics(rows, None, _cfg())
     assert math.isnan(r.unflagged["estimate"])
     assert math.isnan(r.referee["all"]["accuracy"])
-    assert math.isnan(r.tradeoff["auto_accuracy"]["estimate"])
-    assert math.isnan(r.tradeoff["final_accuracy"]["estimate"])
+    assert r.tradeoff["accuracy_lower_bound"] == 0.0 and r.tradeoff["overall_accuracy"] is None
     m = evaluate(rows)
     assert all(math.isnan(v) for v in (m.finish_accuracy_unflagged, m.touch_recall, m.air_recall))
 
@@ -859,22 +858,34 @@ def test_tradeoff_block_side_by_side_without_a_weighted_score():
              *(rev(round=i, needs_review=True, reviewed=False) for i in (13, 14, 15))]
     t = report_metrics(rows, None, _cfg()).tradeoff
     assert t["automation_rate"] == pytest.approx(10 / 15)
-    assert t["auto_accuracy"]["estimate"] == pytest.approx((10 * 0.8 + 1) / 15)
-    assert t["final_accuracy"]["estimate"] == pytest.approx((10 + 2) / 15)
+    assert t["accuracy_lower_bound"] == pytest.approx(9 / 15)  # 8 + 1 reviewed-correct of 15
+    assert t["overall_accuracy"] is None and t["truth_coverage"] == (12, 15)
     assert t["flagged_reviewed"] == (2, 5) and t["unflagged_method"] == "exact"
-    assert set(t) == {"automation_rate", "auto_accuracy", "final_accuracy", "flagged_reviewed",
-                      "unflagged_method", "speed"}
+    assert set(t) == {"automation_rate", "accuracy_lower_bound", "overall_accuracy",
+                      "truth_coverage", "flagged_reviewed", "unflagged_method", "speed"}
 
 
-def test_tradeoff_intervals_propagate_the_audit_interval():
-    rows = _unflagged(20, sampled={1, 2, 3, 4, 5}, reviewed={1, 2, 3, 4, 5}, wrong={2})
-    r = report_metrics(rows, None, _cfg())
-    a = r.tradeoff["auto_accuracy"]
-    assert a["estimate"] == pytest.approx(0.8)
-    assert (a["low"], a["high"]) == (pytest.approx(r.unflagged["low"]),
-                                     pytest.approx(r.unflagged["high"]))
-    f = r.tradeoff["final_accuracy"]  # 5 reviewed now right, 15 unreviewed at the estimate
-    assert f["estimate"] == pytest.approx((15 * 0.8 + 5) / 20)
+def test_tradeoff_lower_bound_counts_only_reviewed_correct_over_all_real_rounds():
+    rows = _unflagged(10, reviewed={1, 2, 3, 4}, wrong={4})  # 4 reviewed, 3 correct
+    t = report_metrics(rows, None, _cfg()).tradeoff
+    assert t["accuracy_lower_bound"] == pytest.approx(0.3)
+    assert t["overall_accuracy"] is None and t["truth_coverage"] == (4, 10)
+
+
+def test_tradeoff_overall_accuracy_is_exact_once_every_real_round_is_reviewed():
+    rows = _unflagged(10, reviewed=set(range(1, 11)), wrong={1, 2})
+    t = report_metrics(rows, None, _cfg()).tradeoff
+    assert t["overall_accuracy"] == pytest.approx(0.8)
+    assert t["accuracy_lower_bound"] == pytest.approx(0.8)
+    assert t["truth_coverage"] == (10, 10)
+
+
+def test_vetoed_unreviewed_round_stays_in_the_lower_bound_population():
+    rows = [rev(video="a.mp4", round=n, calibration_id="S2", fix={}) for n in (1, 2, 3)]
+    rows.append(row(video="b.mp4", round=1, calibration_id="S1"))  # vetoed, unreviewed
+    t = report_metrics(rows, None, _cfg(), vetoed={"S1"}).tradeoff
+    assert t["accuracy_lower_bound"] == pytest.approx(0.75)
+    assert t["overall_accuracy"] is None and t["truth_coverage"] == (3, 4)
 
 
 def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
@@ -901,7 +912,8 @@ def test_cli_eval_report_shows_wall_audit_and_tradeoff_blocks(tmp_path):
     assert main(["eval", str(res), "--config", str(EVAL_CONFIG), "--report", str(report)]) == 0
     summary = report.read_text(encoding="utf-8").split("\n## ", 1)[0]
     for text in ("wall-clock", "sum-based", "Wilson", "audit_sample", "自動化率 Automation Rate",
-                 "自動判定估計正確率", "覆核後估計正確率", "no weighted score"):
+                 "正確率下界 Accuracy Lower Bound", "整體正確率 Overall Accuracy",
+                 "unverified (truth coverage 1/3)", "no weighted score"):
         assert text in summary, text
 
 
@@ -909,8 +921,8 @@ def test_tradeoff_without_any_human_truth_is_unverified_even_if_all_flagged():
     rows = [rev(round=i, needs_review=True, reviewed=False) for i in (1, 2, 3)]
     t = report_metrics(rows, None, _cfg()).tradeoff
     assert t["automation_rate"] == 0.0
-    assert math.isnan(t["auto_accuracy"]["estimate"])  # not a measured 0.0
-    assert math.isnan(t["final_accuracy"]["estimate"])
+    assert t["accuracy_lower_bound"] == 0.0 and t["overall_accuracy"] is None
+    assert t["truth_coverage"] == (0, 3)
 
 
 # ---- fix round 1: I1 wall-clock eligible denominator ----------------------------
@@ -1258,16 +1270,18 @@ def test_report_tradeoff_is_consistent_with_review_ratio_under_a_veto():
     t = extra.tradeoff
     assert m.review_ratio == pytest.approx(0.25)
     assert t["automation_rate"] == pytest.approx(1 - m.review_ratio)
-    # The vetoed unreviewed round needs human work: an error until reviewed, never "at the
-    # unflagged estimate" (1.0 here).
-    assert t["auto_accuracy"]["estimate"] == pytest.approx(0.75)
-    assert t["final_accuracy"]["estimate"] == pytest.approx(0.75)
+    # The vetoed unreviewed round needs human work: it stays in the population and is not
+    # counted correct until reviewed.
+    assert t["accuracy_lower_bound"] == pytest.approx(0.75)
+    assert t["overall_accuracy"] is None
     assert t["flagged_reviewed"] == (0, 1)
     text = render_eval_report("res", rows, None, m, passes(m, cfg), extra, cfg, today="x",
                               vetoed=vetoed)
     assert "| 需覆核比例 review_ratio | 0.250 (1/4) |" in text
     assert "| 自動化率 Automation Rate | 0.750 |" in text
-    assert "Auto Accuracy (all real rounds) | 0.750 (" in text
-    assert "Final Accuracy after review | 0.750 (" in text
+    assert "Accuracy Lower Bound | 0.750 |" in text
+    assert "Overall Accuracy | unverified (truth coverage 3/4) |" in text
+    for gone in ("Auto Accuracy", "Final Accuracy", "自動判定估計", "覆核後估計"):
+        assert gone not in text, gone
     plain = report_metrics(rows, None, cfg).tradeoff  # without vetoes: the old definition
     assert plain["automation_rate"] == 1.0

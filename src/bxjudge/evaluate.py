@@ -920,41 +920,25 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
 
 def _tradeoff(real: list[dict], u: dict, speed: dict,
               vetoed: set[str] = frozenset()) -> dict:
-    """R63 joint block, side by side (no weighted score).
+    """R63/R67 joint block, side by side (no weighted score, no extrapolation).
 
-    auto accuracy = what the judge gets right on its own over ALL real rounds: unflagged
-    rounds at the unflagged estimate, flagged rounds by their reviewed original accuracy
-    with unreviewed flagged rounds counted as errors. final accuracy = after the human
-    review done so far: reviewed rounds are right, unreviewed unflagged rounds at the
-    estimate, unreviewed flagged rounds still pending (counted as errors). An unreviewed
-    round of a vetoed calibration needs human work (spec 6.6b) and is treated as flagged,
-    so automation rate = 1 - review_ratio.
+    ``accuracy_lower_bound`` = reviewed real rounds whose ORIGINAL finish and winner are
+    right / ALL real rounds: every unreviewed round counts as not (yet) right, so it never
+    overstates. ``overall_accuracy`` is the exact value, defined only when every real round
+    is reviewed (None = unverified, with ``truth_coverage`` = (reviewed, real)). An
+    unreviewed round of a vetoed calibration stays in the population and needs human work
+    (spec 6.6b), so automation rate = 1 - review_ratio.
     """
     n = len(real)
-
-    def needs_human(r: dict) -> bool:
-        return r["needs_review"] is True or _vetoed_pending(r, vetoed)
-
-    unflagged = [r for r in real if r["needs_review"] is False and not needs_human(r)]
-    flagged = [r for r in real if needs_human(r)]
+    reviewed = [r for r in real if r.get("reviewed") is True]
+    correct = sum(map(_finish_right, reviewed))
+    flagged = [r for r in real if r["needs_review"] is True or _vetoed_pending(r, vetoed)]
     flagged_reviewed = [r for r in flagged if r.get("reviewed") is True]
-    n_u, n_u_rev = len(unflagged), sum(r.get("reviewed") is True for r in unflagged)
-    correct_flagged = sum(map(_finish_right, flagged_reviewed))
-
-    def mix(weight: int, fixed: int) -> dict:
-        # No human truth at all = unverified, never a "measured" 0.0 from counting
-        # every pending flagged round as an error.
-        no_truth = not any(r.get("reviewed") is True for r in real)
-        if not n or no_truth or (weight and not math.isfinite(u["estimate"])):
-            return {"estimate": NAN, "low": NAN, "high": NAN}
-        p = (u["estimate"], u["low"], u["high"]) if weight else (0.0, 0.0, 0.0)
-        est, lo, hi = ((weight * v + fixed) / n for v in p)
-        return {"estimate": est, "low": lo, "high": hi}
-
     return {
-        "automation_rate": _ratio(n_u, n),
-        "auto_accuracy": mix(n_u, correct_flagged),
-        "final_accuracy": mix(n_u - n_u_rev, n_u_rev + len(flagged_reviewed)),
+        "automation_rate": _ratio(n - len(flagged), n),
+        "accuracy_lower_bound": correct / n if n else NAN,
+        "overall_accuracy": correct / n if n and len(reviewed) == n else None,
+        "truth_coverage": (len(reviewed), n),
         "flagged_reviewed": (len(flagged_reviewed), len(flagged)),
         "unflagged_method": u["method"],
         "speed": speed,
@@ -1423,8 +1407,9 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         wall_note = (f"; NOTE per-video sum {_f(w['sum_s'], 2)} s exceeds wall-clock "
                      f"{_f(w['wall_s'], 2)} s (overlapping work)")
 
-    def interval(d: dict) -> str:
-        return f"{_f(d['estimate'])} ({_f(d['low'])}–{_f(d['high'])})"
+    cov = t["truth_coverage"]
+    overall = (_f(t["overall_accuracy"]) if t["overall_accuracy"] is not None
+               else f"unverified (truth coverage {cov[0]}/{cov[1]})")
     acc = {k: _frac(v["accuracy"], v["correct"], v["n"]) for k, v in ref.items()}
     out += [
         (f"| 核心判定延遲 Core Latency | {_lat(x.core_s, pct)}; ratio "
@@ -1462,14 +1447,12 @@ def render_eval_report(results_dir, rows, timings, metrics: Metrics, ok: dict[st
         "|---|---|---|",
         (f"| 自動化率 Automation Rate | {_f(t['automation_rate'])} | 1 − review_ratio over "
          f"{m.n_rounds} real rounds |"),
-        (f"| 自動判定估計正確率 Auto Accuracy (all real rounds) | {interval(t['auto_accuracy'])} "
-         f"| unflagged at [{t['unflagged_method']}]; flagged (incl. vetoed unreviewed) by "
-         f"reviewed original accuracy, unreviewed flagged counted as errors "
-         f"({t['flagged_reviewed'][0]}/"
-         f"{t['flagged_reviewed'][1]} flagged reviewed) |"),
-        (f"| 覆核後估計正確率 Final Accuracy after review | {interval(t['final_accuracy'])} | "
-         "reviewed rounds right; unreviewed unflagged at the estimate; unreviewed flagged "
-         "still pending (errors) |"),
+        (f"| 正確率下界 Accuracy Lower Bound | {_f(t['accuracy_lower_bound'])} | reviewed "
+         f"real rounds whose original finish and winner are right "
+         f"({t['truth_coverage'][0]} reviewed of {t['truth_coverage'][1]} real rounds); "
+         "unreviewed rounds (incl. vetoed) count as not right, no extrapolation (R67) |"),
+        (f"| 整體正確率 Overall Accuracy | {overall} | exact, only when every real round is "
+         "reviewed |"),
         (f"| 速度達標 Speed Pass | {_f(t['speed']['pass_rate'])} (worst ratio "
          f"{_f(t['speed']['ratio'])}) | {t['speed']['basis']}; {slowest} |"),
         "",

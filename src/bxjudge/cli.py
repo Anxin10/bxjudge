@@ -436,6 +436,14 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     summary = ", ".join(f"{name}={shown(name)} {ok[name]}"
                         for name in ev.METRIC_NAMES)
     print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
+    trade = extra.tradeoff  # R67: conservative lower bound, exact only with full truth
+    covered, real = trade["truth_coverage"]
+    overall = (f"{trade['overall_accuracy']:.3f}" if trade["overall_accuracy"] is not None
+               else f"unverified (truth coverage {covered}/{real})")
+    lower = (f"{trade['accuracy_lower_bound']:.3f}"
+             if math.isfinite(trade["accuracy_lower_bound"]) else "n/a")
+    print(f"accuracy_lower_bound={lower}; "
+          f"overall_accuracy={overall}")
     if metrics.speed_slowest_video is not None:  # R66: name the video that decides speed
         print(f"speed [{metrics.speed_basis}]: slowest video {metrics.speed_slowest_video} "
               f"at {metrics.speed_ratio_worst_observed:.3f} x playback")
