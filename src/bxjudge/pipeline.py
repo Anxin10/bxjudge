@@ -8,6 +8,7 @@ import logging
 import math
 import sys
 import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import closing
@@ -19,6 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import DEFAULT_AUTOCALIB_CONFIG
 from .autocalib import AutoCalibConfig, load_autocalib_config
 from .calibration import scale_calibration
 from .calibration_store import (
@@ -53,6 +55,7 @@ from .output import (
     TRANSIENT_FAILURES,
     read_rounds,
     record_run_timing,
+    record_video_attempt,
     record_video_calibration,
     record_video_status,
     record_video_timing,
@@ -476,6 +479,35 @@ def _read_statuses(out_dir: Path) -> dict[str, str | None]:
             for v, e in rows.items()}
 
 
+def _has_real_rows(out_dir: Path, video: str) -> bool:
+    """Whether ``rounds.json`` holds at least one real (non-placeholder) row of ``video``."""
+    return any(r["video"] == video and not is_not_a_round(r["review_reasons"])
+               for r in read_rounds(out_dir))
+
+
+def _read_vlm_seconds(out_dir: Path) -> dict[str, float]:
+    """``vlm_s`` per video from ``videos.json`` (0 when absent)."""
+    path = Path(out_dir) / "videos.json"
+    rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    out = {}
+    for video, entry in (rows.items() if isinstance(rows, dict) else ()):
+        v = entry.get("vlm_s") if isinstance(entry, dict) else None
+        out[video] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    return out
+
+
+def _read_calibration_ids(out_dir: Path) -> dict[str, str | None]:
+    """The snapshot id each video's current rows were judged with, from ``videos.json``."""
+    path = Path(out_dir) / "videos.json"
+    rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    out: dict[str, str | None] = {}
+    for video, entry in (rows.items() if isinstance(rows, dict) else ()):
+        cal = entry.get("calibration") if isinstance(entry, dict) else None
+        sid = cal.get("id") if isinstance(cal, dict) else None
+        out[video] = sid if isinstance(sid, str) else None
+    return out
+
+
 def run_batch(
     folder: Path,
     calib_dir: Path,
@@ -490,13 +522,16 @@ def run_batch(
     rules: Rules | None = None,
     th: Thresholds | None = None,
     vlm_config: Path | None = None,
-    autocalib_config: Path = Path("config/autocalib.yaml"),
+    autocalib_config: Path = DEFAULT_AUTOCALIB_CONFIG,
     autocalib: AutoCalibConfig | None = None,
     rejudge: bool = False,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    # C-X4(b): one id per run, on every video timing it writes and on its batch record; a
+    # timing whose run never wrote its record (interrupted) cannot verify speed.
+    run_id = uuid.uuid4().hex
     folder, out_dir = Path(folder).expanduser(), Path(out_dir).expanduser()
     if not folder.is_dir():
         raise ValueError(f"{folder}: expected video folder")
@@ -562,12 +597,13 @@ def run_batch(
     # selection (not selected twice). Rulings T4-1/T4-3: a vetoed auto snapshot is never
     # selected again; a video recorded with one keeps its rows until selection yields a
     # non-vetoed snapshot (then it is reanalysed). Ruling R66b: ``rejudge`` ignores the
-    # processed cache and re-analyses every video (reviewed rows are kept, R36).
+    # processed cache and re-analyses every video (reviewed rows are kept, R36), except that
+    # ruling C-X3(a) keeps the T4-3 rule: a video recorded with a vetoed snapshot and no
+    # usable non-vetoed alternative keeps its rows, exactly as on a plain rerun.
     vetoed = vetoed_ids(out_dir)
     processed = processed_videos(folder, db, on_error=on_error)
-    if rejudge:
-        infos, processed = [*infos, *processed], []
     statuses = _read_statuses(out_dir)
+    recorded_calibrations = _read_calibration_ids(out_dir)
     # Ruling R68: "previously judged" = at least one real (non-placeholder) row on disk.
     judged_before = {
         r["video"] for r in read_rounds(out_dir) if not is_not_a_round(r["review_reasons"])
@@ -578,28 +614,85 @@ def run_batch(
         + [(i.path, i, True) for i in processed]
     )
     entries: list[tuple[Path, VideoInfo | None]] = []
+    # C-X7(a): the work this run measured per video, stored in its batch record so a later
+    # retry never rewrites this run's overhead.
+    work: dict[str, float] = {}
+    # C-X8: per listed video, whether it had real rows after this run's attempt (the run's
+    # own speed scope), and the videos only kept (never judged) by the T4-3 veto rule.
+    real: dict[str, bool] = {}
+    kept_only: set[str] = set()
     for path, info, cached in candidates:
-        if limit is not None and len(entries) >= limit:
-            break
+        # C-X9: veto-kept videos (no judging) never use up --limit; once it is reached, only
+        # veto candidates still get their attempt recorded (nothing else is judged).
+        limit_reached = limit is not None and len(
+            [p for p, _ in entries if p.name not in kept_only]) >= limit
         # Ruling R66a: ONE timer per video, from its first decode (the selection pass of a
         # processed video, else judge_video's own) to its result write; selection and
         # judging run back to back, so no other video's work falls inside it.
         began = time.perf_counter()
         preselected: dict = {}
-        if cached:
+        # C-X5(a): the snapshot the video's current rows were judged with: its processed
+        # record, else (a changed file whose record was forgotten) videos.json.
+        recorded = None
+        if info is not None:
+            recorded = processed_calibration(db, info.path) or recorded_calibrations.get(
+                path.name)
+        # A previously judged video recorded with a vetoed snapshot goes through the same
+        # selection even when scan reports it as new/changed (e.g. a touched mtime), so the
+        # T4-3 keep rule below applies on every path.
+        vetoed_before = (info is not None and path.name in judged_before
+                         and recorded in vetoed)
+        if limit_reached and not vetoed_before:
+            continue
+        if cached or vetoed_before:
             try:
                 frame = first_second_frame(info, th)
                 snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
-            except Exception:
+            except Exception as error:
+                if recorded in vetoed and path.name in judged_before:
+                    # C-X7(b): a vetoed, previously judged video whose selection failed is
+                    # never reanalysed (with no usable alternative that could only give a
+                    # recalibrate placeholder, T4-3): its rows stay and the attempt is a
+                    # transient failure (R68), retried on the next run.
+                    status = ("decode_error" if isinstance(error, VideoDecodeError)
+                              else "analysis_error")
+                    log.exception("%s: calibration selection failed (%s); keeping its "
+                                  "vetoed rows", path.name, status)
+                    entries.append((path, info))
+                    wall = time.perf_counter() - began
+                    record_video_status(out_dir, path.name, status, wall_s=wall,
+                                        duration_s=info.duration, run_id=run_id)
+                    work[path.name], real[path.name] = wall, True
+                    continue
                 # e.g. an unreadable first second: the normal per-video flow handles it.
                 log.exception("cannot re-select the calibration of %s; reanalysing it",
                               info.path)
             else:
                 current = snap.id if snap is not None else None
-                # C-X2(a): only a latest status of ``ok`` lets an unchanged video keep its rows
-                # unjudged; any other (a transient failure, R68, or none recorded) is re-judged.
-                if (statuses.get(path.name) == "ok" and not needs_reanalysis(
-                        processed_calibration(db, info.path), current, vetoed)):
+                unchanged = not needs_reanalysis(recorded, current, vetoed)
+                # C-X4(a)/C-X5(a): the T4-3 veto rule comes first. A video recorded with a
+                # vetoed snapshot and no usable non-vetoed alternative keeps its rows on any
+                # rerun (plain or --rejudge, C-X3(a)), whatever its latest analysis_status and
+                # whether it came from the cache or from scan: judging it again could only
+                # give a recalibrate placeholder.
+                if recorded in vetoed and unchanged:
+                    # C-X8: still an attempt: its own wall under this run's id and the
+                    # CURRENT probed duration are recorded (status and judged wall kept), and
+                    # the run lists it with what it measured.
+                    entries.append((path, info))
+                    kept_only.add(path.name)
+                    wall = time.perf_counter() - began
+                    record_video_attempt(out_dir, path.name, wall_s=wall,
+                                         duration_s=info.duration, run_id=run_id)
+                    work[path.name], real[path.name] = wall, True
+                    continue
+                if limit_reached:  # C-X9: --limit is used up; nothing more is judged
+                    continue
+                # C-X2(a): otherwise only a latest status of ``ok`` lets an unchanged cached
+                # video keep its rows unjudged (never under --rejudge, R66b); any other status
+                # (a transient failure, R68, or none recorded) is re-judged.
+                if (cached and not rejudge and statuses.get(path.name) == "ok"
+                        and unchanged):
                     continue
                 preselected = {"snapshot": snap}
         entries.append((path, info))
@@ -639,10 +732,12 @@ def run_batch(
             # source file (its latest probe; none when the probe failed) are recorded with
             # the status, so neither the kept rows nor an old file's length can hide it.
             log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
+            wall = time.perf_counter() - began
             record_video_status(
-                out_dir, path.name, status, wall_s=time.perf_counter() - began,
-                duration_s=info.duration if info is not None else None,
+                out_dir, path.name, status, wall_s=wall,
+                duration_s=info.duration if info is not None else None, run_id=run_id,
             )
+            work[path.name], real[path.name] = wall, True  # its rows are kept
             continue
         write_results(results, out_dir, rules)
         processing = time.perf_counter() - began
@@ -653,7 +748,10 @@ def run_batch(
             processing,
             source_video=path.resolve(),
             wall_s=processing,
+            run_id=run_id,
         )
+        work[path.name] = processing
+        real[path.name] = _has_real_rows(out_dir, path.name)
         record_video_calibration(out_dir, path.name, snap)
         record_video_status(out_dir, path.name, status)
         # Placeholder-only videos await corrected input and are retried (R56): their record
@@ -671,30 +769,42 @@ def run_batch(
             info.duration if info else 0.0,
         )
     vlm_wall_s = None
-    if vlm is not None and entries:
+    if vlm is not None and {path.name for path, _ in entries} - kept_only:
         # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
         vlm_began = time.perf_counter()
         del detector
         _release_gpu_memory()
+        vlm_before = _read_vlm_seconds(out_dir)
         summary = review_results_dir(
             out_dir,
             th=th,
             rules=rules,
             config=vlm,
-            videos={path.name for path, _ in entries},
+            # veto-kept videos were not judged in this run: their rows are left alone
+            videos={path.name for path, _ in entries} - kept_only,
+            autocalib=autocalib,  # C-X3(b): run's --autocalib, never the cwd file
+            run_id=run_id,
         )
         # R65: an unreachable server skips the phase (bounded preflight, still inside the
         # honest batch wall_s) and records no VLM phase.
         if not (summary or {}).get("skipped"):
             vlm_wall_s = time.perf_counter() - vlm_began
+        # C-X7(a): this phase's VLM time per video belongs to this run's measured work.
+        for video, seconds in _read_vlm_seconds(out_dir).items():
+            added = seconds - vlm_before.get(video, 0.0)
+            if video in work and added > 0:
+                work[video] += added
     if entries:  # nothing judged = no judgment wall-clock to report
         record_run_timing(
             out_dir,
             kind="run",
+            run_id=run_id,
             started_at=started_at,
             wall_s=time.perf_counter() - run_began,
             vlm_wall_s=vlm_wall_s,
             videos={path.name: info.duration if info else 0.0 for path, info in entries},
+            work={path.name: work.get(path.name, 0.0) for path, _ in entries},
+            real={path.name: real.get(path.name, False) for path, _ in entries},
         )
 
 

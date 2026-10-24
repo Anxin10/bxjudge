@@ -394,7 +394,7 @@ def _fixed_auto_snapshot(out_dir, seed: int):
 
     eye = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
     return save_snapshot(out_dir, "auto", make_calibration(), make_ref_img(seed), score=0.9,
-                         template_id="f" * 16, homography=eye)
+                         template_id="f" * 16, homography=eye, autocalib=shipped_autocalib())
 
 
 def auto_snapshot_ids() -> tuple[str, str]:
@@ -624,3 +624,13 @@ def audit_of(rows: list[dict], seed: int = 0) -> dict | None:
                         if not is_not_a_round(r.get("review_reasons") or [])
                         and r["needs_review"] is False)
     return {"seed": seed, "n": len(selection), "population": population, "selection": selection}
+
+
+def shipped_autocalib():
+    """``config/autocalib.yaml`` of this repository, resolved from the repo root (never the
+    current directory; ruling C-X3(b))."""
+    from pathlib import Path
+
+    from bxjudge.autocalib import load_autocalib_config
+
+    return load_autocalib_config(Path(__file__).resolve().parents[1] / "config" / "autocalib.yaml")

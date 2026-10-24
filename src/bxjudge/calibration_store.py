@@ -44,7 +44,6 @@ import numpy as np
 from bxjudge.autocalib import (
     AutoCalibConfig,
     estimate_alignment,
-    load_autocalib_config,
     warp_calibration,
 )
 from bxjudge.calibration import ZONES, calibration_similarity, load_calibration
@@ -121,12 +120,13 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
                   score: float, template_id: str | None = None, source_path: Path | None = None,
                   homography: tuple | None = None,
                   template_set: Iterable[str] | None = None,
-                  autocalib: AutoCalibConfig | None = None) -> Snapshot:
+                  autocalib: AutoCalibConfig) -> Snapshot:
     """Write the snapshot of ``calibration`` with reference image ``ref_image`` and return it.
     Idempotent: identical content gives the same id and an existing snapshot is never rewritten.
     For a manual snapshot ``score`` (the per-video similarity) is not part of the identity: it is
     returned on the Snapshot but the stored file keeps a fixed value. ``template_set`` (auto
-    only, stored sorted) is part of the identity (ruling F-2)."""
+    only, stored sorted) is part of the identity (ruling F-2). ``autocalib`` supplies the shape
+    bounds the stored file is re-read with (``load_snapshot``)."""
     if kind not in _KINDS:
         raise ValueError(f"snapshot kind must be one of {_KINDS}, got {kind!r}")
     if kind == "manual" and template_set is not None:
@@ -162,12 +162,13 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
     return replace(snap, score=float(score)) if kind == "manual" else snap
 
 
-def load_snapshot(out_dir: Path, snapshot_id: str, *,
-                  autocalib: AutoCalibConfig | None = None) -> Snapshot:
+def load_snapshot(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibConfig) -> Snapshot:
     """Read snapshot ``snapshot_id`` from ``<out_dir>/calibrations``; ``ref_frame`` is absolute.
     Raises ``FileNotFoundError`` for an unknown id and ``ValueError`` for a malformed file.
     The shape bounds (``snapshot_max_frame_side``, ``snapshot_max_coord``) come from
-    ``autocalib`` (default: ``config/autocalib.yaml``; R40)."""
+    ``autocalib`` (R40), which the caller loads from an explicit path: it is never resolved
+    from the current directory here (ruling C-X3(b)), so a missing config is the caller's
+    global error, never an unknown snapshot."""
     if not snapshot_id or Path(snapshot_id).name != snapshot_id:
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}")
     jpath = _cal_dir(out_dir) / f"{snapshot_id}.json"
@@ -175,8 +176,7 @@ def load_snapshot(out_dir: Path, snapshot_id: str, *,
         raise FileNotFoundError(f"unknown calibration snapshot {snapshot_id!r}: {jpath}")
     try:
         doc = json.loads(jpath.read_text(encoding="utf-8"))
-        meta = _checked_meta(doc, autocalib if autocalib is not None
-                             else load_autocalib_config())
+        meta = _checked_meta(doc, autocalib)
         calibration = load_calibration(jpath)
         if not calibration.ref_frame or not Path(calibration.ref_frame).is_file():
             raise ValueError(f"missing reference image {calibration.ref_frame!r}")
@@ -427,14 +427,15 @@ def vetoed_ids(out_dir: Path) -> set[str]:
     return set(_read_vetoes(out_dir))
 
 
-def veto_calibration(out_dir: Path, snapshot_id: str, *, note: str = "", rules=None) -> None:
+def veto_calibration(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibConfig,
+                     note: str = "", rules=None) -> None:
     """「不採用此組校準」: record a veto of AUTO snapshot ``snapshot_id`` (ruling T4-1: a wrong
     manual calibration is fixed in ``calib/``) as ``{id: {"at": iso, "note": str}}`` in
     ``<out_dir>/calibration_vetoes.json`` and rebuild the CSVs through ``save_rounds``.
     The group's unreviewed rounds stop scoring in ``matches.csv``; no row is changed.
     Raises ``ValueError`` for an unknown or manual snapshot id."""
     try:
-        snap = load_snapshot(out_dir, snapshot_id)
+        snap = load_snapshot(out_dir, snapshot_id, autocalib=autocalib)
     except FileNotFoundError as e:
         raise ValueError(str(e)) from None
     if snap.kind != "auto":
@@ -446,14 +447,15 @@ def veto_calibration(out_dir: Path, snapshot_id: str, *, note: str = "", rules=N
     _write_vetoes_and_rebuild(out_dir, vetoes, rules)
 
 
-def unveto_calibration(out_dir: Path, snapshot_id: str, *, rules=None) -> None:
+def unveto_calibration(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibConfig,
+                       rules=None) -> None:
     """Cancel the veto of ``snapshot_id`` (no-op when it is not vetoed) and rebuild the CSVs
     through ``save_rounds``. Raises ``ValueError`` for an id that is neither vetoed nor a
     known snapshot."""
     vetoes = _read_vetoes(out_dir)
     if snapshot_id not in vetoes:
         try:
-            load_snapshot(out_dir, snapshot_id)
+            load_snapshot(out_dir, snapshot_id, autocalib=autocalib)
         except FileNotFoundError as e:
             raise ValueError(str(e)) from None
         return

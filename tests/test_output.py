@@ -17,6 +17,7 @@ from tests.helpers import (
     read_matches,
     results_with_two_positions,
     rr,
+    shipped_autocalib,
 )
 
 FIELDS = [
@@ -271,16 +272,16 @@ S1, S2 = auto_snapshot_ids()
 
 def test_veto_excludes_unreviewed_rounds_from_matches_only(tmp_path):
     out = results_with_two_positions(tmp_path)  # videos a.mp4 (snapshot S1) and b.mp4 (S2), 2 rounds each
-    veto_calibration(out, S1)
+    veto_calibration(out, S1, autocalib=shipped_autocalib())
     matches = read_matches(out)
     assert all(r["video"] == "b.mp4" for m in matches for r in m["rounds"])
     assert len(json.loads((out / "rounds.json").read_text())) == 4
-    unveto_calibration(out, S1)
+    unveto_calibration(out, S1, autocalib=shipped_autocalib())
     assert {r["video"] for m in read_matches(out) for r in m["rounds"]} == {"a.mp4", "b.mp4"}
 
 
 def test_reviewed_rows_under_veto_still_score(tmp_path):
-    out = results_with_two_positions(tmp_path); confirm_reviewed(out, "a.mp4", 1); veto_calibration(out, S1)
+    out = results_with_two_positions(tmp_path); confirm_reviewed(out, "a.mp4", 1); veto_calibration(out, S1, autocalib=shipped_autocalib())
     assert ("a.mp4", 1) in {(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]}
 
 
@@ -288,7 +289,7 @@ def test_veto_keeps_rows_byte_identical_and_every_rebuild_honours_it(tmp_path, r
     out = results_with_two_positions(tmp_path)
     before_rows = (out / "rounds.json").read_bytes()
     before_csv = (out / "rounds.csv").read_bytes()
-    veto_calibration(out, S1, note="zones off by a pocket")
+    veto_calibration(out, S1, note="zones off by a pocket", autocalib=shipped_autocalib())
     assert (out / "rounds.json").read_bytes() == before_rows  # vetoes never rewrite judgments
     assert (out / "rounds.csv").read_bytes() == before_csv
     # A later export through the shared path (judge writer / corrections) still honours it.
@@ -314,3 +315,20 @@ def test_read_rounds_rejects_a_non_list_rounds_json(tmp_path, payload):
     (tmp_path / "rounds.json").write_text(payload, encoding="utf-8")
     with pytest.raises(ValueError, match="rounds.json must be a list of rows"):
         output.read_rounds(tmp_path)
+
+
+def test_vlm_timing_run_ids_accumulate_and_a_new_analysis_resets_them(tmp_path):
+    """C-X4(b): each VLM phase's run id is kept beside the time it added."""
+    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r1")
+    output.record_vlm_timing(tmp_path, "a.mp4", 1.0, [], run_id="r1")
+    output.record_vlm_timing(tmp_path, "a.mp4", 1.5, [], run_id="v2")
+    e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+    assert e["vlm_run_ids"] == ["r1", "v2"] and e["judged_run_id"] == e["attempt_run_id"] == "r1"
+    output.record_video_status(tmp_path, "a.mp4", "analysis_error", wall_s=0.5, run_id="r3")
+    e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+    assert (e["judged_run_id"], e["attempt_run_id"]) == ("r1", "r3")
+    output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="r4")
+    e = json.loads((tmp_path / "videos.json").read_text())["a.mp4"]
+    assert "vlm_run_ids" not in e and e["judged_run_id"] == "r4"
+    with pytest.raises(ValueError, match="run_id"):
+        output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="")

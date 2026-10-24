@@ -9,6 +9,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from bxjudge import DEFAULT_AUTOCALIB_CONFIG
+
+# C-X5(c): without --autocalib, the repository's config (never the cwd's); an explicit path
+# is used as given.
+_AUTOCALIB_DEFAULT = str(DEFAULT_AUTOCALIB_CONFIG)
+
 
 def _cmd_calibrate(args: argparse.Namespace) -> int:
     import cv2
@@ -164,7 +170,7 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--vlm-config", default="config/vlm.yaml",
                    help="local VLM second opinion after judging (its after_run key enables it)")
     p.add_argument("--no-vlm", action="store_true", help="skip the VLM phase")
-    p.add_argument("--autocalib", default="config/autocalib.yaml",
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
                    help="auto-calibration policy for videos no manual calibration matches")
     p.add_argument("--rejudge", action="store_true",
                    help="ignore the processed cache and re-analyse every video (reviewed rows "
@@ -266,7 +272,7 @@ def _add_autocalib(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--allow-recalibrate", action="store_true",
                    help="with --truth: REJECTED (recalibrate) videos do not fail the run "
                         "(transparent floors may legitimately end up recalibrate)")
-    p.add_argument("--autocalib", default="config/autocalib.yaml")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT)
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.set_defaults(func=_cmd_autocalib)
 
@@ -276,9 +282,11 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
     import logging
     import sys
     import time
+    import uuid
     from datetime import datetime
 
     from bxjudge import vlm
+    from bxjudge.autocalib import load_autocalib_config
     from bxjudge.config import load_thresholds
     from bxjudge.output import record_run_timing
     from bxjudge.rules import load_rules
@@ -287,6 +295,7 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
     results = Path(args.results).expanduser()
     began = time.perf_counter()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    run_id = uuid.uuid4().hex  # C-X4(b): links the VLM timings to this phase's record
     try:
         if not results.is_dir():
             raise ValueError(f"{results}: expected a results directory")
@@ -296,14 +305,16 @@ def _cmd_vlm(args: argparse.Namespace) -> int:
             th=load_thresholds(Path(args.thresholds).expanduser()),
             rules=load_rules(Path(args.rules).expanduser()),
             config=config,
+            autocalib=load_autocalib_config(Path(args.autocalib).expanduser()),
+            run_id=run_id,
         )
         if summary.get("skipped"):  # R65: nothing asked, so no VLM run is recorded
             print(f"warning: VLM phase skipped, {config.host} unreachable; start the local "
                   "Ollama (README 完整流程) and rerun `bxjudge vlm`", file=sys.stderr)
         if summary.get("asked"):
             wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
-            record_run_timing(results, kind="vlm", started_at=started_at, wall_s=wall,
-                              vlm_wall_s=wall, videos={})
+            record_run_timing(results, kind="vlm", run_id=run_id, started_at=started_at,
+                              wall_s=wall, vlm_wall_s=wall, videos={})
     except (ValueError, OSError, RuntimeError) as error:
         if args.debug:
             raise
@@ -319,6 +330,8 @@ def _add_vlm(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--config", default="config/vlm.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
+                   help="auto-calibration config: snapshot file bounds (C-X3(b))")
     p.set_defaults(func=_cmd_vlm)
 
 
@@ -342,6 +355,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         str(results),
         "--rules", str(Path(args.rules).expanduser().resolve()),
         "--thresholds", str(Path(args.thresholds).expanduser().resolve()),
+        "--autocalib", str(Path(args.autocalib).expanduser().resolve()),
     ]
     env = {**os.environ, "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false"}
     print(f"review UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)", file=sys.stderr)
@@ -354,6 +368,8 @@ def _add_review(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--port", type=int, default=8501, help="loopback port (default 8501)")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
+                   help="auto-calibration config: snapshot file bounds (C-X3(b))")
     p.set_defaults(func=_cmd_review)
 
 

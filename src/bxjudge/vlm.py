@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 import yaml
 
+from .autocalib import AutoCalibConfig
 from .calibration import ZONES, scale_calibration
 from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds, config_loader
@@ -681,7 +682,8 @@ def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None
 
 
 def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot],
-                  vetoed: AbstractSet[str] = frozenset()) -> Snapshot:
+                  vetoed: AbstractSet[str] = frozenset(), *,
+                  autocalib: AutoCalibConfig) -> Snapshot:
     """The recorded snapshot ``r`` was judged with; ``NoCalibrationRecord`` when the row has no
     ``calibration_id`` or its snapshot file is missing (never re-selected from ``calib/``);
     ``CalibrationVetoed`` when that snapshot is in ``vetoed`` (ruling T5-2)."""
@@ -692,7 +694,7 @@ def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot],
         raise CalibrationVetoed(f"{r.video} round {r.round}: calibration {sid} is vetoed")
     if sid not in cache:
         try:
-            cache[sid] = load_snapshot(out_dir, sid)
+            cache[sid] = load_snapshot(out_dir, sid, autocalib=autocalib)
         except FileNotFoundError as error:
             raise NoCalibrationRecord(str(error)) from None
     return cache[sid]
@@ -705,6 +707,8 @@ def review_results_dir(
     rules: Rules,
     config: VlmConfig | None = None,
     videos: set[str] | None = None,
+    autocalib: AutoCalibConfig,
+    run_id: str | None = None,
 ) -> dict:
     """Ask the VLM about every ``needs_vlm`` round in a results directory.
 
@@ -715,7 +719,10 @@ def review_results_dir(
     zones being drawn or sent (ruling T5-2); the batch continues. A video whose latest
     ``analysis_status`` is not ``ok`` is skipped, its kept rows untouched (C-X2(b)). Each
     video's notes are persisted through ``write_results`` as a complete snapshot and its
-    VLM time is recorded as ``vlm_s`` beside the core ``processing_s``.
+    VLM time is recorded as ``vlm_s`` beside the core ``processing_s``. The snapshot bounds
+    come from ``autocalib``, loaded by the caller from its ``--autocalib`` path (never the
+    current directory, ruling C-X3(b)). ``run_id`` is the run whose batch record will
+    cover this phase (C-X4(b)), stamped on each video's VLM timing.
     """
     session = VlmSession(config if config is not None else load_vlm_config())
     out_dir = Path(out_dir)
@@ -759,7 +766,7 @@ def review_results_dir(
             source = recorded_source(timing.get(video))
 
             def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
-                snapshot = _row_snapshot(out_dir, r, snapshots, vetoed)
+                snapshot = _row_snapshot(out_dir, r, snapshots, vetoed, autocalib=autocalib)
                 if isinstance(source, str):
                     raise VlmFramesError(source)
                 return event_frames(source, event_time(r), snapshot, session.config, th)
@@ -773,7 +780,8 @@ def review_results_dir(
             }
             _persist_notes(out_dir, video, asked, rules)
             record_vlm_timing(
-                out_dir, video, time.perf_counter() - began, session.requests[sent:]
+                out_dir, video, time.perf_counter() - began, session.requests[sent:],
+                run_id=run_id,
             )
             for note, _ in asked.values():
                 summary["asked"] += 1

@@ -262,21 +262,33 @@ def record_video_timing(
     *,
     source_video: Path | None = None,
     wall_s: float | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Replace ``videos.json[video]`` with this analysis's timing. ``wall_s`` (rulings R66/R66a)
     is the observed wall time of the attempt, ONE timer from that video's first decode
     (including its calibration selection pass) to its result write. This attempt produced the
     current rows, so it is stored as both ``judged_wall_s`` (the rows' run) and
-    ``attempt_wall_s`` (the latest attempt); ``None`` leaves both unrecorded."""
+    ``attempt_wall_s`` (the latest attempt); ``None`` leaves both unrecorded. ``run_id``
+    (ruling C-X4(b)) is the id of the ``bxjudge run`` that measured them, stored as
+    ``judged_run_id`` and ``attempt_run_id`` so the speed gate can link them to that run's
+    batch record in ``runs.json``."""
     _check_wall(wall_s)
+    _check_run_id(run_id)
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     rows[video] = {"duration_s": duration_s, "processing_s": processing_s}
     if wall_s is not None:
         rows[video]["judged_wall_s"] = rows[video]["attempt_wall_s"] = wall_s
+        if run_id is not None:
+            rows[video]["judged_run_id"] = rows[video]["attempt_run_id"] = run_id
     if source_video is not None:
         rows[video]["source_video"] = str(source_video)
     _write_json(path, rows)
+
+
+def _check_run_id(run_id) -> None:
+    if run_id is not None and not (isinstance(run_id, str) and run_id):
+        raise ValueError(f"invalid run_id: {run_id!r}")
 
 
 def _check_wall(wall_s) -> None:
@@ -299,7 +311,7 @@ _KEEP = object()  # record_video_status: leave duration_s as it is
 
 def record_video_status(
     out_dir: Path, video: str, status: str, *, wall_s: float | None = None,
-    duration_s: float | None | object = _KEEP,
+    duration_s: float | None | object = _KEEP, run_id: str | None = None,
 ) -> None:
     """Record ``videos.json[video]["analysis_status"]`` (one of ``ANALYSIS_STATUSES``) without
     touching anything else in the entry, so a failed rerun that keeps a video's rows can say
@@ -309,10 +321,13 @@ def record_video_status(
     ``wall_s`` (rulings R66/R66a): the observed wall time of this latest attempt, stored as
     ``attempt_wall_s`` beside the kept ``judged_wall_s`` of the rows, so neither hides the other.
     ``duration_s``: the latest probe of the CURRENT source file (a replaced file's new length);
-    ``None`` removes it (the probe failed: there is no duration to measure against)."""
+    ``None`` removes it (the probe failed: there is no duration to measure against).
+    ``run_id`` (C-X4(b)): the run that made this attempt, stored as ``attempt_run_id`` with
+    ``wall_s``."""
     if status not in ANALYSIS_STATUSES:
         raise ValueError(f"unknown analysis_status {status!r}; expected one of {ANALYSIS_STATUSES}")
     _check_wall(wall_s)
+    _check_run_id(run_id)
     if duration_s is not _KEEP and duration_s is not None:
         _check_wall(duration_s)
     path = Path(out_dir) / "videos.json"
@@ -321,9 +336,35 @@ def record_video_status(
     entry["analysis_status"] = status
     if wall_s is not None:
         entry["attempt_wall_s"] = wall_s
+        if run_id is not None:
+            entry["attempt_run_id"] = run_id
+        else:
+            entry.pop("attempt_run_id", None)  # never leave an older run's id on a new wall
     if duration_s is None:
         entry.pop("duration_s", None)
     elif duration_s is not _KEEP:
+        entry["duration_s"] = duration_s
+    _write_json(path, rows)
+
+
+def record_video_attempt(
+    out_dir: Path, video: str, *, wall_s: float, duration_s: float | None, run_id: str
+) -> None:
+    """Ruling C-X8: an attempt that keeps a video's rows without judging it (the T4-3 veto
+    keep) still records its own wall (``attempt_wall_s``) under its ``run_id`` and the CURRENT
+    probed ``duration_s`` (``None`` removes it); the status, the rows' ``judged_wall_s`` and
+    the rest of the entry stay as they are."""
+    _check_wall(wall_s)
+    _check_run_id(run_id)
+    if duration_s is not None:
+        _check_wall(duration_s)
+    path = Path(out_dir) / "videos.json"
+    rows = _read_json(path, {})
+    entry = rows.setdefault(video, {})
+    entry["attempt_wall_s"], entry["attempt_run_id"] = wall_s, run_id
+    if duration_s is None:
+        entry.pop("duration_s", None)
+    else:
         entry["duration_s"] = duration_s
     _write_json(path, rows)
 
@@ -365,7 +406,8 @@ def _check_vlm_request(q) -> None:
         raise ValueError(f"invalid VLM request record: {q!r}")
 
 
-def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[dict]) -> None:
+def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[dict], *,
+                      run_id: str | None = None) -> None:
     """Add VLM phase time to ``vlm_s``, kept apart from core ``processing_s``.
 
     ``requests`` holds one record per request actually sent in this phase
@@ -373,7 +415,10 @@ def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[di
     answer by that model in the phase or None when it failed); they accumulate in
     ``vlm_requests``. A later core analysis (``record_video_timing``) replaces the entry
     and its rounds, so accumulated VLM time always belongs to the current round set.
+    ``run_id`` (C-X4(b)): the run (``bxjudge run`` or ``bxjudge vlm``) whose phase this is,
+    appended to ``vlm_run_ids`` (``None`` is kept as an unlinked phase: speed unverified).
     """
+    _check_run_id(run_id)
     for q in requests:
         _check_vlm_request(q)
     path = Path(out_dir) / "videos.json"
@@ -381,6 +426,7 @@ def record_vlm_timing(out_dir: Path, video: str, vlm_s: float, requests: list[di
     entry = rows.setdefault(video, {})
     entry["vlm_s"] = entry.get("vlm_s", 0.0) + vlm_s
     entry["vlm_requests"] = [*entry.get("vlm_requests", []), *(dict(q) for q in requests)]
+    entry["vlm_run_ids"] = [*entry.get("vlm_run_ids", []), run_id]
     _write_json(path, rows)
 
 
@@ -395,6 +441,9 @@ def record_run_timing(
     wall_s: float,
     vlm_wall_s: float | None,
     videos: dict[str, float],
+    run_id: str,
+    work: dict[str, float] | None = None,
+    real: dict[str, bool] | None = None,
 ) -> None:
     """Append one batch wall-clock record to ``runs.json`` (R61).
 
@@ -402,8 +451,17 @@ def record_run_timing(
     scan/probe and its VLM phase (``vlm_wall_s`` is a breakdown INSIDE ``wall_s``, never
     extra time); ``videos`` maps each video judged in that run to its playback duration.
     ``kind="vlm"``: a standalone ``bxjudge vlm`` phase (``videos`` empty: it adds waiting
-    time but no new video).
+    time but no new video). ``run_id`` (C-X4(b)) is the id stamped on every video timing the
+    run wrote; the record is appended only when the run completes. ``work`` (C-X7(a)) maps
+    each listed video to the seconds THIS run measured for it (core attempt + its VLM phase),
+    stored so a historical batch ratio never uses a later retry's timing (default: empty,
+    e.g. a standalone ``vlm`` record, which lists no video). ``real`` (C-X8) maps each listed
+    video to whether it had real rows after this run's attempt (judged, or kept by a failed
+    or veto-kept attempt); with ``videos`` (the duration of the source THIS run probed) and
+    ``work`` it is all a historical batch ratio may use.
     """
+    work = {} if work is None else work
+    real = {} if real is None else real
 
     def seconds(v) -> bool:
         return (isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -416,13 +474,19 @@ def record_run_timing(
         and (vlm_wall_s is None or (seconds(vlm_wall_s) and vlm_wall_s <= wall_s))
         and isinstance(videos, dict)
         and all(isinstance(k, str) and seconds(v) for k, v in videos.items())
+        and isinstance(run_id, str) and run_id
+        and isinstance(work, dict)
+        and all(k in videos and seconds(v) for k, v in work.items())
+        and isinstance(real, dict)
+        and all(k in videos and type(v) is bool for k, v in real.items())
     )
     if not ok:
         raise ValueError(f"invalid run timing record: {kind!r} {wall_s!r} {vlm_wall_s!r} {videos!r}")
     path = Path(out_dir) / "runs.json"
     runs = _read_json(path, [])
-    runs.append({"kind": kind, "started_at": started_at, "wall_s": wall_s,
-                 "vlm_wall_s": vlm_wall_s, "videos": dict(videos)})
+    runs.append({"kind": kind, "run_id": run_id, "started_at": started_at, "wall_s": wall_s,
+                 "vlm_wall_s": vlm_wall_s, "videos": dict(videos), "work": dict(work),
+                 "real": dict(real)})
     _write_json(path, runs)
 
 

@@ -19,7 +19,7 @@ from bxjudge.calibration_store import (
     write_preview,
 )
 from bxjudge.config import load_thresholds
-from tests.helpers import results_with_two_positions, stadium_scene
+from tests.helpers import results_with_two_positions, shipped_autocalib, stadium_scene
 
 
 def th():
@@ -56,7 +56,7 @@ def test_shifted_frame_gets_auto_snapshot_with_its_own_reference(tmp_path):
     assert np.array_equal(cv2.imread(s.calibration.ref_frame), frame)
     assert mean_boundary_error(s.calibration, truth, 1280) < 3.0
     assert not list(calib.glob("auto*")) and len(list(calib.glob("*.json"))) == 1
-    tpl = load_snapshot(out, s.template_id)
+    tpl = load_snapshot(out, s.template_id, autocalib=shipped_autocalib())
     assert tpl.kind == "manual" and tpl.calibration.name == "scene"
 
 
@@ -80,7 +80,7 @@ def test_snapshot_survives_manual_file_edit_and_folder_move(tmp_path):
     (calib / "scene.json").write_text("{}")
     moved = tmp_path / "moved"
     shutil.copytree(out, moved)
-    again = load_snapshot(moved, s.id)
+    again = load_snapshot(moved, s.id, autocalib=shipped_autocalib())
     assert again.calibration.stadium == s.calibration.stadium and Path(again.calibration.ref_frame).is_file()
     assert Path(again.calibration.ref_frame).parent == (moved / "calibrations").resolve()
 
@@ -105,27 +105,27 @@ def test_missing_or_empty_calib_dir_returns_none(tmp_path):
 
 def test_snapshot_id_is_content_addressed(tmp_path):
     img, c = stadium_scene()
-    a = save_snapshot(tmp_path, "manual", c, img, score=1.0)
-    b = save_snapshot(tmp_path, "manual", c, img, score=1.0)
+    a = save_snapshot(tmp_path, "manual", c, img, score=1.0, autocalib=shipped_autocalib())
+    b = save_snapshot(tmp_path, "manual", c, img, score=1.0, autocalib=shipped_autocalib())
     assert a.id == b.id and len(a.id) == 16
-    other = save_snapshot(tmp_path, "manual", c, img, score=0.9)  # per-video score: not identity
+    other = save_snapshot(tmp_path, "manual", c, img, score=0.9, autocalib=shipped_autocalib())  # per-video score: not identity
     assert other.id == a.id and other.score == 0.9 and a.score == 1.0
     assert len(list((tmp_path / "calibrations").glob("*.json"))) == 1
     moved = replace(c, name="other")
-    assert save_snapshot(tmp_path, "manual", moved, img, score=1.0).id != a.id
-    auto_a = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id=a.id)
-    auto_b = save_snapshot(tmp_path, "auto", c, img, score=0.8, template_id=a.id)
+    assert save_snapshot(tmp_path, "manual", moved, img, score=1.0, autocalib=shipped_autocalib()).id != a.id
+    auto_a = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id=a.id, autocalib=shipped_autocalib())
+    auto_b = save_snapshot(tmp_path, "auto", c, img, score=0.8, template_id=a.id, autocalib=shipped_autocalib())
     assert auto_a.id != auto_b.id  # an auto snapshot's alignment score is part of its identity
 
 
 def test_load_unknown_snapshot_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
-        load_snapshot(tmp_path, "0123456789abcdef")
+        load_snapshot(tmp_path, "0123456789abcdef", autocalib=shipped_autocalib())
 
 
 def test_preview_is_written_with_all_zones(tmp_path):
     img, c = stadium_scene()
-    s = save_snapshot(tmp_path, "manual", c, img, score=0.95)
+    s = save_snapshot(tmp_path, "manual", c, img, score=0.95, autocalib=shipped_autocalib())
     p = write_preview(tmp_path, s)
     assert p == tmp_path / "calibrations" / f"{s.id}.preview.jpg"
     out = cv2.imread(str(p))
@@ -180,7 +180,7 @@ def test_edited_template_makes_its_auto_snapshot_ineligible(tmp_path):
     b = select_snapshot(frame, calib, out, th(), load_autocalib_config())
     assert b.kind == "auto" and b.id != a.id and b.template_id != a.template_id
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config()).id == b.id
-    assert load_snapshot(out, a.id).id == a.id  # the old snapshot stays on disk, untouched
+    assert load_snapshot(out, a.id, autocalib=shipped_autocalib()).id == a.id  # the old snapshot stays on disk, untouched
 
 
 def test_removed_template_makes_its_auto_snapshot_ineligible(tmp_path):
@@ -218,15 +218,15 @@ def test_auto_snapshot_records_the_sorted_template_set(tmp_path):
     assert s.kind == "auto" and s.template_set == tuple(ids)
     doc = json.loads((out / "calibrations" / f"{s.id}.json").read_text())
     assert doc["snapshot"]["template_set"] == ids
-    assert load_snapshot(out, s.id).template_set == tuple(ids)
+    assert load_snapshot(out, s.id, autocalib=shipped_autocalib()).template_set == tuple(ids)
 
 
 def test_template_set_is_part_of_an_auto_snapshot_identity(tmp_path):
     img, c = stadium_scene()
     a = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id="a" * 16,
-                      template_set=["a" * 16])
+                      template_set=["a" * 16], autocalib=shipped_autocalib())
     b = save_snapshot(tmp_path, "auto", c, img, score=0.9, template_id="a" * 16,
-                      template_set=["b" * 16, "a" * 16])
+                      template_set=["b" * 16, "a" * 16], autocalib=shipped_autocalib())
     assert a.id != b.id and b.template_set == ("a" * 16, "b" * 16)
 
 
@@ -271,7 +271,7 @@ def test_adding_a_template_keeps_a_vetoed_group_barred_for_its_template(tmp_path
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     frame = stadium_scene(shift=(45, 20))[0]
     a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
-    veto_calibration(out, a.id)
+    veto_calibration(out, a.id, autocalib=shipped_autocalib())
     add_manual_calibration(calib, stadium_scene(rotation_deg=30.0), name="other")  # cannot align
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config(),
                            vetoed_ids(out)) is None
@@ -282,22 +282,22 @@ def test_adding_a_template_keeps_a_vetoed_group_barred_for_its_template(tmp_path
 
 def test_veto_unknown_id_rejected(tmp_path):
     with pytest.raises(ValueError):
-        veto_calibration(results_with_two_positions(tmp_path), "0" * 16)
+        veto_calibration(results_with_two_positions(tmp_path), "0" * 16, autocalib=shipped_autocalib())
 
 
 def test_veto_file_records_time_and_note_and_unveto_restores(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
     assert vetoed_ids(out) == set()
-    veto_calibration(out, a.id, note="rim off by 10 px")
+    veto_calibration(out, a.id, note="rim off by 10 px", autocalib=shipped_autocalib())
     assert vetoed_ids(out) == {a.id}
     entry = json.loads((out / "calibration_vetoes.json").read_text())[a.id]
     assert entry["note"] == "rim off by 10 px" and entry["at"]
-    unveto_calibration(out, a.id)
+    unveto_calibration(out, a.id, autocalib=shipped_autocalib())
     assert vetoed_ids(out) == set()
-    unveto_calibration(out, a.id)  # idempotent
+    unveto_calibration(out, a.id, autocalib=shipped_autocalib())  # idempotent
     with pytest.raises(ValueError):
-        unveto_calibration(out, "0" * 16)
+        unveto_calibration(out, "0" * 16, autocalib=shipped_autocalib())
 
 
 def test_veto_applies_to_auto_snapshots_only(tmp_path):
@@ -305,7 +305,7 @@ def test_veto_applies_to_auto_snapshots_only(tmp_path):
     manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config())
     assert manual.kind == "manual"
     with pytest.raises(ValueError, match="manual"):
-        veto_calibration(out, manual.id)
+        veto_calibration(out, manual.id, autocalib=shipped_autocalib())
     assert not (out / "calibration_vetoes.json").exists()
 
 
@@ -387,26 +387,26 @@ def test_load_snapshot_rejects_a_malformed_file_with_valueerror(tmp_path, edit):
     out, snap, jpath = _stored_manual_snapshot(tmp_path)
     _edit_snapshot_json(jpath, edit)
     with pytest.raises(ValueError, match="malformed"):
-        load_snapshot(out, snap.id)
+        load_snapshot(out, snap.id, autocalib=shipped_autocalib())
 
 
 def test_load_snapshot_rejects_a_top_level_list(tmp_path):
     out, snap, jpath = _stored_manual_snapshot(tmp_path)
     jpath.write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="malformed"):
-        load_snapshot(out, snap.id)
+        load_snapshot(out, snap.id, autocalib=shipped_autocalib())
 
 
 def test_load_snapshot_rejects_a_missing_reference_image(tmp_path):
     out, snap, _ = _stored_manual_snapshot(tmp_path)
     (out / "calibrations" / f"{snap.id}.png").unlink()
     with pytest.raises(ValueError, match="malformed"):
-        load_snapshot(out, snap.id)
+        load_snapshot(out, snap.id, autocalib=shipped_autocalib())
 
 
 def test_load_snapshot_still_reads_a_good_file(tmp_path):
     out, snap, _ = _stored_manual_snapshot(tmp_path)
-    assert load_snapshot(out, snap.id).id == snap.id
+    assert load_snapshot(out, snap.id, autocalib=shipped_autocalib()).id == snap.id
 
 
 def test_validate_output_paths_rejects_overlap_and_files(tmp_path):
@@ -432,7 +432,7 @@ def test_load_snapshot_rejects_a_non_finite_huge_or_fractional_frame_size(tmp_pa
     out, snap, jpath = _stored_manual_snapshot(tmp_path)
     _edit_snapshot_json(jpath, lambda doc: doc.__setitem__("frame_size", bad))
     with pytest.raises(ValueError, match="malformed"):
-        load_snapshot(out, snap.id)
+        load_snapshot(out, snap.id, autocalib=shipped_autocalib())
 
 
 @pytest.mark.parametrize("bad", [1e309, float("nan"), -1e309, 1e30])
@@ -440,7 +440,7 @@ def test_load_snapshot_rejects_a_non_finite_or_huge_polygon_coordinate(tmp_path,
     out, snap, jpath = _stored_manual_snapshot(tmp_path)
     _edit_snapshot_json(jpath, lambda doc: doc[ZONES[0][0]].append([bad, 1.0]))
     with pytest.raises(ValueError, match="malformed"):
-        load_snapshot(out, snap.id)
+        load_snapshot(out, snap.id, autocalib=shipped_autocalib())
 
 
 # --------------------------------------------------------------------------- C-X2(f): bounds are policy (R40)

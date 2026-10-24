@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import yaml
 
+from bxjudge import DEFAULT_AUTOCALIB_CONFIG
 from bxjudge.calibration import ZONES, _edge_map, rim_mask, scale_calibration
 from bxjudge.config import config_loader
 from bxjudge.geometry import RIM_MASK_MARGIN
@@ -59,7 +60,7 @@ _INT_FIELDS = ("work_width", "ecc_iterations", "snapshot_max_frame_side")
 
 
 @config_loader
-def load_autocalib_config(path: Path = Path("config/autocalib.yaml")) -> AutoCalibConfig:
+def load_autocalib_config(path: Path = DEFAULT_AUTOCALIB_CONFIG) -> AutoCalibConfig:
     """Load the auto-calibration policy. Missing/unknown keys, wrong types, non-finite numbers
     or out-of-range values raise ``ValueError``."""
     with open(path, encoding="utf-8") as f:

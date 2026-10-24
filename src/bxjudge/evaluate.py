@@ -351,7 +351,12 @@ def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dic
         observed = max(judged + vlm, attempt)
         videos.append({"video": video, "duration_s": duration, "judged_wall_s": judged,
                        "attempt_wall_s": attempt, "vlm_s": vlm, "observed_s": observed,
-                       "ratio": observed / duration, "status": status})
+                       "ratio": observed / duration, "status": status,
+                       # C-X4(b): the runs that measured this timing
+                       "judged_run_id": entry.get("judged_run_id"),
+                       "attempt_run_id": entry.get("attempt_run_id"),
+                       "has_vlm": "vlm_s" in entry,
+                       "vlm_run_ids": entry.get("vlm_run_ids")})
     slowest = max(videos, key=lambda v: v["ratio"]) if videos else None
     return {
         "videos": videos,
@@ -363,12 +368,50 @@ def _observed_speed(rows: list[dict], timings: dict | None, max_s: float) -> dic
     }
 
 
-def speed_gate(observed: dict, batch_ratio: float) -> tuple[str, float]:
+def _linked_to_complete_runs(video: dict, runs: list[dict] | None) -> bool:
+    """Ruling C-X4(b): the CURRENT timing of ``video`` was measured by runs that completed.
+    Its ``judged_run_id`` and ``attempt_run_id`` must each name a ``run`` record listing the
+    video, and every id in ``vlm_run_ids`` (when it has VLM time) must name a record. A
+    missing id (an interrupted run, or a pre-C-X4 entry) is never linked."""
+    listing: dict[str, set] = {}
+    for r in runs or []:
+        rid = r.get("run_id")
+        if isinstance(rid, str) and rid:
+            listing.setdefault(rid, set()).update(r["videos"] if r["kind"] == "run" else ())
+
+    def lists(rid) -> bool:
+        return isinstance(rid, str) and video["video"] in listing.get(rid, ())
+
+    ok = lists(video["judged_run_id"]) and lists(video["attempt_run_id"])
+    if video["has_vlm"]:
+        ids = video["vlm_run_ids"]
+        ok = ok and isinstance(ids, list) and bool(ids) and all(
+            isinstance(i, str) and i in listing for i in ids)
+    return ok
+
+
+def speed_gate(observed: dict, batch: dict, runs: list[dict] | None = None) -> tuple[str, float]:
     """Ruling R66a: speed is verified only when every required video has its wall times AND
     a pooled batch ratio exists; the gated ratio is then the larger of the worst per-video
-    ratio and the batch ratio (both must be within the target)."""
-    if observed["complete"] and math.isfinite(batch_ratio):
-        return "worst-video+batch", max(observed["worst"], batch_ratio)
+    ratio and the batch ratio (both must be within the target). Ruling C-X3(c): the batch
+    ratio counts only when the batch records (``_wall``) cover EVERY measured real video; a
+    video judged by a run that never wrote its record (interrupted) leaves speed unverified.
+    Ruling C-X4(b): coverage is by run id, not file name: each video's current timing must
+    have been measured by runs whose batch records are complete (``_linked_to_complete_runs``),
+    so a stale record of an earlier run never verifies a newer, unrecorded timing.
+    Ruling C-X5(b): the gated ratio also takes the batch ratio of EACH run that measured a
+    video's current timing (``judged_run_id`` and ``attempt_run_id``), so a fast failed retry
+    never hides the batch overhead of the run that produced the kept rows; any of those
+    ratios missing or not finite leaves speed unverified."""
+    covered = set(batch.get("videos", ()))
+    run_ratios = batch.get("run_ratios", {})
+    linked = [run_ratios.get(v[k]) if isinstance(v[k], str) else None
+              for v in observed["videos"] for k in ("judged_run_id", "attempt_run_id")]
+    if (observed["complete"] and math.isfinite(batch["ratio"])
+            and all(v["video"] in covered and _linked_to_complete_runs(v, runs)
+                    for v in observed["videos"])
+            and all(r is not None and math.isfinite(r) for r in linked)):
+        return "worst-video+batch", max(observed["worst"], batch["ratio"], *linked)
     return "unverified", NAN
 
 
@@ -376,65 +419,104 @@ def _wall(rows: list[dict], timings: dict | None, runs: list[dict] | None,
           max_s: float) -> dict:
     """Batch wall-clock basis from ``runs.json`` records (R61).
 
-    The denominator is the playback duration of the videos eligible on the same terms as
-    the sum-based basis (``_speed_videos``: a real round, measured, ≤ ``max_s``), each
-    counted ONCE, in the last ``run`` record that lists it (the run that produced its
-    current result; a gated video retried later is not counted twice). A ``run`` record
-    is used when it is that last listing for at least one eligible video. Its ``wall_s``
-    already contains its own VLM phase, so ``vlm_wall_s`` is only a breakdown and never
-    added again; standalone ``vlm`` records add waiting time but no video duration.
+    Ruling C-X8: every number here comes ONLY from what each run record stored when it was
+    written: its ``wall_s``, the ``videos`` durations of the sources THAT run probed, the
+    ``work`` it measured per video (C-X7(a)) and ``real`` (whether the video had real rows
+    after that run's attempt). The current ``videos.json`` never changes a run's ratio; it only
+    decides which runs matter (the videos required now, each in the last run listing it).
 
-    So the numerator stays comparable, the measured core + VLM of ineligible videos
-    (gates, over-limit) whose last listing is a used run is subtracted; any other
-    overhead (init, probe, earlier gate attempts) stays in, which is conservative.
-    ``sum_s`` is the per-video core + VLM sum over the counted videos, reported next to
-    the wall-clock: it can exceed wall-clock (e.g. parallel videos) and is never hidden.
+    A listed video is in a run's scope when that run recorded it with real rows and a stored
+    duration in ``(0, max_s]``; a record without its ``real`` map is unusable (C-X9): its own
+    ratio, and the pooled ratio when it is a used run, are NaN, so speed is unverified. A
+    run's own ratio (C-X5(b)) is ``(wall_s - stored work of its out-of-scope videos) / stored
+    duration of its in-scope videos``. The pooled ratio counts each currently eligible video
+    ONCE, in the last ``run`` record that lists it (a gated video retried later is not
+    counted twice), with that record's stored duration when it is in that record's scope.
+    Its ``wall_s`` already contains its own VLM phase, so ``vlm_wall_s`` is only a breakdown
+    and never added again; standalone ``vlm`` records add waiting time but no video
+    duration. The stored work of every listed video left out of the denominator of a used run
+    whose last listing it is, is subtracted; any other overhead (init, probe, earlier gate
+    attempts) stays in, which is conservative. ``sum_s`` is the stored per-video work of the
+    counted videos, reported next to the wall-clock (it can exceed it, e.g. parallel videos).
     """
-    eligible = {v["video"]: v for v in _speed_videos(rows, timings, max_s)[0]}
+    eligible = {v["video"] for v in _speed_videos(rows, timings, max_s)[0]}
     run_records = [r for r in runs or [] if r["kind"] == "run"]
+
+    def stored_work(record: dict, video: str) -> float:
+        w = record.get("work")
+        v = w.get(video) if isinstance(w, dict) else None
+        return v if _number(v) and v >= 0 else 0.0  # absent: subtract nothing (conservative)
+
+    def stored_duration(record: dict, video: str) -> float:
+        v = record["videos"].get(video)
+        return v if _number(v) else 0.0
+
+    def usable(record: dict) -> bool:
+        # C-X9: a record without its ``real`` map cannot say which listed videos it judged
+        # with real rows, so it is never used for speed (no all-real fallback).
+        return isinstance(record.get("real"), dict)
+
+    def in_scope(record: dict, video: str) -> bool:
+        return (record["real"].get(video) is True
+                and 0 < stored_duration(record, video) <= max_s)
+
+    run_ratios: dict[str, float] = {}
+    for r in run_records:
+        rid = r.get("run_id")
+        if not (isinstance(rid, str) and rid):
+            continue
+        if not usable(r):
+            run_ratios[rid] = NAN
+            continue
+        listed = list(r["videos"])
+        dur = sum(stored_duration(r, v) for v in listed if in_scope(r, v))
+        own = max(0.0, r["wall_s"] - sum(stored_work(r, v) for v in listed
+                                         if not in_scope(r, v)))
+        run_ratios[rid] = own / dur if dur > 0 else NAN
+
     last: dict[str, int] = {}
     for i, r in enumerate(run_records):
         for video in r["videos"]:
             last[video] = i
     counted = sorted(v for v in eligible if v in last)
+    unusable = any(not usable(run_records[last[v]]) for v in counted)
+    in_denominator = [v for v in counted if usable(run_records[last[v]])
+                      and in_scope(run_records[last[v]], v)]
     used_ids = {last[v] for v in counted}
-    excluded = sorted(v for v, i in last.items() if i in used_ids and v not in eligible)
+    excluded = sorted(v for v, i in last.items()
+                      if i in used_ids and v not in in_denominator)
     if not runs:
         reason = "no run records"
-    elif not counted:
+    elif unusable:
+        reason = "a run record without its real map (written before C-X8)"
+    elif not in_denominator:
         reason = "no eligible video in run records"
     else:
         reason = None
     used = [run_records[i] for i in sorted(used_ids)]
     if used:
         used += [r for r in runs if r["kind"] == "vlm"]
-    timings = timings or {}
-
-    def work(video: str) -> float:
-        e = timings.get(video)
-        if not isinstance(e, dict) or not _number(e.get("processing_s")):
-            return 0.0
-        vlm = e.get("vlm_s", 0.0)
-        return e["processing_s"] + (vlm if _number(vlm) else 0.0)
-
     raw_wall = sum(r["wall_s"] for r in used)
-    wall = max(0.0, raw_wall - sum(work(v) for v in excluded))
+    wall = max(0.0, raw_wall - sum(stored_work(run_records[last[v]], v) for v in excluded))
     vlm_wall = sum(r["vlm_wall_s"] or 0.0 for r in used)
-    duration = sum(eligible[v]["duration_s"] for v in counted)
-    sum_s = sum(eligible[v]["total_s"] for v in counted) if counted else NAN
+    duration = sum(stored_duration(run_records[last[v]], v) for v in in_denominator)
+    sum_s = (sum(stored_work(run_records[last[v]], v) for v in in_denominator)
+             if in_denominator else NAN)
     return {
         "n_runs": len(used),
-        "n_videos": len(counted),
+        "n_videos": len(in_denominator),
+        "videos": counted,
+        "run_ratios": run_ratios,
         "excluded": excluded,
         "reason": reason,
         "wall_s": wall if used else NAN,
         "raw_wall_s": raw_wall if used else NAN,
         "vlm_wall_s": vlm_wall if used else NAN,
         "duration_s": duration if used else NAN,
-        "ratio": wall / duration if used and duration > 0 else NAN,
+        "ratio": wall / duration if used and duration > 0 and not unusable else NAN,
         "sum_s": sum_s,
-        "sum_ratio": sum_s / duration if counted and duration > 0 else NAN,
-        "sum_exceeds_wall": bool(used and counted and sum_s > wall),
+        "sum_ratio": sum_s / duration if in_denominator and duration > 0 else NAN,
+        "sum_exceeds_wall": bool(used and in_denominator and sum_s > wall),
     }
 
 
@@ -453,14 +535,21 @@ def _is_key(k) -> bool:
 
 def check_audit(audit) -> dict:
     """The frozen audit sample record (R69) after a schema check: ``seed`` and ``n`` ints,
-    ``population`` and ``selection`` lists of ``[video, round]``. Anything else (including
-    the legacy ``keys`` record: no compatibility path) raises ``ValueError``."""
+    ``population`` and ``selection`` lists of ``[video, round]``, with ``n`` distinct selected
+    rounds, all in the population: ``len(selection) == n <= len(population)`` and selection
+    within population (C-X3(d)). Anything else (including the legacy ``keys`` record: no
+    compatibility path) raises ``ValueError``."""
     ok = (isinstance(audit, dict)
           and type(audit.get("seed")) is int and type(audit.get("n")) is int
           and isinstance(audit.get("population"), list)
           and isinstance(audit.get("selection"), list)
           and all(map(_is_key, audit["population"]))
           and all(map(_is_key, audit["selection"])))
+    if ok:
+        selection = {tuple(k) for k in audit["selection"]}
+        population = {tuple(k) for k in audit["population"]}
+        ok = (len(selection) == len(audit["selection"]) == audit["n"]
+              <= len(population) and selection <= population)
     if not ok:
         raise ValueError(f"malformed audit sample record (audit_sample.json): {audit!r}; "
                          "re-draw with `bxjudge audit-sample <dir> --n N --seed S --replace`")
@@ -560,8 +649,9 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
     and ``runs.json`` wall-clock records).
 
     Speed (R66a) is the larger of the worst observed per-video wall ratio and the pooled batch
-    ratio, unverified without ``timings``, without a batch record, or when a measured real
-    video lacks its wall times; the median ratio is a diagnostic. ``audit`` (the frozen
+    ratio, unverified without ``timings``, without a batch record, when the batch records do
+    not cover every measured real video (C-X3(c)), or when a measured real video lacks its
+    wall times; the median ratio is a diagnostic. ``audit`` (the frozen
     ``read_audit`` record) is required when rows carry audit marks. ``config`` defaults to
     ``config/evaluation.yaml``. ``vetoed`` calibration snapshot ids (spec 6.6b): their rounds
     stay in every population with their original predictions; the unreviewed ones also count
@@ -581,12 +671,14 @@ def evaluate(rows: list[dict], timings: dict[str, dict] | None = None, *,
             speed = (statistics.median(v["total_ratio"] for v in videos),
                      statistics.median(v["core_ratio"] for v in videos))
         n_speed, n_vlm = len(videos), sum(v["has_vlm"] for v in videos)
-        wall = _wall(rows, timings, runs, cfg.speed_max_video_s)["ratio"]
+        batch = _wall(rows, timings, runs, cfg.speed_max_video_s)
         observed = _observed_speed(rows, timings, cfg.speed_max_video_s)
     else:
-        wall = NAN  # no videos.json: no eligible videos, so no wall-clock denominator
+        # no videos.json: no eligible videos, so no wall-clock denominator
+        batch = {"ratio": NAN, "videos": []}
         observed = _observed_speed(rows, None, math.inf)  # every real video is missing
-    basis, gated = speed_gate(observed, wall)
+    wall = batch["ratio"]
+    basis, gated = speed_gate(observed, batch, runs)
     u = unflagged_accuracy(rows, None if config is None else config.audit_confidence_level,
                            audit)
     cal = calibration_coverage(rows, timings, vetoed)
@@ -788,7 +880,7 @@ def report_metrics(rows: list[dict], timings: dict[str, dict] | None, config: Ev
     # the share of required real videos whose observed wall meets the limit (a missing one
     # counts as not verified).
     seen = observed["videos"]
-    basis, gated = speed_gate(observed, wall["ratio"])
+    basis, gated = speed_gate(observed, wall, runs)
     speed = {"basis": basis, "ratio": gated,
              "pass_rate": _ratio(sum(v["ratio"] <= limit for v in seen),
                                  len(seen) + len(observed["missing"])),
@@ -1228,7 +1320,9 @@ _TIMING_NOTE = (
     "keeps the rows, R68, but never hides them), over `duration_s`, the latest probe of the "
     "current source file. Speed pass/fail (R66a) needs BOTH the WORST observed per-video "
     "ratio over every real video ≤ speed_max_video_s AND the pooled batch wall-clock ratio "
-    "to be ≤ the target; a real video without wall times, or no batch record, makes speed "
+    "to be ≤ the target; a real video without wall times, or a batch record that does not "
+    "cover every measured real video, or whose run id differs from the run id stamped on a "
+    "video's current timing (e.g. an interrupted run or --rejudge), makes speed "
     "unverified (re-judge with `bxjudge run --rejudge`). The median per-video ratio, the "
     "sum-based median and core-only are diagnostics (R59/R61). VLM request latency "
     "is per request actually sent (`vlm_requests`); *cold* = first answer by that model in "

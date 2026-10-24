@@ -19,7 +19,13 @@ from bxjudge.vlm import (
     question_for,
     review_low_confidence,
 )
-from tests.helpers import make_calibration, make_ref_img, make_video, rr
+from tests.helpers import (
+    make_calibration,
+    make_ref_img,
+    make_video,
+    rr,
+    shipped_autocalib,
+)
 
 PRIMARY, FALLBACK = "qwen3.8:27b", "qwen3-vl:8b"
 TOUCH_Q = "發射時是否有發射器或手碰到盤面？是哪一側？"
@@ -585,7 +591,7 @@ def test_sticky_fallback_spans_videos_in_one_results_dir_phase(tmp_path, monkeyp
 
     monkeypatch.setattr(vlm, "_post", fake)
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    summary = vlm.review_results_dir(out, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     assert _chat_models(calls) == [PRIMARY, FALLBACK, FALLBACK, FALLBACK]
     assert summary["models"] == {FALLBACK: 3}
 
@@ -659,7 +665,7 @@ def _snapshot(out_dir, seed=0):
     from bxjudge.calibration_store import save_snapshot
 
     return save_snapshot(out_dir, "auto", make_calibration(), make_ref_img(seed), score=0.9,
-                         template_id="f" * 16)
+                         template_id="f" * 16, autocalib=shipped_autocalib())
 
 
 def test_event_frames_decode_playback_window_with_scaled_zone_overlay(tmp_path, monkeypatch, th):
@@ -750,7 +756,7 @@ def test_vlm_row_without_record_is_unavailable_and_batch_continues(tmp_path, mon
         return reply('{"answer":"over_left","reason":"r"}')
 
     monkeypatch.setattr(vlm, "_post", fake_ollama)
-    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg(frames=3))
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg(frames=3), autocalib=shipped_autocalib())
     notes = {r["video"]: r.get("vlm_note") or "" for r in output.read_rounds(out)}
     assert notes["old.mp4"] == "vlm_unavailable: no calibration record"
     assert notes["gone.mp4"] == "vlm_unavailable: no calibration record"
@@ -779,7 +785,7 @@ def test_vlm_never_sends_vetoed_zones_and_other_rows_continue(tmp_path, monkeypa
     for video in ("bad.mp4", "good.mp4"):
         source = make_video(tmp_path / video, seconds=2, fps=30, size=(320, 180))
         output.record_video_timing(out, video, 2.0, 1.0, source_video=source)
-    veto_calibration(out, bad, rules=rules)
+    veto_calibration(out, bad, rules=rules, autocalib=shipped_autocalib())
     drawn = []
     real_frames = vlm.event_frames
 
@@ -789,7 +795,7 @@ def test_vlm_never_sends_vetoed_zones_and_other_rows_continue(tmp_path, monkeypa
 
     monkeypatch.setattr(vlm, "event_frames", frames)
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"over_left","reason":"r"}'))
-    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg(frames=3))
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=cfg(frames=3), autocalib=shipped_autocalib())
     notes = {r["video"]: r.get("vlm_note") for r in output.read_rounds(out)}
     assert notes["bad.mp4"] == "vlm_unavailable: calibration vetoed"
     assert notes["good.mp4"].startswith(f"[{PRIMARY}]")
@@ -811,7 +817,7 @@ def test_results_dir_writes_notes_through_complete_snapshots(tmp_path, monkeypat
         return [blank()]
 
     monkeypatch.setattr(vlm, "event_frames", frames)
-    summary = vlm.review_results_dir(out, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     after = json.loads((out / "rounds.json").read_text())
     assert [(r["video"], r["round"]) for r in after] == [(r["video"], r["round"]) for r in before]
     changed = {(r["video"], r["round"]) for r, o in zip(after, before) if r != o}
@@ -842,7 +848,7 @@ def test_results_dir_relative_or_missing_source_is_unavailable(tmp_path, monkeyp
     out = _results(tmp_path, rules, Path("relative/a.mp4"))
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"x","reason":"r"}'))
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("must not guess paths"))
-    vlm.review_results_dir(out, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     notes = [r["vlm_note"] for r in json.loads((out / "rounds.json").read_text()) if r["vlm_note"]]
     assert notes and all(n.startswith(vlm.UNAVAILABLE_PREFIX) for n in notes)
 
@@ -855,7 +861,7 @@ def test_results_dir_rerun_only_retries_unavailable_and_respects_concurrent_revi
     out = _results(tmp_path, rules, source.resolve())
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"first","reason":"r"}'))
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    vlm.review_results_dir(out, th=th, rules=rules, videos={"a.mp4"})
+    vlm.review_results_dir(out, th=th, rules=rules, videos={"a.mp4"}, autocalib=shipped_autocalib())
     rows = json.loads((out / "rounds.json").read_text())
     assert rows[4]["vlm_note"] is None  # b.mp4 outside the requested videos
     asked = []
@@ -872,7 +878,7 @@ def test_results_dir_rerun_only_retries_unavailable_and_respects_concurrent_revi
     record = {k: v for k, v in json.loads((out / "videos.json").read_text()).items()}
     record["b.mp4"]["source_video"] = str(source.resolve())
     (out / "videos.json").write_text(json.dumps(record))
-    vlm.review_results_dir(out, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     rows = json.loads((out / "rounds.json").read_text())
     assert len(asked) == 1  # a.mp4 rows already have notes
     assert rows[4]["reviewed"] is True and rows[4]["reviewer_fix"] == {"winner": "X"}
@@ -887,7 +893,7 @@ def test_results_dir_validates_endpoint_before_reading_frames(tmp_path, monkeypa
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: pytest.fail("frames before validation"))
     monkeypatch.setattr(vlm, "_post", lambda *a, **k: pytest.fail("request before validation"))
     with pytest.raises(VlmConfigError):
-        vlm.review_results_dir(out, th=th, rules=rules, config=cfg(host="http://192.0.2.4:1"))
+        vlm.review_results_dir(out, th=th, rules=rules, config=cfg(host="http://192.0.2.4:1"), autocalib=shipped_autocalib())
 
 
 def test_results_dir_releases_models_once_per_phase(tmp_path, monkeypatch, rules, th):
@@ -905,7 +911,7 @@ def test_results_dir_releases_models_once_per_phase(tmp_path, monkeypatch, rules
 
     monkeypatch.setattr(vlm, "_post", fake)
     monkeypatch.setattr(vlm, "event_frames", lambda *a, **k: [blank()])
-    vlm.review_results_dir(out, th=th, rules=rules)
+    vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     assert paths == ["/api/chat"] * 3 + ["/api/generate"] * 2
 
 
@@ -1063,7 +1069,7 @@ def test_unreachable_vlm_skips_phase_before_any_frame_work(
         began = time.perf_counter()
         with caplog.at_level("WARNING"):
             summary = vlm.review_results_dir(out, th=th, rules=rules,
-                                             config=cfg(host=url, preflight_timeout_s=0.3))
+                                             config=cfg(host=url, preflight_timeout_s=0.3), autocalib=shipped_autocalib())
         assert time.perf_counter() - began < 2.0  # bounded by preflight_timeout_s
     finally:
         if silent:
@@ -1086,7 +1092,7 @@ def test_no_review_required_rows_needs_no_preflight(tmp_path, monkeypatch, rules
     monkeypatch.setattr(vlm, "preflight", lambda c: pytest.fail("preflight without work"))
     out = tmp_path / "out"
     output.write_results([res("a.mp4", 1, finish="spin", winner="X")], out, rules)
-    summary = vlm.review_results_dir(out, th=th, rules=rules)
+    summary = vlm.review_results_dir(out, th=th, rules=rules, autocalib=shipped_autocalib())
     assert summary["asked"] == 0 and "skipped" not in summary
 
 
@@ -1130,3 +1136,74 @@ def test_preflight_without_a_version_string_is_unreachable(body):
     finally:
         srv.close()
     assert reason is not None and "unreachable" in reason and "version" in reason
+
+
+def test_results_dir_from_another_cwd_loads_the_zones(tmp_path, monkeypatch, rules, th):
+    """Fix round 2 NB-2 / C-X3(b): from another cwd the recorded snapshot still loads, and no
+    false ``vlm_unavailable: no calibration record`` note is written."""
+    from tests.helpers import shipped_autocalib
+
+    out = mixed_results(tmp_path, rules)
+    config, autocalib = cfg(frames=3), shipped_autocalib()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(vlm, "_post", lambda *a, **k: reply('{"answer":"over_left","reason":"r"}'))
+    summary = vlm.review_results_dir(out, th=th, rules=rules, config=config,
+                                     autocalib=autocalib)
+    notes = {r["video"]: r.get("vlm_note") or "" for r in output.read_rounds(out)}
+    assert notes["new.mp4"].startswith(f"[{PRIMARY}]")
+    assert summary["answered"] == 1 and summary["unavailable"] == 2  # old/gone only
+
+
+def test_vlm_cli_passes_its_autocalib_config(tmp_path, monkeypatch, capsys):
+    from dataclasses import replace as _replace
+
+    from bxjudge.cli import main
+    from tests.helpers import shipped_autocalib
+
+    out = tmp_path / "res"
+    out.mkdir()
+    custom = tmp_path / "ac.yaml"
+    import yaml
+
+    shipped = shipped_autocalib()
+    changed = _replace(shipped, snapshot_max_coord=shipped.snapshot_max_coord + 1)
+    custom.write_text(yaml.safe_dump(
+        __import__("dataclasses").asdict(changed)))
+    seen, vlm_cfg = {}, cfg()
+    monkeypatch.setattr(vlm, "load_vlm_config", lambda *a, **k: vlm_cfg)
+    monkeypatch.setattr(vlm, "review_results_dir",
+                        lambda out_dir, **kw: seen.update(kw) or {"asked": 0})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    repo = Path(__file__).resolve().parents[1]
+    flags = ["--thresholds", str(repo / "config/thresholds.yaml"),
+             "--rules", str(repo / "config/rules.yaml")]
+    assert main(["vlm", str(out), *flags, "--autocalib", str(custom)]) == 0
+    assert seen["autocalib"] == changed
+    assert isinstance(seen["run_id"], str) and seen["run_id"]  # C-X4(b)
+    assert main(["vlm", str(out), *flags, "--autocalib", str(tmp_path / "missing.yaml")]) == 2
+    assert "missing.yaml" in capsys.readouterr().err
+
+
+def test_vlm_cli_default_autocalib_loads_the_repositorys_from_another_cwd(tmp_path, monkeypatch):
+    """C-X5(c): `bxjudge vlm` launched elsewhere without --autocalib loads the repo's file."""
+    from bxjudge.cli import main
+    from tests.helpers import shipped_autocalib
+
+    out = tmp_path / "res"
+    out.mkdir()
+    seen, vlm_cfg = {}, cfg()
+    monkeypatch.setattr(vlm, "load_vlm_config", lambda *a, **k: vlm_cfg)
+    monkeypatch.setattr(vlm, "review_results_dir",
+                        lambda out_dir, **kw: seen.update(kw) or {"asked": 0})
+    repo = Path(__file__).resolve().parents[1]
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "config").mkdir(parents=True)
+    (elsewhere / "config" / "autocalib.yaml").write_text("not: a valid config\n")
+    monkeypatch.chdir(elsewhere)
+    assert main(["vlm", str(out), "--thresholds", str(repo / "config/thresholds.yaml"),
+                 "--rules", str(repo / "config/rules.yaml")]) == 0
+    assert seen["autocalib"] == shipped_autocalib()

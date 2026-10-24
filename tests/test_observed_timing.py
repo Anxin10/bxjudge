@@ -30,17 +30,18 @@ def _cfg():
     return load_eval_config(EVAL_CONFIG)
 
 
-def _entry(duration, judged, *, attempt=None, processing=None, status="ok", vlm=None):
+def _entry(duration, judged, *, attempt=None, processing=None, status="ok", vlm=None,
+           run_id="r1"):
     e = {"duration_s": duration,
          "processing_s": processing if processing is not None else (judged or 1.0),
          "analysis_status": status}
     if judged is not None:
-        e["judged_wall_s"] = judged
+        e["judged_wall_s"], e["judged_run_id"] = judged, run_id
     attempt = judged if attempt is None else attempt
     if attempt is not None:
-        e["attempt_wall_s"] = attempt
+        e["attempt_wall_s"], e["attempt_run_id"] = attempt, run_id
     if vlm is not None:
-        e["vlm_s"] = vlm
+        e["vlm_s"], e["vlm_run_ids"] = vlm, [run_id]
     return e
 
 
@@ -48,9 +49,11 @@ def _rows(*videos):
     return [rev(video=v, round=1) for v in videos]
 
 
-def _run(wall, videos):
-    return {"kind": "run", "started_at": "t", "wall_s": wall, "vlm_wall_s": None,
-            "videos": dict(videos)}
+def _run(wall, videos, run_id="r1", work=None, real=None):
+    return {"kind": "run", "run_id": run_id, "started_at": "t", "wall_s": wall,
+            "vlm_wall_s": None, "videos": dict(videos),
+            "work": dict(work) if work is not None else {v: 0.0 for v in videos},
+            "real": dict(real) if real is not None else {v: True for v in videos}}
 
 
 def _fast_batch(timings):
@@ -468,3 +471,251 @@ def test_vlm_phases_skip_a_video_whose_latest_attempt_failed(tmp_path, monkeypat
     assert main(["vlm", str(b.out), "--config", str(cfg)]) == 0  # the separate command too
     assert (b.out / "rounds.json").read_bytes() == before
     assert math.isfinite(b.timings()["a.mp4"]["attempt_wall_s"])
+
+
+# ------------------------------------------------- C-X3(c): the batch record covers every video
+
+
+def test_batch_record_covering_only_some_measured_videos_is_unverified():
+    # Codex fix-2 review: a finite batch ratio from a record listing only a.mp4 must not
+    # verify b.mp4, whose run never wrote a batch record (interrupted).
+    timings = {"a.mp4": _entry(100.0, 40.0), "b.mp4": _entry(100.0, 40.0)}
+    rows = _rows("a.mp4", "b.mp4")
+    runs = [_run(50.0, {"a.mp4": 100.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio)
+    assert passes(m)["speed_ratio"] != "PASS"
+    assert report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]["basis"] == "unverified"
+    full = [_run(100.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
+    assert evaluate(rows, timings, runs=full).speed_basis == "worst-video+batch"
+
+
+def test_interrupted_run_without_its_batch_record_does_not_pass(tmp_path, monkeypatch, th, rules):
+    b = Batch(tmp_path, monkeypatch, th, rules, names=("a.mp4", "b.mp4"))
+    b.new = {"a.mp4"}
+    b.run()  # a.mp4 judged, batch record written
+    assert passes(b.evaluate())["speed_ratio"] == "PASS"
+    b.new = {"b.mp4"}
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "record_run_timing", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        b.run()  # b.mp4 judged and timed, then the run dies before its batch record
+    t = b.timings()
+    assert t["b.mp4"]["judged_wall_s"] > 0 and t["b.mp4"]["analysis_status"] == "ok"
+    assert [set(r["videos"]) for r in json.loads((b.out / "runs.json").read_text())] == [
+        {"a.mp4"}]
+    m = b.evaluate()
+    assert m.speed_basis == "unverified"
+    assert passes(m)["speed_ratio"] != "PASS"
+
+
+# ------------------------------------------------- C-X4(b): run ids link timings to batch records
+
+
+def test_stale_batch_record_never_verifies_a_newer_unrecorded_timing():
+    # Codex fix-3 review: a complete batch recorded a.mp4 at 50 s (run r1); a rejudge (r2)
+    # updated its wall to 80 of 100 s and stopped before its batch record.
+    rows = _rows("a.mp4")
+    runs = [_run(50.0, {"a.mp4": 100.0}, run_id="r1")]
+    timings = {"a.mp4": _entry(100.0, 80.0, run_id="r2")}
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio)
+    assert passes(m)["speed_ratio"] != "PASS"
+    assert report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]["basis"] == (
+        "unverified")
+    # its own complete record verifies it
+    done = [*runs, _run(85.0, {"a.mp4": 100.0}, run_id="r2")]
+    assert evaluate(rows, timings, runs=done).speed_basis == "worst-video+batch"
+
+
+@pytest.mark.parametrize("field", ["judged_run_id", "attempt_run_id", "vlm_run_ids"])
+def test_timing_without_a_matching_run_id_is_unverified(field):
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(100.0, 40.0, vlm=1.0)}
+    runs = [_run(50.0, {"a.mp4": 100.0})]
+    assert evaluate(rows, timings, runs=runs).speed_basis == "worst-video+batch"
+    timings["a.mp4"][field] = ["r9"] if field == "vlm_run_ids" else "r9"
+    assert evaluate(rows, timings, runs=runs).speed_basis == "unverified"
+    del timings["a.mp4"][field]  # no id at all (pre-C-X4 entry): no compatibility path
+    assert evaluate(rows, timings, runs=runs).speed_basis == "unverified"
+
+
+def test_interrupted_rejudge_after_a_complete_batch_does_not_pass(
+    tmp_path, monkeypatch, th, rules
+):
+    b = Batch(tmp_path, monkeypatch, th, rules)
+    b.work["a.mp4"] = 50.0
+    b.run()
+    m = b.evaluate()
+    assert m.speed_basis == "worst-video+batch" and passes(m)["speed_ratio"] == "PASS"
+    b.work["a.mp4"] = 80.0
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "record_run_timing", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        b.run(rejudge=True)
+    t = b.timings()["a.mp4"]
+    assert t["judged_wall_s"] == 80.0
+    [run] = json.loads((b.out / "runs.json").read_text())
+    assert t["judged_run_id"] == t["attempt_run_id"] != run["run_id"]
+    m = b.evaluate()
+    assert m.speed_basis == "unverified"
+    assert passes(m)["speed_ratio"] != "PASS"
+
+
+def test_run_batch_stamps_one_run_id_on_timings_and_the_batch_record(
+    tmp_path, monkeypatch, th, rules
+):
+    b = Batch(tmp_path, monkeypatch, th, rules, names=("a.mp4", "b.mp4"))
+    b.run()
+    b.fail.add("b.mp4")
+    b.due = True
+    b.run()
+    first, second = json.loads((b.out / "runs.json").read_text())
+    assert first["run_id"] != second["run_id"]
+    t = b.timings()
+    assert t["a.mp4"]["judged_run_id"] == t["a.mp4"]["attempt_run_id"] == second["run_id"]
+    # b.mp4 failed in run 2: its kept rows still belong to run 1, its attempt to run 2
+    assert t["b.mp4"]["judged_run_id"] == first["run_id"]
+    assert t["b.mp4"]["attempt_run_id"] == second["run_id"]
+
+
+# ------------------------------------- C-X5(b): every run behind the current timing is gated
+
+
+def test_fast_failed_retry_never_hides_the_judged_runs_batch_overhead():
+    # Codex fix-4 review: a 100 s video judged with a 30 s wall inside a 160 s batch (r1),
+    # then a failed 1 s retry (r2): the gate returned 0.3 PASS, hiding r1's 1.6 batch ratio.
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(100.0, 30.0, attempt=1.0, status="analysis_error")}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    runs = [_run(160.0, {"a.mp4": 100.0}, run_id="r1"), _run(1.0, {"a.mp4": 100.0}, run_id="r2")]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "worst-video+batch"
+    assert m.speed_ratio == pytest.approx(1.6)
+    assert passes(m)["speed_ratio"] == "FAIL"
+    s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
+    assert s["basis"] == "worst-video+batch" and s["ratio"] == pytest.approx(1.6)
+
+
+def test_judged_run_without_its_batch_record_is_unverified_even_if_the_attempt_has_one():
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(100.0, 30.0, attempt=1.0, status="analysis_error")}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    runs = [_run(1.0, {"a.mp4": 100.0}, run_id="r2")]  # r1 never wrote its record
+    assert evaluate(rows, timings, runs=runs).speed_basis == "unverified"
+
+
+def test_run_cli_default_autocalib_is_the_repositorys_not_the_cwds(tmp_path, monkeypatch):
+    """C-X5(c): without --autocalib the run uses <repo>/config/autocalib.yaml from any cwd;
+    an explicit path is used as given."""
+    calls = []
+    monkeypatch.setattr(pipeline, "run_batch", lambda *a, **kw: calls.append(kw))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert main(["run", str(tmp_path)]) == 0
+    assert Path(calls[-1]["autocalib_config"]) == ROOT / "config" / "autocalib.yaml"
+    assert main(["run", str(tmp_path), "--autocalib", "mine.yaml"]) == 0
+    assert Path(calls[-1]["autocalib_config"]) == Path("mine.yaml")
+
+
+# ------------------------------------- C-X7(a): a run's ratio uses the work it measured itself
+
+
+def test_a_later_retry_never_rewrites_an_earlier_runs_overhead():
+    # Codex fix-5 review: r1 took 200 s (A eligible: 100 s playback, 30 s work; B excluded:
+    # 10 s work). A's failed 1 s retry (r2), then B's separate 250 s retry (r3): with B's
+    # CURRENT 250 s subtracted, r1's ratio fell from 1.9 to 0 and speed flipped to PASS 0.3.
+    rows = _rows("a.mp4")  # b.mp4 has no real round: excluded from the speed population
+    timings = {"a.mp4": _entry(100.0, 30.0, attempt=1.0, status="analysis_error"),
+               "b.mp4": {"duration_s": 50.0, "processing_s": 250.0}}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    runs = [_run(200.0, {"a.mp4": 100.0, "b.mp4": 50.0}, run_id="r1",
+                 work={"a.mp4": 30.0, "b.mp4": 10.0},
+                 real={"a.mp4": True, "b.mp4": False}),  # B: no real rows in r1 (C-X8)
+            _run(1.0, {"a.mp4": 100.0}, run_id="r2", work={"a.mp4": 1.0}),
+            _run(250.0, {"b.mp4": 50.0}, run_id="r3", work={"b.mp4": 250.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "worst-video+batch"
+    assert m.speed_ratio == pytest.approx(1.9)
+    assert passes(m)["speed_ratio"] == "FAIL"
+
+
+def test_run_record_stores_the_work_it_measured(tmp_path, monkeypatch, th, rules):
+    b = Batch(tmp_path, monkeypatch, th, rules, names=("a.mp4", "b.mp4"))
+    b.work.update({"a.mp4": 3.0, "b.mp4": 4.0})
+    b.run()
+    [run] = json.loads((b.out / "runs.json").read_text())
+    assert run["work"] == {"a.mp4": 3.0, "b.mp4": 4.0}
+
+
+# ------------------------------- C-X8: historical ratios use only what each run record stored
+
+
+def test_replaced_source_never_rewrites_an_earlier_runs_ratio():
+    # Codex fix-6 review: r1 judged a 100 s video in 30 s inside a 160 s batch (1.6, FAIL);
+    # the source was replaced by a 200 s video and a 1 s retry (r2) failed. With the CURRENT
+    # 200 s as r1's denominator, r1 became 0.8 and speed passed.
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(200.0, 30.0, attempt=1.0, status="analysis_error")}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    runs = [_run(160.0, {"a.mp4": 100.0}, run_id="r1", work={"a.mp4": 30.0}),
+            _run(1.0, {"a.mp4": 200.0}, run_id="r2", work={"a.mp4": 1.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "worst-video+batch"
+    assert m.speed_ratio == pytest.approx(1.6)
+    assert passes(m)["speed_ratio"] == "FAIL"
+
+
+def test_run_ratio_scope_is_what_the_run_recorded():
+    # a gate video (no real rows in that run) is left out of that run's denominator and its
+    # stored work subtracted, whatever videos.json says about it now
+    rows = _rows("a.mp4", "g.mp4")  # g.mp4 has real rows NOW (judged later)
+    timings = {"a.mp4": _entry(100.0, 50.0), "g.mp4": _entry(100.0, 50.0, run_id="r2")}
+    runs = [_run(160.0, {"a.mp4": 100.0, "g.mp4": 100.0}, work={"a.mp4": 50.0, "g.mp4": 10.0},
+                 real={"a.mp4": True, "g.mp4": False}),
+            _run(60.0, {"g.mp4": 100.0}, run_id="r2", work={"g.mp4": 50.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_ratio == pytest.approx(1.5)  # r1: (160 - 10) / 100
+
+
+def test_veto_kept_attempt_on_a_shorter_source_fails_against_its_current_duration():
+    # Codex fix-6 review: judged 100 s video, 30 s processing in a 40 s batch (r1); vetoed;
+    # source replaced by a 10 s video; --rejudge keeps the rows (r2, 0.5 s attempt). With the
+    # current 10 s duration recorded by r2 (C-X8) the gate sees 3.0, not the stale 0.4.
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(10.0, 30.0, attempt=0.5)}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    runs = [_run(40.0, {"a.mp4": 100.0}, run_id="r1", work={"a.mp4": 30.0}),
+            _run(2.0, {"a.mp4": 10.0}, run_id="r2", work={"a.mp4": 0.5})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_ratio == pytest.approx(3.0)
+    assert passes(m)["speed_ratio"] == "FAIL"
+
+
+# --------------------------- C-X9: a run record without its `real` map is unusable for speed
+
+
+def test_run_record_without_real_map_cannot_verify_speed():
+    # Codex fix-7 review: r1 160 s for A (100 s, real, 30 s) and B (100 s placeholder, 10 s)
+    # with no `real` map; A then fails a 1 s retry. Treating B as real gave 0.8 PASS.
+    rows = _rows("a.mp4")
+    timings = {"a.mp4": _entry(100.0, 30.0, attempt=1.0, status="analysis_error"),
+               "b.mp4": {"duration_s": 100.0, "processing_s": 10.0}}
+    timings["a.mp4"]["attempt_run_id"] = "r2"
+    r1 = _run(160.0, {"a.mp4": 100.0, "b.mp4": 100.0}, run_id="r1",
+              work={"a.mp4": 30.0, "b.mp4": 10.0})
+    del r1["real"]
+    runs = [r1, _run(1.0, {"a.mp4": 100.0}, run_id="r2", work={"a.mp4": 1.0})]
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_basis == "unverified" and math.isnan(m.speed_ratio)
+    assert passes(m)["speed_ratio"] != "PASS"
+    r1["real"] = {"a.mp4": True, "b.mp4": False}  # with its map: (160 - 10) / 100
+    m = evaluate(rows, timings, runs=runs)
+    assert m.speed_ratio == pytest.approx(1.5) and passes(m)["speed_ratio"] == "FAIL"

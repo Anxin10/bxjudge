@@ -14,6 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .autocalib import AutoCalibConfig
 from .calibration import scale_calibration
 from .calibration_store import Snapshot, load_snapshot, vetoed_ids
 from .config import Thresholds
@@ -208,16 +209,17 @@ def _video_calibration_record(
     return record if isinstance(record, dict) else None
 
 
-def row_calibration(out_dir: Path, row: dict) -> Snapshot | None:
+def row_calibration(out_dir: Path, row: dict, *, autocalib: AutoCalibConfig) -> Snapshot | None:
     """The recorded snapshot ``row`` was judged with (by its ``calibration_id``), never a
     re-selection from ``calib/`` (spec section 6.5). ``None`` when the row has no record
     (results made before snapshots) or its snapshot file is missing. A manual snapshot carries
-    the video's recorded similarity as ``score`` when ``videos.json`` names the same id."""
+    the video's recorded similarity as ``score`` when ``videos.json`` names the same id.
+    ``autocalib`` is the config the caller loaded from its ``--autocalib`` path (C-X3(b))."""
     sid = row.get("calibration_id")
     if not sid:
         return None
     try:
-        snap = load_snapshot(Path(out_dir), sid)
+        snap = load_snapshot(Path(out_dir), sid, autocalib=autocalib)
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError, TypeError) as e:

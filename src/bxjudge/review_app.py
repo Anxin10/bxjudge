@@ -18,7 +18,9 @@ from pathlib import Path
 
 import streamlit as st
 
+from bxjudge import DEFAULT_AUTOCALIB_CONFIG
 from bxjudge import review_ui as ui
+from bxjudge.autocalib import AutoCalibConfig, load_autocalib_config
 from bxjudge.calibration_store import unveto_calibration, veto_calibration, vetoed_ids
 from bxjudge.config import load_thresholds
 from bxjudge.corrections import (
@@ -37,6 +39,7 @@ def _args() -> argparse.Namespace:
     p.add_argument("results")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--autocalib", default=str(DEFAULT_AUTOCALIB_CONFIG))
     return p.parse_known_args(sys.argv[1:])[0]
 
 
@@ -59,11 +62,11 @@ def _flash(message: str) -> None:
     st.rerun()
 
 
-def _calibration(row: dict, out: Path, rules):
+def _calibration(row: dict, out: Path, rules, autocalib: AutoCalibConfig):
     """Info line, banners and veto controls for the row's recorded snapshot; returns it."""
     st.subheader("校準")
     try:
-        snap = ui.row_calibration(out, row)
+        snap = ui.row_calibration(out, row, autocalib=autocalib)
         state = ui.calibration_status(out, row)
     except (ui.ReviewMediaError, OSError, ValueError) as e:
         st.warning(f"校準紀錄無法讀取，畫面不疊區域：{e}")
@@ -84,21 +87,22 @@ def _calibration(row: dict, out: Path, rules):
         try:
             vetoed = snap.id in vetoed_ids(out)
             if vetoed and st.button(ui.UNVETO_BUTTON, key=f"unveto-{snap.id}"):
-                unveto_calibration(out, snap.id, rules=rules)
+                unveto_calibration(out, snap.id, autocalib=autocalib, rules=rules)
                 _flash("已恢復採用此組校準，比分已重新計算。")
             elif not vetoed and st.button(
                 ui.VETO_BUTTON, key=f"veto-{snap.id}",
                 help="此組校準的未覆核回合不計入比分（原判定保留，可恢復）。",
             ):
-                veto_calibration(out, snap.id, rules=rules)
+                veto_calibration(out, snap.id, autocalib=autocalib, rules=rules)
                 _flash("已不採用此組校準：其未覆核回合不計入比分。")
         except (OSError, ValueError) as e:
             st.error(f"未儲存：{e}")
     return snap
 
 
-def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules) -> None:
-    snap = _calibration(row, out, rules)
+def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
+              autocalib: AutoCalibConfig) -> None:
+    snap = _calibration(row, out, rules, autocalib)
     calibration = snap.calibration if snap is not None else None
     st.subheader("影片")
     if isinstance(source, str):
@@ -254,6 +258,9 @@ def main() -> None:
     try:
         rules = load_rules(a.rules)
         load_thresholds(a.thresholds)
+        # C-X3(b): snapshot bounds from the --autocalib path `bxjudge review` resolved; a
+        # missing or bad file is a global load error here, never a silent per-row "no record".
+        autocalib = load_autocalib_config(a.autocalib)
         rows = read_rounds(out)
         vetoed = vetoed_ids(out)
         videos_path = out / "videos.json"
@@ -338,7 +345,7 @@ def main() -> None:
 
     left, right = st.columns([3, 2], gap="large")
     with left:
-        _evidence(row, source, out, a, rules)
+        _evidence(row, source, out, a, rules, autocalib)
     with right:
         _judgment(row, rows, rules, vetoed)
         _form(row, out, rules)

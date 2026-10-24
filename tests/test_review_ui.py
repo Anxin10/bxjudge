@@ -27,6 +27,7 @@ from tests.helpers import (
     make_video,
     read_matches,
     rr,
+    shipped_autocalib,
 )
 
 APP = Path(__file__).resolve().parents[1] / "src" / "bxjudge" / "review_app.py"
@@ -296,7 +297,7 @@ def _calibrated_results(tmp_path, snap_kind="auto", rounds=(1,), *, with_ids=Tru
             snap = _fixed_auto_snapshot(out, 1)
         else:
             snap = replace(save_snapshot(out, "manual", make_calibration(), make_ref_img(3),
-                                         score=0.9321), score=0.9321)
+                                         score=0.9321, autocalib=shipped_autocalib()), score=0.9321)
         write_preview(out, snap)
     results = []
     for n in rounds:
@@ -343,7 +344,7 @@ def _text(at):
 def test_overlay_uses_recorded_snapshot_not_calib_dir(tmp_path):
     out = results_with_auto_snapshot(tmp_path)
     shutil.rmtree(tmp_path / "calib")
-    snap = review_ui.row_calibration(out, read_rounds(out)[0])
+    snap = review_ui.row_calibration(out, read_rounds(out)[0], autocalib=shipped_autocalib())
     assert snap.kind == "auto" and snap.id == SNAP_ID
     assert snap.calibration.battle_area == make_calibration().battle_area
 
@@ -351,16 +352,16 @@ def test_overlay_uses_recorded_snapshot_not_calib_dir(tmp_path):
 def test_row_calibration_is_none_without_a_record(tmp_path):
     out = results_with_auto_snapshot(tmp_path)
     row_ = read_rounds(out)[0]
-    assert review_ui.row_calibration(out, {**row_, "calibration_id": None}) is None
+    assert review_ui.row_calibration(out, {**row_, "calibration_id": None}, autocalib=shipped_autocalib()) is None
     del row_["calibration_id"]
-    assert review_ui.row_calibration(out, row_) is None
+    assert review_ui.row_calibration(out, row_, autocalib=shipped_autocalib()) is None
     (out / "calibrations" / f"{SNAP_ID}.json").unlink()  # snapshot file missing
-    assert review_ui.row_calibration(out, read_rounds(out)[0]) is None
+    assert review_ui.row_calibration(out, read_rounds(out)[0], autocalib=shipped_autocalib()) is None
 
 
 def test_manual_row_calibration_shows_the_videos_recorded_similarity(tmp_path):
     out = results_with_manual_snapshot(tmp_path)
-    snap = review_ui.row_calibration(out, read_rounds(out)[0])
+    snap = review_ui.row_calibration(out, read_rounds(out)[0], autocalib=shipped_autocalib())
     assert snap.kind == "manual" and snap.score == pytest.approx(0.9321)
 
 
@@ -419,16 +420,16 @@ def test_reviewed_row_flagged_when_calibration_vetoed(tmp_path, rules):
     assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "ok"
     confirm_reviewed(out, "clip.mp4", 1, rules=rules)
     assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "ok"
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 1)) == "changed_since_review"
 
 
 def test_calibration_status_values(tmp_path, rules):
     out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
     confirm_reviewed(out, "clip.mp4", 1, rules=rules)
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     assert review_ui.calibration_status(out, find_row(out, "clip.mp4", 2)) == "vetoed"
-    unveto_calibration(out, SNAP_ID, rules=rules)
+    unveto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     # the video was re-judged with another calibration after the review
     videos = json.loads((out / "videos.json").read_text(encoding="utf-8"))
     videos["clip.mp4"]["calibration"]["id"] = "0" * 16
@@ -442,7 +443,7 @@ def test_calibration_status_values(tmp_path, rules):
 def test_changed_since_review_banner(tmp_path, monkeypatch, rules):
     out = results_with_auto_snapshot(tmp_path)
     confirm_reviewed(out, "clip.mp4", 1, rules=rules)
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     at = app_test(out, monkeypatch).run()
     assert not at.exception, at.exception
     assert any("覆核當時使用的校準已被否決／更換，請確認是否需要重新覆核" in m.value
@@ -466,7 +467,7 @@ def test_corrections_after_veto_keep_vetoed_unreviewed_rounds_out_of_matches(
 def _vetoed_app(tmp_path, monkeypatch, rules):
     out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
     confirm_reviewed(out, "clip.mp4", 1, rules=rules)  # reviewed: changed_since_review, not vetoed
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     return out, app_test(out, monkeypatch).run()
 
 
@@ -490,7 +491,7 @@ def test_vetoed_filter_selects_exactly_vetoed_rounds(tmp_path, monkeypatch, rule
 
 def test_needs_review_filter_includes_vetoed_unreviewed_round(tmp_path, rules):
     out = results_with_auto_snapshot(tmp_path, rounds=(1, 2))
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     rows = [{**find_row(out, "clip.mp4", n), "needs_review": False} for n in (1, 2)]
 
     def view(choice):
@@ -511,7 +512,7 @@ def test_header_count_and_needs_review_list_agree_on_vetoed_unflagged_round(
     rounds[0]["needs_review"] = False
     rounds[0]["review_reasons"] = []
     (out / "rounds.json").write_text(json.dumps(rounds), encoding="utf-8")
-    veto_calibration(out, SNAP_ID, rules=rules)
+    veto_calibration(out, SNAP_ID, rules=rules, autocalib=shipped_autocalib())
     at = app_test(out, monkeypatch).run()
     assert not at.exception, at.exception
     assert {m.label: m.value for m in at.metric}["待覆核"] == "1"
@@ -560,3 +561,36 @@ def test_review_and_vlm_cli_no_longer_take_calib(tmp_path):
     for command in ("review", "vlm"):
         with pytest.raises(SystemExit):
             cli.main([command, str(tmp_path), "--calib", "calib"])
+
+
+def test_row_calibration_from_another_cwd_still_loads_the_zones(tmp_path, monkeypatch):
+    """Fix round 2 NB-2 / C-X3(b): the snapshot bounds never come from the current directory."""
+    from tests.helpers import shipped_autocalib
+
+    out = results_with_auto_snapshot(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    snap = review_ui.row_calibration(out, read_rounds(out)[0], autocalib=shipped_autocalib())
+    assert snap is not None and snap.id == SNAP_ID
+
+
+def test_review_app_takes_the_autocalib_config(tmp_path, monkeypatch):
+    from pathlib import Path as _P
+
+    from bxjudge import review_app
+
+    monkeypatch.setattr(sys, "argv", ["review_app.py", str(tmp_path), "--autocalib", "/x/a.yaml"])
+    assert _P(review_app._args().autocalib) == _P("/x/a.yaml")
+
+
+def test_review_app_default_autocalib_is_the_repositorys(tmp_path, monkeypatch):
+    """C-X5(c): the app's own default never resolves from the cwd."""
+    from pathlib import Path as _P
+
+    from bxjudge import review_app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["review_app.py", str(tmp_path)])
+    repo = _P(__file__).resolve().parents[1]
+    assert _P(review_app._args().autocalib) == repo / "config" / "autocalib.yaml"

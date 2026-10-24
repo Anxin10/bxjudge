@@ -94,17 +94,20 @@ def test_audit_sample_cli(tmp_path, rules, capsys):
 
 def test_run_timing_records_append_and_validate(tmp_path):
     output.record_run_timing(tmp_path, kind="run", started_at="2026-10-23T10:00:00+08:00",
-                             wall_s=12.5, vlm_wall_s=4.0, videos={"a.mp4": 10.0})
+                             wall_s=12.5, vlm_wall_s=4.0, videos={"a.mp4": 10.0}, run_id="r1")
     output.record_run_timing(tmp_path, kind="vlm", started_at="2026-10-23T11:00:00+08:00",
-                             wall_s=3.0, vlm_wall_s=3.0, videos={})
+                             wall_s=3.0, vlm_wall_s=3.0, videos={}, run_id="r2")
     runs = json.loads((tmp_path / "runs.json").read_text())
     assert [r["kind"] for r in runs] == ["run", "vlm"]
-    assert runs[0] == {"kind": "run", "started_at": "2026-10-23T10:00:00+08:00",
-                       "wall_s": 12.5, "vlm_wall_s": 4.0, "videos": {"a.mp4": 10.0}}
+    assert runs[0] == {"kind": "run", "run_id": "r1", "started_at": "2026-10-23T10:00:00+08:00",
+                       "wall_s": 12.5, "vlm_wall_s": 4.0, "videos": {"a.mp4": 10.0},
+                       "work": {}, "real": {}}
     for bad in ({"kind": "other"}, {"wall_s": -1.0}, {"vlm_wall_s": 20.0},
-                {"videos": {"a.mp4": "long"}}):
+                {"videos": {"a.mp4": "long"}}, {"run_id": ""}, {"run_id": None},
+                {"run_id": 3}, {"work": {"b.mp4": 1.0}},
+                {"videos": {"a.mp4": 1.0}, "work": {"a.mp4": -1.0}}):
         args = {"kind": "run", "started_at": "x", "wall_s": 12.5, "vlm_wall_s": None,
-                "videos": {}, **bad}
+                "videos": {}, "run_id": "r3", **bad}
         with pytest.raises(ValueError):
             output.record_run_timing(tmp_path, **args)
     assert len(json.loads((tmp_path / "runs.json").read_text())) == 2
@@ -272,3 +275,40 @@ def test_malformed_or_legacy_audit_records_are_rejected_with_valueerror(tmp_path
     _write_meta(out, meta)
     with pytest.raises(ValueError, match="audit"):
         read_audit(out)
+
+
+_POP = [["v0.mp4", 1], ["v1.mp4", 1]]
+
+
+@pytest.mark.parametrize("meta", [
+    # Codex fix-2 review: n=100 with one selected row was a trusted record
+    {"seed": 7, "n": 100, "population": _POP, "selection": [["v0.mp4", 1]]},
+    {"seed": 7, "n": 2, "population": _POP, "selection": [["v0.mp4", 1]]},  # n != len(selection)
+    {"seed": 7, "n": 0, "population": _POP, "selection": [["v0.mp4", 1]]},
+    {"seed": 7, "n": 3, "population": _POP,  # n > len(population)
+     "selection": [["v0.mp4", 1], ["v1.mp4", 1], ["v2.mp4", 1]]},
+    {"seed": 7, "n": 1, "population": _POP, "selection": [["v9.mp4", 1]]},  # not in population
+    {"seed": 7, "n": 2, "population": _POP,  # a duplicated selection is not 2 rounds
+     "selection": [["v0.mp4", 1], ["v0.mp4", 1]]},
+])
+def test_audit_record_with_inconsistent_sizes_is_malformed(tmp_path, rules, meta):
+    """C-X3(d): len(selection) == n <= len(population) and selection within population."""
+    from bxjudge.evaluate import check_audit
+
+    with pytest.raises(ValueError, match="malformed audit sample record"):
+        check_audit(meta)
+    out = _results(tmp_path, rules)
+    mark_audit_sample(out, 1, seed=7, rules=rules)
+    rows, timings, runs = read_results(out)
+    with pytest.raises(ValueError, match="malformed audit sample record"):
+        evaluate(rows, timings, runs=runs, audit=meta)
+    _write_meta(out, meta)
+    with pytest.raises(ValueError, match="malformed audit sample record"):
+        read_audit(out)
+
+
+def test_consistent_audit_record_is_accepted():
+    from bxjudge.evaluate import check_audit
+
+    meta = {"seed": 7, "n": 2, "population": _POP, "selection": _POP}
+    assert check_audit(meta) is meta

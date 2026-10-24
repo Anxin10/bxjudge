@@ -17,6 +17,7 @@ from tests.helpers import (
     make_track,
     make_video,
     rr,
+    shipped_autocalib,
 )
 
 
@@ -1252,7 +1253,7 @@ def test_template_at_1080p_scales_to_720p_decode_and_keeps_120fps_timing(
     detector = FakeDetector(launch_frame=150)
     _run(videos, calib, out, rules, detector=detector)
     vid = json.loads((out / "videos.json").read_text())["clip.mp4"]
-    snap = load_snapshot(out, vid["calibration"]["id"])
+    snap = load_snapshot(out, vid["calibration"]["id"], autocalib=shipped_autocalib())
     assert snap.kind == "manual" and snap.calibration.frame_size == (1920, 1080)
     expected = scale_calibration(snap.calibration, (1280, 720))
     assert expected.frame_size == (1280, 720)
@@ -1333,7 +1334,8 @@ def test_run_cli_passes_autocalib_config(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(pipeline, "run_batch", lambda *a, **kw: calls.append(kw))
     assert main(["run", str(tmp_path)]) == 0
-    assert calls[-1]["autocalib_config"] == Path("config/autocalib.yaml")
+    # C-X5(c): the default is the repository's config, not a cwd-relative path
+    assert calls[-1]["autocalib_config"] == _REPO / "config" / "autocalib.yaml"
     assert main(["run", str(tmp_path), "--autocalib", "x/ac.yaml"]) == 0
     assert calls[-1]["autocalib_config"] == Path("x/ac.yaml")
 
@@ -1424,7 +1426,8 @@ def test_manual_match_with_moved_camera_measures_shake_against_the_videos_own_fr
 
 def _veto_setup(tmp_path, rules):
     """clip.mp4 and clip2.mp4 at the same moved camera position, judged (one auto group, one
-    real round each); clip.mp4 round 1 confirmed and clip2.mp4 round 1 in the audit sample;
+    real round each); clip.mp4 round 1 confirmed and clip2.mp4 round 1 (made unflagged) in the
+    audit sample;
     then that group vetoed. Returns (videos, calib, out, snapshot id)."""
     from bxjudge.calibration_store import veto_calibration
     from bxjudge.output import read_rounds, save_rounds
@@ -1440,10 +1443,12 @@ def _veto_setup(tmp_path, rules):
     rows = read_rounds(out)
     for r in rows:
         if r["video"] == "clip2.mp4":
+            # C-X3(d): an audit sample is drawn from the unflagged population only
+            r["needs_review"], r["review_reasons"] = False, []
             r["audit_sample"] = True
     save_rounds(rows, out, rules)
     _freeze_audit(out)
-    veto_calibration(out, sid, rules=rules)
+    veto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
     return videos, calib, out, sid
 
 
@@ -1513,7 +1518,7 @@ def test_unveto_then_rerun_keeps_the_rounds(tmp_path, rules, rerun_while_vetoed)
     before_rows = json.loads((out / "rounds.json").read_text())
     if rerun_while_vetoed:
         _run(videos, calib, out, rules)
-    unveto_calibration(out, sid, rules=rules)
+    unveto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
     detector = FakeDetector()
     _run(videos, calib, out, rules, detector=detector)
     assert detector.frames == []  # same snapshot as recorded: nothing to redo
@@ -1639,9 +1644,12 @@ def test_transient_failure_of_a_judged_video_keeps_its_rows_and_is_retried(
     assert (out / "processed_videos.json").read_bytes() == before_db  # left for retry
     entry = json.loads((out / "videos.json").read_text())["clip.mp4"]
     # R66a: only the status, the attempt's own wall and the current file's probed duration
-    # (none when the probe failed) change; the rows' judged_wall_s and timing stay.
+    # (none when the probe failed) change; the rows' judged_wall_s and timing stay. C-X4(b):
+    # the attempt carries this run's id, the kept rows keep the id of the run that made them.
     expected = {**before_entry, "analysis_status": status,
-                "attempt_wall_s": entry["attempt_wall_s"]}
+                "attempt_wall_s": entry["attempt_wall_s"],
+                "attempt_run_id": entry["attempt_run_id"]}
+    assert entry["attempt_run_id"] != before_entry["attempt_run_id"]
     if mode == "probe":
         del expected["duration_s"]
     assert entry == expected
@@ -1734,3 +1742,242 @@ def test_unchanged_video_after_a_transient_failure_is_rejudged_not_marked_ok(
     _run(videos, calib, out, rules)
     assert spy.videos == {"clip.mp4"}
     assert _status(out, "clip.mp4") == "ok"
+
+
+# ----------------------------------------------------------------- C-X3(a): --rejudge keeps T4-3
+
+
+def test_rejudge_after_a_veto_without_alternative_keeps_the_rows(tmp_path, rules, monkeypatch):
+    """Fix round 2 NB-1: --rejudge on a vetoed group with no non-vetoed alternative keeps the
+    rows and their audit marks exactly as a plain rerun does (T4-3, spec 6.6b); a non-vetoed
+    video is still re-analysed."""
+    from tests.helpers import stadium_scene, write_scene_video
+
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
+    _run(videos, calib, out, rules)  # plain.mp4 judged with the (non-vetoed) manual
+    before_rows = [r for r in json.loads((out / "rounds.json").read_text())
+                   if r["video"] != "plain.mp4"]
+    before = _eval(out)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, rejudge=True)
+    assert spy.videos == {"plain.mp4"}
+    rows = json.loads((out / "rounds.json").read_text())
+    assert [r for r in rows if r["video"] != "plain.mp4"] == before_rows
+    clip2 = next(r for r in rows if r["video"] == "clip2.mp4")
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert not any(r["review_reasons"] == ["recalibrate"] for r in rows)
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip.mp4"]["analysis_status"] == v["clip2.mp4"]["analysis_status"] == "ok"
+    assert v["clip.mp4"]["calibration"]["id"] == v["clip2.mp4"]["calibration"]["id"] == sid
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_recalibrate_videos == 0
+
+
+def test_rejudge_after_a_veto_with_an_alternative_reanalyses_the_group(tmp_path, rules):
+    from tests.helpers import add_manual_calibration, stadium_scene
+
+    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
+    _run(videos, calib, out, rules, rejudge=True)
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip2.mp4"]["calibration"]["kind"] == "manual"
+    rows = {(r["video"], r["round"]): r for r in json.loads((out / "rounds.json").read_text())}
+    assert rows[("clip2.mp4", 1)]["calibration_id"] == v["clip2.mp4"]["calibration"]["id"]
+    assert rows[("clip.mp4", 1)]["reviewed"] is True  # R36
+
+
+_REPO = Path(__file__).resolve().parents[1]
+
+
+def test_after_run_vlm_phase_uses_the_runs_autocalib(tmp_path, monkeypatch):
+    """C-X3(b): the after_run VLM phase validates snapshots with run's --autocalib, never a
+    config read from the current directory."""
+    from dataclasses import replace
+
+    from tests.helpers import make_video, rr, shipped_autocalib
+
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    make_video(folder / "a.mp4", seconds=0.1)
+    custom = replace(shipped_autocalib(), snapshot_max_coord=12345.0)
+    seen = {}
+    monkeypatch.setattr(pipeline, "load_detector", lambda *a, **k: lambda image, frame: [])
+    monkeypatch.setattr(pipeline, "judge_video", lambda *a, **k: [rr("spin", "X", video="a.mp4")])
+    monkeypatch.setattr(pipeline, "review_results_dir",
+                        lambda out_dir, **kw: seen.update(kw) or {})
+    vlm_cfg = _vlm_config(tmp_path)
+    selection = _synthetic_selection(tmp_path)
+    calib = _empty_calib(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    pipeline.run_batch(folder, calib, tmp_path / "out", selection=selection,
+                       vlm_config=vlm_cfg, autocalib=custom,
+                       thresholds=_REPO / "config/thresholds.yaml",
+                       rules_path=_REPO / "config/rules.yaml",
+                       detection_config=_REPO / "config/detection.yaml")
+    assert seen["autocalib"] is custom
+    [run] = json.loads((tmp_path / "out" / "runs.json").read_text())
+    assert seen["run_id"] == run["run_id"]  # C-X4(b): the VLM timings link to this record
+
+
+def test_review_cli_passes_an_absolute_autocalib_to_the_app(tmp_path, monkeypatch):
+    import subprocess
+
+    from bxjudge.cli import main
+
+    (tmp_path / "rounds.json").write_text("[]")
+    calls = []
+    monkeypatch.setattr(subprocess, "call", lambda argv, **k: calls.append(argv) or 0)
+    monkeypatch.chdir(tmp_path)
+    assert main(["review", str(tmp_path), "--autocalib", "my/ac.yaml"]) == 0
+    argv = calls[-1]
+    assert argv[argv.index("--autocalib") + 1] == str((tmp_path / "my/ac.yaml").resolve())
+    # C-X5(c): without --autocalib, the repository's config, never the cwd's
+    assert main(["review", str(tmp_path)]) == 0
+    assert calls[-1][calls[-1].index("--autocalib") + 1] == str(
+        _REPO / "config" / "autocalib.yaml")
+
+
+@pytest.mark.parametrize("rejudge", [False, True])
+def test_vetoed_video_keeps_its_rows_after_a_transient_failure_whatever_its_status(
+    tmp_path, rules, monkeypatch, rejudge
+):
+    """Codex fix-3 review / C-X4(a): judge -> veto -> a probe failure keeps the rows with
+    decode_error -> decoding recovers -> a rerun (plain or --rejudge) with no non-vetoed
+    alternative still keeps the vetoed rows and their audit marks (T4-3 beats the status)."""
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before = _eval(out)
+    with monkeypatch.context() as m:
+        _break_judging(m, "probe")
+        _run(videos, calib, out, rules)
+    assert (out / "rounds.json").read_bytes() == before_rows
+    assert _status(out, "clip2.mp4") == "decode_error"
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, rejudge=rejudge)  # decoding has recovered
+    assert spy.videos == set()
+    assert (out / "rounds.json").read_bytes() == before_rows
+    clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_recalibrate_videos == 0
+
+
+@pytest.mark.parametrize("rejudge", [False, True])
+def test_vetoed_video_whose_file_looks_changed_keeps_its_rows(
+    tmp_path, rules, monkeypatch, rejudge
+):
+    """Codex fix-4 review / C-X5(a): judge -> veto -> touch the sources' mtime -> rerun with
+    no alternative: scan reports them as changed, yet the vetoed rows and audit marks stay."""
+    import os
+
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before = _eval(out)
+    for name in ("clip.mp4", "clip2.mp4"):
+        st = (videos / name).stat()
+        os.utime(videos / name, (st.st_atime + 10, st.st_mtime + 10))
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, rejudge=rejudge)
+    assert spy.videos == set()
+    assert (out / "rounds.json").read_bytes() == before_rows
+    clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_recalibrate_videos == 0
+
+
+@pytest.mark.parametrize("rejudge", [False, True])
+def test_vetoed_video_whose_selection_fails_keeps_its_rows(tmp_path, rules, monkeypatch, rejudge):
+    """Codex fix-5 review / C-X7(b): judge -> veto -> first_second_frame fails once -> no
+    alternative: the vetoed rows and audit marks survive, the attempt is a transient failure
+    and the video is not reanalysed (judging it could only give recalibrate)."""
+    from bxjudge.video import VideoDecodeError
+
+    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    before = _eval(out)
+    real = pipeline.first_second_frame
+    failed: set[str] = set()
+
+    def fails_once(info, th):
+        if info.path.name not in failed:
+            failed.add(info.path.name)
+            raise VideoDecodeError("first second unreadable")
+        return real(info, th)
+
+    monkeypatch.setattr(pipeline, "first_second_frame", fails_once)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, rejudge=rejudge)
+    assert spy.videos == set()
+    assert (out / "rounds.json").read_bytes() == before_rows
+    clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    v = json.loads((out / "videos.json").read_text())
+    assert v["clip2.mp4"]["analysis_status"] == "decode_error"
+    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    [*_, run] = json.loads((out / "runs.json").read_text())
+    assert v["clip2.mp4"]["attempt_run_id"] == run["run_id"] and "clip2.mp4" in run["videos"]
+    _run(videos, calib, out, rules, rejudge=rejudge)  # selection works again: still kept
+    assert spy.videos == set()
+    assert (out / "rounds.json").read_bytes() == before_rows
+    after = _eval(out)
+    assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
+        before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
+    assert after.n_recalibrate_videos == 0
+
+
+def test_veto_kept_video_records_its_current_duration_and_attempt(tmp_path, rules):
+    """Codex fix-6 review / C-X8: judge -> veto -> replace the source with a shorter video ->
+    --rejudge with no alternative. The rows stay (T4-3), but the attempt records the CURRENT
+    probed duration and its own wall under this run's id, so a stale 3 s length can no longer
+    hide the old analysis against a 1 s source."""
+    from tests.helpers import stadium_scene, write_scene_video
+
+    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    before_rows = (out / "rounds.json").read_bytes()
+    judged = json.loads((out / "videos.json").read_text())["clip2.mp4"]["judged_wall_s"]
+    write_scene_video(videos / "clip2.mp4", stadium_scene(shift=(46, 21))[0], seconds=1.0,
+                      fps=30)
+    _run(videos, calib, out, rules, rejudge=True)
+    assert (out / "rounds.json").read_bytes() == before_rows
+    entry = json.loads((out / "videos.json").read_text())["clip2.mp4"]
+    [*_, run] = json.loads((out / "runs.json").read_text())
+    assert entry["duration_s"] == pytest.approx(1.0, abs=0.05)
+    assert entry["attempt_run_id"] == run["run_id"] and entry["attempt_wall_s"] > 0
+    assert entry["judged_wall_s"] == judged  # the kept rows' own wall stays
+    assert entry["analysis_status"] == "ok"  # unchanged: never written by a kept attempt
+    assert run["videos"]["clip2.mp4"] == pytest.approx(1.0, abs=0.05)
+    assert run["real"]["clip2.mp4"] is True and run["work"]["clip2.mp4"] > 0
+
+
+def test_veto_kept_videos_do_not_use_up_the_limit(tmp_path, rules, monkeypatch):
+    """Codex fix-7 review / C-X9: repeated `run --limit 1` with veto-kept videos first in
+    order and a new plain.mp4 must judge plain.mp4; the kept ones still get their attempt."""
+    from tests.helpers import stadium_scene, write_scene_video
+
+    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    before_rows = json.loads((out / "rounds.json").read_text())
+    write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
+    spy = _JudgeSpy(monkeypatch)
+    _run(videos, calib, out, rules, limit=1)
+    assert spy.videos == {"plain.mp4"}
+    rows = json.loads((out / "rounds.json").read_text())
+    assert [r for r in rows if r["video"] != "plain.mp4"] == before_rows
+    [*_, run] = json.loads((out / "runs.json").read_text())
+    v = json.loads((out / "videos.json").read_text())
+    for kept in ("clip.mp4", "clip2.mp4"):
+        assert v[kept]["attempt_run_id"] == run["run_id"] and kept in run["videos"]
+    spy.videos.clear()
+    _run(videos, calib, out, rules, limit=1)  # nothing new left to judge
+    assert spy.videos == set()

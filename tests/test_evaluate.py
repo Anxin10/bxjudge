@@ -26,7 +26,14 @@ from bxjudge.evaluate import (
 )
 from bxjudge.evaluate import evaluate as _evaluate
 from bxjudge.evaluate import report_metrics as _report_metrics
-from tests.helpers import audit_of, placeholder, rev, row, videos_with_calibration
+from tests.helpers import (
+    audit_of,
+    placeholder,
+    rev,
+    row,
+    shipped_autocalib,
+    videos_with_calibration,
+)
 
 
 # C-X2(d): marked rows always need their frozen record; these unit tests derive the record that
@@ -169,7 +176,7 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
     rows = _rows_of_videos("a.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 50.0, "vlm_s": 70.0,
                          "judged_wall_s": 50.0, "attempt_wall_s": 50.0,
-                         "analysis_status": "ok"}}
+                         "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1", "vlm_run_ids": ["r1"]}}
     m = evaluate(rows, timings, runs=[_run(60.0, {"a.mp4": 100.0})])
     assert m.speed_ratio == pytest.approx(1.2) == m.speed_ratio_sum  # R66a: wall + VLM
     assert m.speed_ratio_core == pytest.approx(0.5)
@@ -180,7 +187,7 @@ def test_speed_total_includes_vlm_phase_and_core_is_diagnostic():
 def test_speed_median_is_diagnostic_and_the_worst_video_decides():
     rows = _rows_of_videos("a.mp4", "b.mp4", "c.mp4")
     timings = {v: {"duration_s": 100.0, "processing_s": s, "judged_wall_s": s,
-                   "attempt_wall_s": s, "analysis_status": "ok"}
+                   "attempt_wall_s": s, "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1"}
                for v, s in (("a.mp4", 50.0), ("b.mp4", 80.0), ("c.mp4", 200.0))}
     m = evaluate(rows, timings, runs=[_run(150.0, {v: 100.0 for v in timings})])
     assert m.speed_ratio_sum == pytest.approx(0.8) == m.speed_ratio_core  # was the R61 pass
@@ -724,9 +731,11 @@ def test_cli_eval_report_starts_with_r60_summary_table(tmp_path):
 # ---- R61 batch wall-clock ------------------------------------------------------
 
 
-def _run(wall, videos, *, kind="run", vlm=None):
-    return {"kind": kind, "started_at": "2026-10-23T10:00:00+08:00", "wall_s": wall,
-            "vlm_wall_s": vlm, "videos": videos}
+def _run(wall, videos, *, kind="run", vlm=None, run_id="r1", work=None, real=None):
+    # C-X9: a run record always carries its `real` map (default: every listed video real)
+    return {"kind": kind, "run_id": run_id, "started_at": "2026-10-23T10:00:00+08:00",
+            "wall_s": wall, "vlm_wall_s": vlm, "videos": videos, "work": dict(work or {}),
+            "real": dict(real) if real is not None else {v: True for v in videos}}
 
 
 def test_batch_wall_clock_is_a_diagnostic_and_never_double_counts_vlm():
@@ -755,7 +764,8 @@ def test_sum_exceeding_wall_clock_is_reported_not_hidden():
     rows = _rows_of_videos("a.mp4", "b.mp4")
     timings = {v: {"duration_s": 100.0, "processing_s": 90.0, "vlm_s": 0.0, "vlm_requests": []}
                for v in ("a.mp4", "b.mp4")}
-    runs = [_run(120.0, {"a.mp4": 100.0, "b.mp4": 100.0})]  # e.g. future parallel videos
+    runs = [_run(120.0, {"a.mp4": 100.0, "b.mp4": 100.0},  # e.g. future parallel videos
+                 work={"a.mp4": 90.0, "b.mp4": 90.0})]  # C-X8: the work that run stored
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
     assert w["sum_s"] == 180.0 and w["wall_s"] == 120.0 and w["sum_exceeds_wall"] is True
     assert w["ratio"] == pytest.approx(0.6) and w["sum_ratio"] == pytest.approx(0.9)
@@ -871,12 +881,13 @@ def test_tradeoff_speed_uses_the_worst_observed_video_never_the_batch_ratio():
     rows = _rows_of_videos("a.mp4", "b.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
                "b.mp4": {"duration_s": 100.0, "processing_s": 50.0, "judged_wall_s": 50.0,
-                         "attempt_wall_s": 50.0, "analysis_status": "ok"}}
+                         "attempt_wall_s": 50.0, "analysis_status": "ok", "judged_run_id": "r1", "attempt_run_id": "r1"}}
     runs = [_run(80.0, {"a.mp4": 100.0, "b.mp4": 100.0})]
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s["basis"] == "unverified" and math.isnan(s["ratio"])  # a.mp4 has no wall_s
     assert s["pass_rate"] == 0.5 and s["slowest"] == "b.mp4"
-    timings["a.mp4"].update(judged_wall_s=150.0, attempt_wall_s=150.0, analysis_status="ok")
+    timings["a.mp4"].update(judged_wall_s=150.0, attempt_wall_s=150.0, analysis_status="ok",
+                            judged_run_id="r1", attempt_run_id="r1")
     s = report_metrics(rows, timings, _cfg(), runs=runs).tradeoff["speed"]
     assert s == {"basis": "worst-video+batch", "ratio": 1.5, "pass_rate": 0.5,
                  "slowest": "a.mp4"}
@@ -911,7 +922,9 @@ def test_wall_clock_excludes_gate_video_duration_probe():
         rev(video="g.mp4", finish=None, winner=None, review_reasons=["recalibrate"])]
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
                "g.mp4": {"duration_s": 200.0, "processing_s": 1.0}}
-    runs = [_run(151.0, {"a.mp4": 100.0, "g.mp4": 200.0})]
+    runs = [_run(151.0, {"a.mp4": 100.0, "g.mp4": 200.0},
+                 work={"a.mp4": 150.0, "g.mp4": 1.0},  # C-X7(a): as that run measured
+                 real={"a.mp4": True, "g.mp4": False})]  # g: a placeholder gate (C-X8)
     m = evaluate(rows, timings, runs=runs)
     assert m.speed_ratio_wall == pytest.approx(1.5)  # gate work and duration both left out
     w = report_metrics(rows, timings, _cfg(), runs=runs).wall
@@ -922,7 +935,8 @@ def test_wall_clock_excludes_over_limit_video_work_and_duration():
     rows = _rows_of_videos("a.mp4", "long.mp4")
     timings = {"a.mp4": {"duration_s": 100.0, "processing_s": 150.0},
                "long.mp4": {"duration_s": 900.0, "processing_s": 400.0, "vlm_s": 10.0}}
-    runs = [_run(560.0, {"a.mp4": 100.0, "long.mp4": 900.0})]
+    runs = [_run(560.0, {"a.mp4": 100.0, "long.mp4": 900.0},
+                 work={"a.mp4": 150.0, "long.mp4": 410.0})]
     m = evaluate(rows, timings, runs=runs)
     assert m.speed_ratio_wall == pytest.approx(1.5)  # (560 - 410) / 100, not 560 / 1000
 
@@ -1215,7 +1229,7 @@ def test_cli_eval_reports_calibration_section(tmp_path):
     s1, _ = auto_snapshot_ids()
     out = results_with_two_positions(tmp_path)
     confirm_reviewed(out, "a.mp4", 1)
-    veto_calibration(out, s1)
+    veto_calibration(out, s1, autocalib=shipped_autocalib())
     def files():
         return {p: p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
 
