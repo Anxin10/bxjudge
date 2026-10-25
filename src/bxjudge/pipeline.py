@@ -17,6 +17,7 @@ from dataclasses import asdict
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
+from threading import Event
 
 import cv2
 import numpy as np
@@ -77,7 +78,7 @@ from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
 from .trajectory_video import load_video_policy
 from .types import RoundResult, Track
-from .video import VideoDecodeError, iter_frames
+from .video import VideoDecodeError, iter_frames, prefetched
 from .vlm import load_vlm_config, review_results_dir
 
 log = logging.getLogger(__name__)
@@ -184,10 +185,12 @@ def judge_video(
     if dynamic_config is not None:
         with info.path.open("rb") as f:
             source_before = hashlib.file_digest(f, "sha256").hexdigest()
+    cancelled = Event()
     try:
         with closing(
             iter_frames(
-                info.path, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel
+                info.path, long_edge=th.infer_long_edge, hwaccel=th.decode_hwaccel,
+                cancelled=cancelled
             )
         ) as frames:
             prefix = list(_first_second(frames, info.fps))
@@ -249,9 +252,10 @@ def judge_video(
                             crops[(d.frame, tuple(d.box))] = crop
                 return detections
 
-            tracks = track_frames(
-                measured(), detecting, info.fps, config=detection_config
-            )
+            with prefetched(measured(), cancelled=cancelled) as prepared_frames:
+                tracks = track_frames(
+                    prepared_frames, detecting, info.fps, config=detection_config
+                )
         phase = None
         side_hints = {}
         geometry_evidence = None

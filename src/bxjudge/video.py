@@ -8,7 +8,11 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
+from concurrent.futures import CancelledError
+from contextlib import contextmanager
 from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from typing import Iterator
 
 import numpy as np
@@ -52,9 +56,12 @@ def _decode(
     hwaccel: str,
     first_index: int,
     skip: int,
+    cancelled: Event | None = None,
 ) -> Iterator[tuple[int, np.ndarray]]:
     """One ffmpeg run. Yields ``(frame_index, frame)`` skipping the first ``skip`` frames;
     raises ``VideoDecodeError`` on ffmpeg failure, a truncated frame, or zero frames."""
+    if cancelled is not None and cancelled.is_set():
+        return
     cmd = ["ffmpeg", "-v", "error", "-nostdin", *_hwaccel_args(hwaccel)]
     if start > 0:
         cmd += ["-ss", f"{start:.6f}"]
@@ -71,7 +78,21 @@ def _decode(
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, bufsize=0)
         except FileNotFoundError as e:
             raise VideoDecodeError("ffmpeg not found; install ffmpeg") from e
+        finished = Event()
+
+        def cancel_decode():
+            while not finished.wait(0.05):
+                if cancelled.is_set():
+                    proc.kill()
+                    return
+
+        watcher = (
+            Thread(target=cancel_decode, name="bxjudge-decode-cancel")
+            if cancelled is not None else None
+        )
         try:
+            if watcher is not None:
+                watcher.start()
             assert proc.stdout is not None
             while True:
                 buf = bytearray(frame_bytes)
@@ -82,6 +103,8 @@ def _decode(
                     if not k:
                         break
                     got += k
+                if cancelled is not None and cancelled.is_set():
+                    return
                 if got == 0:
                     break
                 if got < frame_bytes:
@@ -93,11 +116,16 @@ def _decode(
                     yield idx, np.frombuffer(buf, np.uint8).reshape(out_h, out_w, 3)
             rc = proc.wait()
         finally:
+            finished.set()
+            if watcher is not None and watcher.ident is not None:
+                watcher.join()
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
             if proc.stdout:
                 proc.stdout.close()
+        if cancelled is not None and cancelled.is_set():
+            return
         if rc != 0:
             err.seek(0)
             msg = err.read().decode(errors="replace").strip()
@@ -114,6 +142,8 @@ def iter_frames(
     end: float | None = None,
     long_edge: int = 1280,
     hwaccel: str = "cuda",
+    *,
+    cancelled: Event | None = None,
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield ``(source_frame_index, BGR frame)`` for ``[start, end)`` seconds.
 
@@ -141,12 +171,89 @@ def iter_frames(
         try:
             for idx, frame in _decode(
                 path, start=start, end=end, out_w=out_w, out_h=out_h,
-                hwaccel=hw, first_index=first_index, skip=delivered,
+                hwaccel=hw, first_index=first_index, skip=delivered, cancelled=cancelled,
             ):
                 delivered += 1
                 yield idx, frame
             return
         except VideoDecodeError as e:
+            if cancelled is not None and cancelled.is_set():
+                return
             if i + 1 >= len(attempts):
                 raise
             log.warning("cuda decode of %s failed (%s); retrying on cpu", path.name, e)
+
+
+@contextmanager
+def prefetched(
+    source: Iterator[tuple[int, np.ndarray]],
+    *,
+    cancelled: Event,
+) -> Iterator[Iterator[tuple[int, np.ndarray]]]:
+    """Overlap frame preparation with consumption, retaining order and frame objects.
+
+    Only the producer advances/closes the source. Two queued frames bound memory;
+    The source must observe the shared cancellation event (as iter_frames does).
+    Exiting cancels decoding/backpressure and joins the producer before returning.
+    A source failure is delivered after the frames already prepared, never hidden.
+    """
+    pending: Queue[tuple[int, np.ndarray] | BaseException | None] = Queue(maxsize=2)
+    stopped = cancelled
+    failure = None
+
+    def send(value):
+        while not stopped.is_set():
+            try:
+                pending.put(value, timeout=0.05)
+                return
+            except Full:
+                continue
+
+    def produce():
+        nonlocal failure
+        error = None
+        try:
+            for item in source:
+                if stopped.is_set():
+                    break
+                send(item)
+        except BaseException as exc:  # noqa: BLE001 - forward worker failures to consumer
+            error = exc
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException as exc:  # noqa: BLE001 - forward close failures too
+                    if error is None:
+                        error = exc
+            failure = error
+            send(error)
+
+    def consume():
+        while True:
+            if cancelled.is_set():
+                raise CancelledError("frame decoding cancelled")
+            try:
+                item = pending.get(timeout=0.05)
+            except Empty:
+                continue
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    worker = Thread(target=produce, name="bxjudge-frame-prefetch")
+    worker.start()
+    frames = consume()
+    completed = False
+    try:
+        yield frames
+        completed = True
+    finally:
+        stopped.set()
+        worker.join()
+        frames.close()
+        if completed and failure is not None:
+            raise failure

@@ -1,5 +1,6 @@
 import logging
 import subprocess
+from threading import Event
 
 import numpy as np
 import pytest
@@ -139,3 +140,180 @@ def test_cpu_failure_is_not_retried(tmp_path, monkeypatch):
 def test_cuda_decodes_all_frames(tmp_path):
     p = make_video(tmp_path / "a.mp4", seconds=2, fps=60)
     assert sum(1 for _ in iter_frames(p, hwaccel="cuda")) == 120
+
+
+# Prefetch must preserve the source stream and release decoder resources even
+# when a model stops consuming, fails, or the producer cannot decode a frame.
+def test_prefetch_keeps_order_indices_and_original_frame_objects():
+    from bxjudge.video import prefetched
+
+    values = [(f, np.full((2, 3, 3), f, np.uint8)) for f in (7, 8, 12, 13)]
+    with prefetched(iter(values), cancelled=Event()) as frames:
+        actual = list(frames)
+    assert [f for f, _ in actual] == [7, 8, 12, 13]
+    assert all(a[1] is b[1] for a, b in zip(actual, values, strict=True))
+
+
+def test_prefetch_propagates_original_decode_error_and_closes_generator():
+    from bxjudge.video import VideoDecodeError, prefetched
+
+    events = []
+    error = VideoDecodeError("source decode failure")
+
+    def source():
+        try:
+            yield (8, np.zeros((2, 2, 3), np.uint8))
+            raise error
+        finally:
+            events.append("closed")
+
+    with pytest.raises(VideoDecodeError) as caught, prefetched(source(), cancelled=Event()) as frames:
+        assert next(frames)[0] == 8
+        next(frames)
+    assert caught.value is error
+    assert events == ["closed"]
+
+
+def test_prefetch_consumer_failure_cancels_full_queue_without_leaking_thread():
+    import threading
+
+    from bxjudge.video import prefetched
+
+    closed = threading.Event()
+    filled = threading.Event()
+    source_threads = []
+
+    def source():
+        try:
+            source_threads.append(threading.current_thread())
+            for frame in range(1000):
+                if frame == 3:
+                    filled.set()
+                yield frame, np.zeros((2, 2, 3), np.uint8)
+        finally:
+            closed.set()
+
+    with pytest.raises(RuntimeError, match="detector failed"), prefetched(source(), cancelled=Event()) as frames:
+        assert next(frames)[0] == 0
+        assert filled.wait(timeout=2)
+        raise RuntimeError("detector failed")
+    assert closed.is_set()
+    assert len(source_threads) == 1 and not source_threads[0].is_alive()
+
+
+def test_empty_prefetch_closes_without_hanging():
+    from bxjudge.video import prefetched
+
+    with prefetched(iter([]), cancelled=Event()) as frames:
+        assert list(frames) == []
+
+def test_prefetch_early_exit_reports_source_close_failure():
+    from bxjudge.video import prefetched
+
+    class BrokenClose:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return 0, np.zeros((2, 2, 3), np.uint8)
+
+        def close(self):
+            raise RuntimeError("source close failed")
+
+    with pytest.raises(RuntimeError, match="source close failed"), prefetched(
+        BrokenClose(), cancelled=Event()
+    ) as frames:
+        next(frames)
+
+
+def test_prefetch_cancels_decoder_blocked_on_pipe(monkeypatch, tmp_path):
+    import sys
+    import time
+
+    from bxjudge.video import _decode, prefetched
+
+    real_popen = subprocess.Popen
+    blocked = Event()
+    cancelled = Event()
+    processes = []
+
+    class ObservedPipe:
+        def __init__(self, pipe):
+            self.pipe = pipe
+            self.reads = 0
+
+        def readinto(self, target):
+            self.reads += 1
+            if self.reads == 2:
+                blocked.set()
+            return self.pipe.readinto(target)
+
+        def close(self):
+            self.pipe.close()
+
+    def stalled_decoder(cmd, **kwargs):
+        process = real_popen(
+            [sys.executable, "-u", "-c",
+             ("import sys,time;sys.stdout.buffer.write(bytes(12));"
+             "sys.stdout.buffer.flush();time.sleep(30)")],
+            **kwargs,
+        )
+        process.stdout = ObservedPipe(process.stdout)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(video.subprocess, "Popen", stalled_decoder)
+    source = _decode(
+        tmp_path / "unused.mp4", start=0, end=None, out_w=2, out_h=2,
+        hwaccel="cpu", first_index=0, skip=0, cancelled=cancelled,
+    )
+    started = time.perf_counter()
+    try:
+        with pytest.raises(RuntimeError, match="detector failed"), prefetched(
+            source, cancelled=cancelled
+        ) as frames:
+            assert next(frames)[0] == 0
+            assert blocked.wait(2)
+            raise RuntimeError("detector failed")
+        assert time.perf_counter() - started < 3
+        assert processes and all(p.poll() is not None for p in processes)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+def test_prefetch_pre_cancelled_stream_fails_instead_of_hanging():
+    from concurrent.futures import CancelledError
+
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    cancelled.set()
+    with pytest.raises(CancelledError), prefetched(iter([]), cancelled=cancelled) as frames:
+        list(frames)
+
+
+def test_prefetch_external_cancel_never_returns_a_partial_success():
+    from concurrent.futures import CancelledError
+
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    waiting = Event()
+    closed = Event()
+
+    def source():
+        try:
+            yield 0, np.zeros((2, 2, 3), np.uint8)
+            waiting.set()
+            cancelled.wait(2)
+        finally:
+            closed.set()
+
+    with pytest.raises(CancelledError), prefetched(source(), cancelled=cancelled) as frames:
+        assert next(frames)[0] == 0
+        assert waiting.wait(2)
+        cancelled.set()
+        next(frames)
+    assert closed.is_set()
