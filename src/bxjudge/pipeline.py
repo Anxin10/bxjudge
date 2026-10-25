@@ -166,6 +166,7 @@ def judge_video(
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
     """
+    evidence_confidence = load_policy(detection_config)["confidence"]
     try:
         with closing(
             iter_frames(
@@ -214,7 +215,7 @@ def judge_video(
             def detecting(image, f):
                 detections = detector(image, f)
                 for d in detections:
-                    if d.cls == "bey":
+                    if d.cls == "bey" and d.score >= evidence_confidence:
                         crop = _crop(image, d.box)
                         if crop is not None:
                             crops[(d.frame, tuple(d.box))] = crop
@@ -576,6 +577,7 @@ def run_batch(
             else str(Path(thresholds).resolve()),
             "rules_path": str(Path(rules_path).resolve()),
             "confidence": policy["confidence"],
+            "candidate_confidence": policy["candidate_confidence"],
             "tracking": policy["tracking"],
             "device": policy["device"],
             "thresholds": asdict(th),
@@ -585,6 +587,7 @@ def run_batch(
         detector = load_detector(
             provenance["kind"],
             Path(provenance["weights"]),
+            conf=policy["candidate_confidence"],
             config=detection_config,
             thresholds=th,
             **backend_options,

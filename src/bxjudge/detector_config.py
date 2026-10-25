@@ -138,6 +138,7 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
     cfg = yaml.safe_load(Path(path).read_text())
     required = {
         "confidence",
+        "candidate_confidence",
         "evaluation_confidence",
         "device",
         "selection_tie_ap",
@@ -147,7 +148,12 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
     }
     if not isinstance(cfg, dict) or set(cfg) != required:
         raise ValueError("detector config has missing or unknown keys")
-    for key in ("confidence", "evaluation_confidence", "selection_tie_ap"):
+    for key in (
+        "confidence",
+        "candidate_confidence",
+        "evaluation_confidence",
+        "selection_tie_ap",
+    ):
         value = cfg[key]
         if (
             type(value) not in (int, float)
@@ -199,6 +205,15 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
             or not 0 <= value <= 1
         ):
             raise ValueError(f"tracking {key} must be a finite number in [0, 1]")
+    if cfg["candidate_confidence"] > cfg["confidence"]:
+        raise ValueError("candidate_confidence cannot exceed confidence evidence floor")
+    if (
+        tracking["high_conf_det_threshold"] < cfg["confidence"]
+        or tracking["track_activation_threshold"] < cfg["confidence"]
+    ):
+        raise ValueError(
+            "tracking high/activation thresholds cannot be below confidence evidence floor"
+        )
     return cfg
 
 

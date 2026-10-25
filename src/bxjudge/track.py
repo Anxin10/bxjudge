@@ -1,4 +1,4 @@
-"""Per-class ByteTrack using Roboflow's supported trackers/supervision API."""
+"""Native ByteTrack association, with high-score-only adjudication evidence."""
 
 from collections.abc import Iterable
 from pathlib import Path
@@ -25,8 +25,11 @@ def track_frames(
     trackers = {
         cls: ByteTrackTracker(frame_rate=fps, **cfg["tracking"]) for cls in CLASSES
     }
-    tracks: dict[tuple[str, int], Track] = {}
-    pending: dict[object, list[Detection]] = {}
+    tracks: list[Track] = []
+    # Native tracklet objects remain stable when their initially -1 ID is confirmed.
+    pending: dict[object, Detection] = {}
+    accepted: dict[object, Track] = {}
+    last_strong: dict[object, int] = {}
     previous = -1
     for frame_idx, frame in frames:
         if type(frame_idx) is not int or frame_idx < 0 or frame_idx <= previous:
@@ -37,44 +40,63 @@ def track_frames(
         detections = detector(frame, frame_idx)
         if any(d.frame != frame_idx or d.cls not in CLASSES for d in detections):
             raise ValueError("detector returned invalid source frame or class")
+        if any(not np.isfinite(d.score) or not 0 <= d.score <= 1 for d in detections):
+            raise ValueError("detector returned invalid confidence")
         for cls, tracker in trackers.items():
-            current = [d for d in detections if d.cls == cls]
+            # A low-score chain may update native motion, but cannot keep a public
+            # identity alive after the native lost-track TIME budget without evidence.
+            tracker.tracks = [
+                t
+                for t in tracker.tracks
+                if (frame_idx - last_strong[t]) / fps
+                <= tracker.maximum_time_without_update
+            ]
+            current = [
+                d
+                for d in detections
+                if d.cls == cls and d.score >= cfg["candidate_confidence"]
+            ]
             sv_dets = sv.Detections(
                 xyxy=np.array([d.box for d in current], dtype=float).reshape(-1, 4),
                 confidence=np.array([d.score for d in current], dtype=float),
                 class_id=np.full(len(current), CLASSES.index(cls), dtype=int),
             )
-            # Absolute timestamps let the maintained tracker age/predict through gaps.
             before = set(tracker.tracks)
             tracked = tracker.update(sv_dets, timestamp=frame_idx / fps)
-            # New tracklets always emit -1 until the next matching observation.
-            # Their public object identity links the exact seed to its confirmed ID.
             unmatched = list(current)
             for tracklet in tracker.tracks:
                 if tracklet not in before:
                     seed = next(
                         d
                         for d in unmatched
-                        if np.array_equal(d.box, tracklet.get_state_bbox())
+                        if d.score >= cfg["confidence"]
+                        and np.array_equal(d.box, tracklet.get_state_bbox())
                     )
                     unmatched.remove(seed)
-                    pending[tracklet] = [seed]
-                if tracklet.tracker_id >= 0 and tracklet in pending:
-                    key = (cls, int(tracklet.tracker_id))
-                    tracks[key] = Track(len(tracks) + 1, cls, pending.pop(tracklet))
-            alive = {t for tracker_ in trackers.values() for t in tracker_.tracks}
-            pending = {
-                t: observations for t, observations in pending.items() if t in alive
-            }
+                    pending[tracklet] = seed
+                    last_strong[tracklet] = frame_idx
+            by_id = {t.tracker_id: t for t in tracker.tracks if t.tracker_id >= 0}
             for box, score, identity in zip(
                 tracked.xyxy, tracked.confidence, tracked.tracker_id, strict=True
             ):
-                if identity < 0:
+                # Weak boxes participate only in association. A native ID assigned
+                # through weak matches does not confirm the seed as strong evidence.
+                if identity < 0 or score < cfg["confidence"]:
                     continue
-                key = (cls, int(identity))
-                if key not in tracks:
-                    tracks[key] = Track(len(tracks) + 1, cls, [])
-                tracks[key].dets.append(
-                    Detection(frame_idx, cls, tuple(map(float, box)), float(score))
+                tracklet = by_id[int(identity)]
+                detection = Detection(
+                    frame_idx, cls, tuple(map(float, box)), float(score)
                 )
-    return list(tracks.values())
+                last_strong[tracklet] = frame_idx
+                if tracklet not in accepted:
+                    # Seed + independently matched HIGH observation: exactly the
+                    # native seed/confirmation contract, with weak hits excluded.
+                    result = Track(len(tracks) + 1, cls, [pending.pop(tracklet)])
+                    tracks.append(result)
+                    accepted[tracklet] = result
+                accepted[tracklet].dets.append(detection)
+            alive = {t for tr in trackers.values() for t in tr.tracks}
+            pending = {t: seed for t, seed in pending.items() if t in alive}
+            accepted = {t: result for t, result in accepted.items() if t in alive}
+            last_strong = {t: f for t, f in last_strong.items() if t in alive}
+    return tracks

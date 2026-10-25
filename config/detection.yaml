@@ -1,5 +1,6 @@
 # Both adapters accept decoder BGR uint8 HWC frames.
-confidence: 0.3
+confidence: 0.3  # Minimum score for adjudication evidence; unchanged.
+candidate_confidence: 0.3  # Keep the proven operating point; 0.1 trial did not improve real tracking.
 evaluation_confidence: 0.001
 device: cuda:0
 selection_tie_ap: 0.01  # AP is on [0, 1]; one percentage point.

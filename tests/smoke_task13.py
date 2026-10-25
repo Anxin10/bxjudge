@@ -77,7 +77,7 @@ def main():
     )
     cfg = yaml.safe_load(Path("config/detection.yaml").read_text())
     # Explicit smoke-only operating point, no production-policy modification.
-    cfg["confidence"] = cfg["evaluation_confidence"]
+    cfg["confidence"] = cfg["candidate_confidence"] = cfg["evaluation_confidence"]
     for key in ("track_activation_threshold", "high_conf_det_threshold"):
         cfg["tracking"][key] = cfg["evaluation_confidence"]
     config = root / "synthetic-detection.yaml"

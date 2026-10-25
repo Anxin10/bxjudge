@@ -2013,3 +2013,42 @@ def test_vetoed_video_whose_selection_fails_does_not_use_up_the_limit(
     for kept in ("clip.mp4", "clip2.mp4"):
         assert v[kept]["analysis_status"] == "decode_error"
         assert v[kept]["attempt_run_id"] == run["run_id"] and kept in run["videos"]
+
+
+def test_weak_candidates_never_enter_spin_crops(monkeypatch,tmp_path,th,rules):
+    from bxjudge.types import Detection
+    calibrated(monkeypatch,tmp_path)
+    seen=[]
+    original=pipeline._crop
+    def crop(image,box):
+        seen.append(tuple(box))
+        return original(image,box)
+    monkeypatch.setattr(pipeline,'_crop',crop)
+    def detector(image,f):
+        return [Detection(f,'bey',(350.,350.,370.,370.),.9),
+                Detection(f,'bey',(890.,350.,910.,370.),.2)]
+    pipeline.judge_video(info(),tmp_path,detector,rules,th,**_kw(tmp_path))
+    assert seen==[(350.,350.,370.,370.)]*120
+
+
+def test_batch_uses_candidate_threshold_and_records_distinct_evidence_floor(tmp_path,monkeypatch):
+    make_video(tmp_path/'a.mp4',seconds=.1)
+    seen=[]
+    def load(*args,**kwargs):
+        seen.append(kwargs['conf'])
+        return lambda image,f:[]
+    monkeypatch.setattr(pipeline,'load_detector',load)
+    def judge(*args,**kwargs):
+        return pipeline._provenance([rr('spin','X',video='a.mp4')],kwargs['provenance'])
+    monkeypatch.setattr(pipeline,'judge_video',judge)
+    import yaml
+    cfg=yaml.safe_load(Path("config/detection.yaml").read_text())
+    cfg["candidate_confidence"] = .1
+    config=tmp_path/"candidate-policy.yaml"
+    config.write_text(yaml.safe_dump(cfg))
+    out=tmp_path/'out'
+    pipeline.run_batch(tmp_path,_empty_calib(tmp_path),out,selection=_synthetic_selection(tmp_path),detection_config=config)
+    row=json.loads((out/'rounds.json').read_text())[0]
+    assert seen==[.1]
+    assert row['detector_provenance']['runtime']['candidate_confidence']==.1
+    assert row['detector_provenance']['runtime']['confidence']==.3
