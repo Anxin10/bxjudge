@@ -504,3 +504,9 @@ uv run --no-sync bxjudge run ~/bx/videos/20261001 --calib calib \
 `--trt-manifest` 明確啟用 TensorRT；沒有這個參數則明確使用原生 PyTorch。指定後若引擎／權重雜湊、解析度、版本、GPU 或 tensor contract 不符，啟動會失敗，不切回其他後端。每回合 `detector_provenance.runtime.detector` 記錄實際引擎與雜湊。切換後端請使用新結果目錄或 `--rejudge`，因為普通重跑會保留未變影片的既有判定；已人工覆核的原始判定仍受保護。
 
 96 格實驗量測只包含 detector adapter，排除解碼、追蹤、事件、VLM。正式速度以 `bxjudge eval` 的完整牆鐘時間判斷；資料未經人工真值／稽核之前，不宣稱裁判準確率達標。校準未匹配影片繼續標示需重校。
+
+### 軌跡動畫
+
+覆核頁「該回合軌跡圖」會從已存軌跡 CSV 及判定時的校準快照產生 H.264 MP4，可播放、暫停及拖曳。背景固定，觀測線條按原始時間以1倍速累積；圖下 `Video t` 是原影片時刻。X 橘、B 藍、未確認灰色；首末標記指每段軌跡的實際觀測，缺格不插點、不連線。原 PNG 放在「靜態軌跡總覽」。
+
+軌跡輸出會在同名 JSON 記錄座標影格尺寸及 CSV 雜湊；缺少紀錄或雜湊不符時不猜尺寸，需重新產生軌跡輸出。首次檢視需要產生動畫，之後讀取 `trajectories/playback/` 快取。CSV、校準幾何／參考圖、回合時間、繪圖程式或 `config/trajectory_video.yaml` 改變時會產生新的快取。輸出為 H.264/yuv420p、faststart，使用專案既有 ffmpeg/libx264。編碼失敗會明確顯示訊息，不發布半成品。此功能只建立覆核檢視媒體，不重跑模型、不修改判定／人工覆核／原軌跡／校準／計時紀錄。

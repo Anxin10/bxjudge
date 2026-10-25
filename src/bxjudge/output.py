@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING
 import cv2
 import numpy as np
 
-from .calibration import ZONES
+from . import trajectory_plot as plot
 from .geometry import zone_of
 from .rules import Match, Rules, group_matches
 from .types import Calibration, LaunchCheck, RoundResult, Side, Track
@@ -549,24 +550,11 @@ def write_trajectory(
     png_p = trajectory_png(out_dir, r.video, r.round)
     csv_p = png_p.with_suffix(".csv")
     png_p.parent.mkdir(parents=True, exist_ok=True)
-    image = cv2.imread(c.ref_frame)
-    if image is None:
-        raise FileNotFoundError(c.ref_frame)
-    image = cv2.resize(image, c.frame_size, interpolation=cv2.INTER_AREA)
+    image = plot.base_image(c)
 
     def label(text, point, size, color):
-        (width, height), baseline = cv2.getTextSize(
-            text, cv2.FONT_HERSHEY_SIMPLEX, size, 1
-        )
-        x = max(0, min(int(point[0]), image.shape[1] - width))
-        y = max(height, min(int(point[1]), image.shape[0] - baseline))
-        cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, 1)
+        plot.label(image, text, point, size, color)
 
-    for field, _, _ in ZONES:
-        pts = np.rint(getattr(c, field)).astype(np.int32)
-        cv2.polylines(image, [pts], True, (80, 200, 80), 1)
-        anchor = tuple(pts[0])
-        label(field, anchor, 0.35, (80, 200, 80))
     rows = []
     for side, track in [
         *bey.items(),
@@ -591,7 +579,7 @@ def write_trajectory(
                 }
             )
         if side or track.cls == "bey":
-            color = {"X": (0, 159, 230), "B": (178, 114, 0)}.get(side, (150, 150, 150))
+            color = plot.SIDE_COLORS.get(side, plot.UNKNOWN_COLOR)
             # Missing observations remain gaps, never invented connected evidence.
             for f, p in sorted(centers.items()):
                 if f - 1 in centers:
@@ -607,13 +595,8 @@ def write_trajectory(
             first, last = min(centers), max(centers)
             start = tuple(np.rint(centers[first]).astype(int))
             end = tuple(np.rint(centers[last]).astype(int))
-            cv2.circle(image, start, 9, (15, 15, 15), 4)
-            cv2.circle(image, start, 7, color, 2)
-            cv2.drawMarker(image, end, (15, 15, 15), cv2.MARKER_TILTED_CROSS, 16, 5)
-            cv2.drawMarker(image, end, color, cv2.MARKER_TILTED_CROSS, 16, 2)
-            identity = f"{side or '?'} #{track.track_id}"
-            label(f"{identity} start f{first}", (start[0] + 11, start[1] - 11), 0.35, color)
-            label(f"{identity} end f{last}", (end[0] + 11, end[1] + 18), 0.35, color)
+            plot.endpoint(image, start, side, track.track_id, first)
+            plot.endpoint(image, end, side, track.track_id, last, end=True)
             for event, frame in events.items() if side else []:
                 if event.startswith("landing_") and event != f"landing_{side}":
                     continue
@@ -630,18 +613,7 @@ def write_trajectory(
             point = tuple(np.rint(centers[frame]).astype(int))
             cv2.drawMarker(image, point, (0, 255, 255), cv2.MARKER_CROSS, 12, 2)
             label(f"finish@{frame} (part)", point, 0.4, (0, 255, 255))
-    # Put the key outside the evidence frame: never obscure paths or event markers.
-    footer_y = image.shape[0]
-    image = cv2.copyMakeBorder(image, 0, 86, 0, 0, cv2.BORDER_CONSTANT, value=(20, 20, 20))
-    cv2.line(image, (18, footer_y + 26), (43, footer_y + 26), (0, 159, 230), 3)
-    label("X side", (51, footer_y + 31), 0.5, (0, 159, 230))
-    cv2.line(image, (190, footer_y + 26), (215, footer_y + 26), (178, 114, 0), 3)
-    label("B side", (223, footer_y + 31), 0.5, (178, 114, 0))
-    cv2.circle(image, (26, footer_y + 51), 7, (240, 240, 240), 2)
-    label("Start", (42, footer_y + 56), 0.45, (240, 240, 240))
-    cv2.drawMarker(image, (198, footer_y + 51), (240, 240, 240), cv2.MARKER_TILTED_CROSS, 14, 2)
-    label("End", (216, footer_y + 56), 0.45, (240, 240, 240))
-    label("Unknown side / fragments", (18, footer_y + 76), 0.4, (150, 150, 150))
+    image = plot.with_legend(image)
     _csv(
         csv_p,
         ["frame", "t", "side", "track_id", "cls", "x", "y", "zone", "score"],
@@ -649,4 +621,11 @@ def write_trajectory(
     )
     if not cv2.imwrite(str(png_p), image):
         raise OSError(f"cannot write {png_p}")
+    # Coordinates are in the decoded frame plane, which may differ from the snapshot.
+    with csv_p.open("rb") as stream:
+        csv_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    metadata = csv_p.with_suffix(".json")
+    pending = metadata.with_suffix(".json.tmp")
+    pending.write_text(json.dumps({"coordinate_size": list(c.frame_size), "csv_sha256": csv_hash}) + "\n")
+    pending.replace(metadata)
     return csv_p, png_p

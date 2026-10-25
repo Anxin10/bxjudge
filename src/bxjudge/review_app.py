@@ -32,6 +32,7 @@ from bxjudge.corrections import (
 )
 from bxjudge.output import effective, matches_for, read_rounds, trajectory_png
 from bxjudge.rules import finish_points, load_rules
+from bxjudge.trajectory_video import generate_trajectory_video
 
 
 def _args() -> argparse.Namespace:
@@ -138,14 +139,25 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
     else:
         st.info("沒有原始影片，無法擷取截圖。")
     st.subheader("該回合軌跡圖")
-    png = trajectory_png(out, row["video"], row["round"])
-    if png.is_file():
-        st.image(
-            str(png), caption=f"{png.name}（X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認）", width="stretch"
-        )
-        st.caption("起點／終點是每段軌跡的首末觀測位置，不等於發射／停止位置；缺失觀測不連線。")
+    if calibration is None:
+        st.warning("沒有判定時的校準參考圖，無法產生軌跡動畫。")
     else:
-        st.info(f"此回合沒有軌跡圖（{png}）。")
+        try:
+            with st.spinner("產生軌跡動畫…首次需要一點時間，之後可直接重播"):
+                movie = generate_trajectory_video(out, row, calibration)
+            st.video(str(movie), format="video/mp4")
+            st.caption("軌跡動畫 · 1 倍速，可播放、暫停、拖曳進度；圖下 Video t 是原影片時刻。"
+                       "背景是判定時的固定校準參考圖，線條依已存觀測逐步出現。")
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            st.warning(f"軌跡動畫無法產生：{error}")
+    st.caption("X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認。"
+               "起終點是每段軌跡的首末觀測，不等於發射／停止位置；缺失觀測不連線。")
+    png = trajectory_png(out, row["video"], row["round"])
+    with st.expander("靜態軌跡總覽"):
+        if png.is_file():
+            st.image(str(png), caption=png.name, width="stretch")
+        else:
+            st.info(f"此回合沒有靜態軌跡圖（{png}）。")
 
 
 def _judgment(row: dict, rows: list[dict], rules, vetoed: set[str]) -> None:

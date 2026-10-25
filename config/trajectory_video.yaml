@@ -1,0 +1,6 @@
+# Rendering policy only; no effect on judging or tracking.
+fps: 30
+max_long_edge: 1280
+crf: 23
+preset: veryfast
+encoder_threads: 2

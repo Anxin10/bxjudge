@@ -615,3 +615,33 @@ def test_app_warns_when_kept_rows_come_from_a_failed_latest_analysis(batch):
     assert warning in [w.value for w in at.warning]
     pick(at, "b.mp4::1")
     assert warning not in [w.value for w in at.warning]
+
+
+def test_app_trajectory_progress_uses_recorded_csv_and_native_video(tmp_path,monkeypatch):
+    from bxjudge.output import row_to_result, write_trajectory
+    from tests.helpers import make_track
+
+    out=results_with_auto_snapshot(tmp_path)
+    row=read_rounds(out)[0]
+    snap=review_ui.row_calibration(out,row,autocalib=shipped_autocalib())
+    write_trajectory(out,row_to_result(row),{"X":make_track(1,"bey",{0:(200,180),1:(230,180)})},
+                     [],snap.calibration,30,{})
+    at=app_test(out,monkeypatch).run()
+    assert not at.exception,at.exception
+    assert len(at.get("video"))==2  # original footage plus seekable trajectory animation
+    assert "軌跡動畫" in _text(at) and "原影片時刻" in _text(at)
+    assert any(e.label=="靜態軌跡總覽" for e in at.expander)
+    widget(at.button,"確認無誤")
+
+
+def test_bad_reference_does_not_remove_human_review_controls(tmp_path,monkeypatch):
+    from bxjudge.output import row_to_result, write_trajectory
+    from tests.helpers import make_track
+    out=results_with_auto_snapshot(tmp_path);row=read_rounds(out)[0]
+    snap=review_ui.row_calibration(out,row,autocalib=shipped_autocalib())
+    write_trajectory(out,row_to_result(row),{"X":make_track(1,"bey",{0:(200,180)})},[],snap.calibration,30,{})
+    Path(snap.calibration.ref_frame).write_bytes(b"")
+    at=app_test(out,monkeypatch).run()
+    assert not at.exception,at.exception
+    widget(at.button,"確認無誤")
+    assert at.warning
