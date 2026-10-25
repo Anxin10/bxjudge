@@ -147,7 +147,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   detection_config=Path(args.config).expanduser(), limit=args.limit,
                   vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser(),
                   autocalib_config=Path(args.autocalib).expanduser(),
-                  rejudge=args.rejudge)
+                  rejudge=args.rejudge,
+                  trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
     except (ValueError, OSError, RuntimeError) as error:
         if args.debug:
             raise
@@ -163,6 +164,7 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--out", help="defaults to results/<folder name>")
     p.add_argument("--selection", default="weights/selected.json",
                    help="explicit selected detector manifest; synthetic output requires review")
+    p.add_argument("--trt-manifest", help="verified RF-DETR TensorRT export manifest (no fallback)")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")
     p.add_argument("--config", default="config/detection.yaml")

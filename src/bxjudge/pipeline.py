@@ -514,6 +514,7 @@ def run_batch(
     out_dir: Path,
     *,
     selection: Path = Path("weights/selected.json"),
+    trt_manifest: Path | None = None,
     thresholds: Path = Path("config/thresholds.yaml"),
     rules_path: Path = Path("config/rules.yaml"),
     detection_config: Path = Path("config/detection.yaml"),
@@ -564,6 +565,8 @@ def run_batch(
     if vlm is not None and not vlm.after_run:
         vlm = None
     provenance = None
+    if trt_manifest is not None and detector is not None:
+        raise ValueError("trt_manifest cannot be combined with an injected detector")
     if detector is None:
         provenance = _load_selection(Path(selection).expanduser(), th)
         provenance["runtime"] = {
@@ -578,12 +581,18 @@ def run_batch(
             "thresholds": asdict(th),
             "rules": asdict(rules),
         }
+        backend_options = {} if trt_manifest is None else {"trt_manifest": trt_manifest}
         detector = load_detector(
             provenance["kind"],
             Path(provenance["weights"]),
             config=detection_config,
             thresholds=th,
+            **backend_options,
         )
+        if trt_manifest is not None:
+            provenance["runtime"]["detector"] = detector.runtime
+        else:
+            provenance["runtime"]["detector"] = {"backend": "pytorch"}
     db = out_dir / "processed_videos.json"
     failures = []
 

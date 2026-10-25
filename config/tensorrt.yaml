@@ -1,0 +1,4 @@
+# Static single-frame RF-DETR export; FP16-enabled mixed precision, FP32 input.
+fp16: true
+batch_size: 1
+opset_version: 17

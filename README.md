@@ -483,3 +483,24 @@ SHA256 `c0950dba96979d99c88a53bd7114c8bf1b2b4ff470875f475cbe1dcdeed26541`）：
 - 第 12 版追加「Barrel Griffon 分離的 barrel 不算 burst」。偵測類別 `bey_part` 無法分辨
   這個零件，若只因該 barrel 脫落而判 burst 會判錯，相關對戰需人工覆核。
 - 不判斷搶拍 / 慢拍（フライング、後出し）：本系統不使用音軌（spec §3）。
+### RF-DETR TensorRT 後端（本機選用，無自動 fallback）
+
+已驗證環境：WSL Ubuntu、RTX 3090、CUDA 13.2 PyTorch、RF-DETR 1.11.2、TensorRT-cu13 10.16.1.11。TensorRT 引擎只用於同 GPU 型號／compute capability 與相同套件版本；更換環境或 checkpoint 後重新匯出。
+
+```bash
+cd /home/<user>/bxjudge
+uv sync --frozen --extra tensorrt
+# out 必須是不存在的新目錄；匯出完成才會發布 manifest.json。
+uv run --no-sync python scripts/export_rfdetr_trt.py \
+  runs/train-rfdetr-20261023b/fit/checkpoint_best_total.pth \
+  --out weights/rfdetr-trt
+uv run --no-sync bxjudge run ~/bx/videos/20261001 --calib calib \
+  --trt-manifest weights/rfdetr-trt/manifest.json \
+  --out results/20261001-trt --rejudge
+```
+
+`config/tensorrt.yaml` 管理匯出設定；解析度仍唯一來自 `config/thresholds.yaml`。這是 FP16-enabled mixed precision（輸入 FP32），不是所有層都強制 FP16。原 RF-DETR RGB 前處理、座標／類別後處理、信心門檻及裁判規則不變。訓練與 `compare` 繼續使用原生後端，不會改寫原選模檔的量測。
+
+`--trt-manifest` 明確啟用 TensorRT；沒有這個參數則明確使用原生 PyTorch。指定後若引擎／權重雜湊、解析度、版本、GPU 或 tensor contract 不符，啟動會失敗，不切回其他後端。每回合 `detector_provenance.runtime.detector` 記錄實際引擎與雜湊。切換後端請使用新結果目錄或 `--rejudge`，因為普通重跑會保留未變影片的既有判定；已人工覆核的原始判定仍受保護。
+
+96 格實驗量測只包含 detector adapter，排除解碼、追蹤、事件、VLM。正式速度以 `bxjudge eval` 的完整牆鐘時間判斷；資料未經人工真值／稽核之前，不宣稱裁判準確率達標。校準未匹配影片繼續標示需重校。

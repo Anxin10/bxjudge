@@ -17,6 +17,15 @@ dependencies = [
     "streamlit>=1.66.1",
 ]
 
+[project.optional-dependencies]
+tensorrt = [
+    # Private upstream execution boundary is verified against these exact versions.
+    "rfdetr==1.11.2",
+    "tensorrt-cu13==10.16.1.11",
+    "onnx==1.23.2",
+    "polygraphy==0.53.6",
+]
+
 [project.scripts]
 bxjudge = "bxjudge.cli:main"
 
@@ -47,9 +56,15 @@ name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu132" }
 torchvision = { index = "pytorch-cu132" }
+tensorrt-cu13 = { index = "nvidia" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

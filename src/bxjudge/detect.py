@@ -35,6 +35,7 @@ class RFDETRDetector:
         weights: Path,
         conf: float | None = None,
         *,
+        trt_manifest: Path | None = None,
         config: Path | str = "config/detection.yaml",
         thresholds: Thresholds | Path | str = "config/thresholds.yaml",
     ):
@@ -48,6 +49,18 @@ class RFDETRDetector:
         self.inference_long_edge = th.infer_long_edge
         if not Path(weights).is_file():
             raise FileNotFoundError(weights)
+        artifact = None
+        if trt_manifest is not None:
+            from .tensorrt import load_trt_manifest
+
+            artifact = load_trt_manifest(
+                trt_manifest, weights, self.inference_long_edge
+            )
+        self.runtime = (
+            {"backend": "pytorch"}
+            if artifact is None
+            else {"backend": "tensorrt", **artifact}
+        )
         disable_uploads()
         from rfdetr import RFDETRNano
 
@@ -60,6 +73,10 @@ class RFDETRDetector:
         )
         if tuple(self.model.class_names) != CLASSES:
             raise ValueError(f"RF-DETR checkpoint class names must be {CLASSES}")
+        if artifact is not None:
+            from .tensorrt import attach_tensorrt
+
+            attach_tensorrt(self.model, artifact, cfg["device"])
 
     def __call__(self, frame: np.ndarray, frame_idx: int) -> list[Detection]:
         _check_frame(frame, frame_idx)
@@ -143,12 +160,21 @@ def load_detector(
     kind: Literal["rfdetr", "yolo26"],
     weights: Path,
     *,
+    trt_manifest: Path | None = None,
     conf: float | None = None,
     config: Path | str = "config/detection.yaml",
     thresholds: Thresholds | Path | str = "config/thresholds.yaml",
 ) -> Detector:
     if kind == "rfdetr":
-        return RFDETRDetector(weights, conf, config=config, thresholds=thresholds)
+        return RFDETRDetector(
+            weights,
+            conf,
+            config=config,
+            thresholds=thresholds,
+            trt_manifest=trt_manifest,
+        )
+    if trt_manifest is not None:
+        raise ValueError("--trt-manifest requires the rfdetr detector")
     if kind == "yolo26":
         return YOLODetector(weights, conf, config=config, thresholds=thresholds)
     raise ValueError(f"unknown detector kind: {kind}")
