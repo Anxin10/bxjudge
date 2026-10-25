@@ -238,10 +238,16 @@ def judge_video(
                     chain(prefix, frames), c, ref
                 ):
                     disp[f] = displacement
-                    if geometry is not None:
-                        geometry.update(f, image)
                     yield f, image
                 prefix.clear()
+
+            def aligned():
+                # Raw motion always uses untouched source pixels. Its producer can
+                # prepare the next frame while this worker aligns the current one.
+                with prefetched(measured(), cancelled=cancelled) as raw_frames:
+                    for f, image in raw_frames:
+                        geometry.update(f, image)
+                        yield f, image
 
             def detecting(image, f):
                 detections = detector(image, f)
@@ -252,7 +258,8 @@ def judge_video(
                             crops[(d.frame, tuple(d.box))] = crop
                 return detections
 
-            with prefetched(measured(), cancelled=cancelled) as prepared_frames:
+            prepared = aligned() if geometry is not None else measured()
+            with prefetched(prepared, cancelled=cancelled) as prepared_frames:
                 tracks = track_frames(
                     prepared_frames, detecting, info.fps, config=detection_config
                 )

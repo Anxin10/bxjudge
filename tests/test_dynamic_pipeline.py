@@ -249,3 +249,51 @@ def test_relocation_before_launch_still_requires_candidate_review(
         dynamic_config=DEFAULT_DYNAMIC_CONFIG,
     )
     assert "calibration_relocated" in r.review_reasons
+
+
+def test_raw_motion_preparation_overlaps_dynamic_alignment(tmp_path, monkeypatch, th, rules):
+    from threading import Event, get_ident
+
+    raw_second = Event()
+    alignment_first = Event()
+    raw_threads = set()
+    geometry_threads = set()
+    ref, c = stadium_scene(size=(640, 360))
+    c.ref_frame = str(tmp_path / "reference.png")
+    assert cv2.imwrite(c.ref_frame, ref)
+    monkeypatch.setattr(
+        pipeline, "iter_frames", lambda *a, **k: iter((f, ref) for f in range(40))
+    )
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
+
+    def raw(frames, *args):
+        for f, image in frames:
+            raw_threads.add(get_ident())
+            if f == 1:
+                raw_second.set()
+                assert alignment_first.wait(2)
+            yield f, image, 0.0
+
+    original = pipeline.DynamicCalibration.update
+
+    def geometry(self, f, image):
+        geometry_threads.add(get_ident())
+        if f == 0:
+            alignment_first.set()
+            assert raw_second.wait(2)
+        return original(self, f, image)
+
+    monkeypatch.setattr(pipeline, "iter_stadium_displacement", raw)
+    monkeypatch.setattr(pipeline.DynamicCalibration, "update", geometry)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"synthetic source identity")
+    [result] = pipeline.judge_video(
+        info(source), tmp_path, lambda *a: [], rules, th,
+        out_dir=tmp_path / "out", autocalib=shipped_autocalib(),
+        dynamic_config=DEFAULT_DYNAMIC_CONFIG,
+    )
+    assert "analysis_error" not in result.review_reasons
+    assert raw_threads and geometry_threads and raw_threads.isdisjoint(geometry_threads)
+    record = json.loads(next((tmp_path / "out/geometry").glob("*.json")).read_text())
+    assert [s["frame"] for s in record["samples"]] == list(range(40))

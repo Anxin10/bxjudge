@@ -184,6 +184,10 @@ def iter_frames(
             log.warning("cuda decode of %s failed (%s); retrying on cpu", path.name, e)
 
 
+class _PrefetchCancelled(CancelledError):
+    """Shared-event cancellation, distinct from an explicit source failure."""
+
+
 @contextmanager
 def prefetched(
     source: Iterator[tuple[int, np.ndarray]],
@@ -195,14 +199,16 @@ def prefetched(
     Only the producer advances/closes the source. Two queued frames bound memory;
     The source must observe the shared cancellation event (as iter_frames does).
     Exiting cancels decoding/backpressure and joins the producer before returning.
+    Normal exhaustion leaves the shared event unset so stages can be composed.
     A source failure is delivered after the frames already prepared, never hidden.
     """
     pending: Queue[tuple[int, np.ndarray] | BaseException | None] = Queue(maxsize=2)
-    stopped = cancelled
+    stopped = Event()
     failure = None
+    exhausted = False
 
     def send(value):
-        while not stopped.is_set():
+        while not stopped.is_set() and not cancelled.is_set():
             try:
                 pending.put(value, timeout=0.05)
                 return
@@ -214,7 +220,7 @@ def prefetched(
         error = None
         try:
             for item in source:
-                if stopped.is_set():
+                if stopped.is_set() or cancelled.is_set():
                     break
                 send(item)
         except BaseException as exc:  # noqa: BLE001 - forward worker failures to consumer
@@ -231,14 +237,19 @@ def prefetched(
             send(error)
 
     def consume():
+        nonlocal exhausted
         while True:
             if cancelled.is_set():
-                raise CancelledError("frame decoding cancelled")
+                worker.join()
+                if failure is not None:
+                    raise failure
+                raise _PrefetchCancelled("frame decoding cancelled")
             try:
                 item = pending.get(timeout=0.05)
             except Empty:
                 continue
             if item is None:
+                exhausted = True
                 return
             if isinstance(item, BaseException):
                 raise item
@@ -253,7 +264,13 @@ def prefetched(
         completed = True
     finally:
         stopped.set()
+        cancelled_here = not cancelled.is_set() and not exhausted
+        if not exhausted:
+            cancelled.set()
         worker.join()
         frames.close()
-        if completed and failure is not None:
-            raise failure
+        if completed and failure is not None:  # noqa: SIM102 - distinguish cleanup below
+            # Normal early exit may cancel an upstream prefetch waiting for data.
+            # Do not mistake our own cleanup for a source/close failure.
+            if not (cancelled_here and isinstance(failure, _PrefetchCancelled)):
+                raise failure

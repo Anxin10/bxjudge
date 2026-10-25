@@ -226,7 +226,8 @@ def test_prefetch_early_exit_reports_source_close_failure():
         next(frames)
 
 
-def test_prefetch_cancels_decoder_blocked_on_pipe(monkeypatch, tmp_path):
+@pytest.mark.parametrize("nested", [False, True])
+def test_prefetch_cancels_decoder_blocked_on_pipe(monkeypatch, tmp_path, nested):
     import sys
     import time
 
@@ -267,10 +268,14 @@ def test_prefetch_cancels_decoder_blocked_on_pipe(monkeypatch, tmp_path):
         tmp_path / "unused.mp4", start=0, end=None, out_w=2, out_h=2,
         hwaccel="cpu", first_index=0, skip=0, cancelled=cancelled,
     )
+    def transformed():
+        with prefetched(source, cancelled=cancelled) as ready:
+            yield from ready
+
     started = time.perf_counter()
     try:
         with pytest.raises(RuntimeError, match="detector failed"), prefetched(
-            source, cancelled=cancelled
+            transformed() if nested else source, cancelled=cancelled
         ) as frames:
             assert next(frames)[0] == 0
             assert blocked.wait(2)
@@ -317,3 +322,97 @@ def test_prefetch_external_cancel_never_returns_a_partial_success():
         cancelled.set()
         next(frames)
     assert closed.is_set()
+
+
+def test_nested_prefetch_completion_keeps_all_buffered_frames():
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    values = [(f, np.full((2, 2, 3), f, np.uint8)) for f in range(17)]
+
+    def transformed():
+        with prefetched(iter(values), cancelled=cancelled) as raw:
+            yield from raw
+
+    with prefetched(transformed(), cancelled=cancelled) as ready:
+        actual = list(ready)
+    assert [f for f, _ in actual] == list(range(17))
+    assert all(a[1] is b[1] for a, b in zip(actual, values, strict=True))
+    assert not cancelled.is_set()
+
+
+def test_nested_prefetch_processing_failure_preserves_original_error():
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    closed = Event()
+    error = ValueError("geometry failed")
+
+    def source():
+        try:
+            for f in range(100):
+                yield f, np.zeros((2, 2, 3), np.uint8)
+        finally:
+            closed.set()
+
+    def transformed():
+        with prefetched(source(), cancelled=cancelled) as raw:
+            for value in raw:
+                if value[0] == 3:
+                    raise error
+                yield value
+
+    with pytest.raises(ValueError) as caught, prefetched(
+        transformed(), cancelled=cancelled
+    ) as ready:
+        list(ready)
+    assert caught.value is error
+    assert closed.is_set()
+
+
+def test_nested_prefetch_normal_break_does_not_raise_its_own_cancellation():
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    outer_waiting = Event()
+    closed = Event()
+
+    def source():
+        try:
+            yield 0, np.zeros((2, 2, 3), np.uint8)
+            assert cancelled.wait(2)
+        finally:
+            closed.set()
+
+    def transformed():
+        with prefetched(source(), cancelled=cancelled) as raw:
+            yield next(raw)
+            outer_waiting.set()
+            yield from raw
+
+    with prefetched(transformed(), cancelled=cancelled) as ready:
+        assert next(ready)[0] == 0
+        assert outer_waiting.wait(2)
+    assert cancelled.is_set() and closed.is_set()
+
+
+def test_early_break_keeps_explicit_source_cancellation_error():
+    from concurrent.futures import CancelledError
+
+    from bxjudge.video import prefetched
+
+    cancelled = Event()
+    failed = Event()
+    error = CancelledError("source cancellation failure")
+
+    def source():
+        yield 0, np.zeros((2, 2, 3), np.uint8)
+        failed.set()
+        raise error
+
+    with pytest.raises(CancelledError) as caught, prefetched(
+        source(), cancelled=cancelled
+    ) as ready:
+        next(ready)
+        assert failed.wait(2)
+    assert caught.value is error
