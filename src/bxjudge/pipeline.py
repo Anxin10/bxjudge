@@ -50,7 +50,8 @@ from .finish import (
     spin_activity,
     stop_frame,
 )
-from .launch_check import analyze_launch, assign_sides
+from .identity import anchor_sides, inherited_sides
+from .launch_check import analyze_launch
 from .launch_phase import load_launch_policy, prepare_launch_tracks
 from .manifest import (
     VideoInfo,
@@ -267,10 +268,17 @@ def judge_video(
         side_hints = {}
         geometry_evidence = None
         if geometry is not None:
-            side_hints = assign_sides(normalize_tracks(tracks, geometry.samples), c)
-            phase = prepare_launch_tracks(
-                tracks, info.fps, load_launch_policy(), side_hints=side_hints
+            phase_policy = load_launch_policy()
+            anchors = anchor_sides(
+                normalize_tracks(tracks, geometry.samples), c,
+                required_frames=max(2, math.ceil(phase_policy["held_s"] * info.fps)),
+                body_margin_px=phase_policy["body_margin_px"],
+                source_frames={t.track_id: [d.frame for d in t.dets] for t in tracks},
             )
+            phase = prepare_launch_tracks(
+                tracks, info.fps, phase_policy, side_hints=anchors.sides
+            )
+            side_hints = inherited_sides(anchors.sides, phase.members)
             tracks = phase.tracks
             with info.path.open("rb") as source:
                 source_sha = hashlib.file_digest(source, "sha256").hexdigest()
@@ -282,8 +290,12 @@ def judge_video(
                 "source": str(info.path.resolve()),
                 "source_sha256": source_sha,
                 "follow_policy": load_video_policy()["stadium_follow"],
-                "phase_policy": load_launch_policy(),
+                "phase_policy": phase_policy,
                 "phase": phase.record(),
+                "identity": {
+                    "anchors": anchors.record(),
+                    "sides": {str(k): v for k, v in side_hints.items()},
+                },
             }
             geometry_evidence = save_geometry(out_dir, info.path.name, record)
         raw_tracks = tracks
@@ -389,7 +401,20 @@ def judge_video(
                     geometry.samples[f].segment > 0 for f in range(start, end + 1)
                 ):
                     dynamic_notes.append("calibration_relocated")
-                active_ids = {t.track_id for t in current}
+                # Geometry may hide a raw unidentified opponent. Its absence in
+                # normalized tracks cannot turn it into evidence for a winner.
+                active_ids = {
+                    t.track_id for t in raw_tracks
+                    if t.cls == "bey" and any(start <= d.frame <= end for d in t.dets)
+                }
+                unanchored = sorted(active_ids - side_hints.keys())
+                dynamic_notes.extend(f"identity_unanchored@{tid}" for tid in unanchored)
+                if unanchored:
+                    # Unidentified observations may belong to a missing opponent.
+                    finish = type(finish)(
+                        None, None, None, 0.0,
+                        [*finish.reasons, "identity_unanchored"],
+                    )
                 dynamic_notes.extend(
                     n for n in phase.notes if int(n.rsplit("@", 1)[1]) in active_ids
                 )

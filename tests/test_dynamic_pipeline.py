@@ -45,6 +45,13 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
         return original(current, *a, **k)
 
     monkeypatch.setattr(pipeline, "analyze_launch", analyze)
+    # Even an apparently confident downstream event must not choose the
+    # winner while a real observed top has no launch identity anchor.
+    from bxjudge.finish import FinishResult
+
+    monkeypatch.setattr(
+        pipeline, "detect_finish", lambda *a: FinishResult("over", "B", 70, 0.95, [])
+    )
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"source bytes")
     [r] = pipeline.judge_video(
@@ -63,7 +70,15 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
     assert record.is_file()
     data = json.loads(record.read_text())
     assert data["calibration_id"] == r.calibration_id
-    assert set(r.motion_evidence["displacements"].values()) == {5.0}
+    assert data["identity"]["sides"] == {}
+    assert "identity_unanchored@1" in r.review_reasons
+    assert "identity_unanchored@2" in r.review_reasons
+    assert r.needs_review and r.finish is None and r.winner is None
+    # Missing identity extends the launch window to its configured cap. Frames
+    # beyond the decoded clip remain unknown, never manufactured as no motion.
+    values = r.motion_evidence["displacements"]
+    assert all(v == (5.0 if int(f) < 80 else None) for f, v in values.items())
+    assert 5.0 in values.values()
     csv = next((tmp_path / "out/trajectories").glob("*.csv")).read_text()
     assert "262.0,212.0" in csv
 

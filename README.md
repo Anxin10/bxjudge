@@ -19,9 +19,9 @@ f1618 的深色 X／淺色 B 修訂另存版本，原提交、預測與瀏覽器
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --site runs/dynamic-referee-20261025 \
-  --results runs/identity-continuation-20261026/pilot \
+  --results runs/identity-recovery-20261026/pilot \
   --human-results runs/trt-final-20261025/pilot \
-  --evidence runs/identity-continuation-20261026/evidence \
+  --evidence runs/identity-recovery-20261026/evidence \
   --core-commit "$(git rev-parse HEAD)"
 ```
 
@@ -32,15 +32,24 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
 
 ### 軌跡接續現況
 
-兩支開發原片在本輪完整重跑，陀螺軌跡由 30 條降為 29 條，僅接回第二片 f1021
-的 4→6 同格交接。66 個既有人工物件仍能精確追溯且沒有 X／B 標記衝突；其餘碎片
-尚未解決，不能把軌跡減少當作整體身分或勝負準確率通過。
+動態裁判以發射前的陀螺與發射器區域連續觀測建立 X／B 身分，再沿已通過接續檢查的
+成員繼承。中途跑到另一側，不會按當時畫面左右重新命名；沒有足夠證據就保留未知。
+這項區域證據不代表機械接合，也不決定物理分離時點。
+
+建立身分需 `held_s` 對應的連續原始影格，陀螺在發射區聯集、近身發射器只有同一個
+區域身分且沒有矛盾。真漏偵可重新累積；已有觀測但對位失敗時，不能跨過後定錨。
+身分與證據寫在 geometry 的 `identity`；有效但未知身分的陀螺會要求覆核並禁止自動勝方。
+舊的靜態模式仍是明確的獨立流程，不能把其半邊判定當成動態身分錨點。
+
+前輪完整重跑的軌跡為 30→29，本輪相同偵測重播與完整原片重跑皆為 27 條（累計三次交接）。完整處理時間
+225.56 秒；正式速度 gate 為 0.882 PASS（關閉 VLM，兩支開發原片）。66 筆重複使用的開發影格觀測中，目前38筆指派與人工一致、
+28筆未知、0筆指派不一致；未知不計入判對。這不是獨立身分或勝負準確率驗收。
 
 接續沿用互相唯一、速度、方向、尺度與位置條件。短暫重疊必須每格有雙方實際框且
-IoU 達 `config/launch_phase.yaml` 門檻；既有 side 提示矛盾時拒絕。共用影格保留較早
+IoU 達 `config/launch_phase.yaml` 門檻；相反身分錨點拒絕接續。共用影格保留較早
 軌跡的觀測，被取代原始框及分數另存於 geometry 的 `phase.joins`，成員 ID 在
 `phase.members`。不插補漏格、不中斷追溯，也不以此推定物理分離。接續結果仍加上
-`identity_join_requires_review`，保持人工覆核。
+`identity_join_requires_review`，保持人工覆核。其餘軌跡碎片仍待解決。
 
 ## 環境設定
 
