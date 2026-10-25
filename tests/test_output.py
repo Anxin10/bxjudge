@@ -130,7 +130,7 @@ def test_trajectory_all_zones_source_indices_and_scaled_reference(
     assert {r["zone"] for r in rows if r["side"] == "X"} == {"battle_area"}
     assert {r["zone"] for r in rows if r["side"] == "B"} == {"xtreme"}
     assert rows[-1]["side"] == ""
-    assert len(seen) >= 8 and cv2.imread(str(png_p)).shape == (360, 640, 3)
+    assert len(seen) >= 8 and cv2.imread(str(png_p)).shape == (446, 640, 3)
 
 
 def test_trajectory_missing_observation_is_explicit(tmp_path):
@@ -166,7 +166,7 @@ def test_trajectory_labels_stay_inside_image(tmp_path, monkeypatch):
         return original(image, label, position, font, size, color, thickness, *args)
 
     monkeypatch.setattr(cv2, "putText", text)
-    output.write_trajectory(
+    _, png = output.write_trajectory(
         tmp_path,
         rr("spin", "X"),
         {"X": make_track(1, "bey", {0: (638, 358)})},
@@ -176,7 +176,7 @@ def test_trajectory_labels_stay_inside_image(tmp_path, monkeypatch):
         {"finish": 0},
     )
     assert all(
-        x >= 0 and y >= height and x + width <= 640 and y + baseline <= 360
+        x >= 0 and y >= height and x + width <= 640 and y + baseline <= cv2.imread(str(png)).shape[0]
         for (x, y), width, height, baseline in positions
     )
 
@@ -338,3 +338,51 @@ def test_vlm_timing_run_ids_accumulate_and_a_new_analysis_resets_them(tmp_path, 
     assert "vlm_run_ids" not in e and e["judgment_sources"][0]["run_id"] == "r4"
     with pytest.raises(ValueError, match="run_id"):
         output.record_video_timing(tmp_path, "a.mp4", 10.0, 2.0, wall_s=2.0, run_id="", produced_rounds={1})
+
+
+def test_trajectory_side_colors_and_observed_endpoints(tmp_path):
+    c = cal_with(make_ref_img(), tmp_path)
+    bey = {
+        "X": make_track(1, "bey", {30: (100, 150), 31: (120, 150), 32: (140, 150)}),
+        "B": make_track(2, "bey", {30: (100, 230), 31: (120, 230), 32: (140, 230)}),
+    }
+    unknown = make_track(9, "bey", {30: (100, 280), 31: (120, 280), 32: (140, 280)})
+    csv_p, png_p = output.write_trajectory(
+        tmp_path, rr("spin", "X"), bey, [], c, 30, {}, unassigned=[unknown]
+    )
+    image = cv2.imread(str(png_p))
+    orange, blue, gray = (0, 159, 230), (178, 114, 0), (150, 150, 150)
+    for y, color in [(150, orange), (230, blue), (280, gray)]:
+        assert tuple(image[y, 120]) == color  # actual contiguous trajectory
+        assert tuple(image[y + 7, 100]) == color  # start circle
+        assert tuple(image[y + 3, 143]) == color  # end tilted cross
+    rows = list(csv.DictReader(csv_p.open()))
+    assert {row["side"] for row in rows if row["track_id"] == "9"} == {""}
+    assert {row["side"] for row in rows if row["track_id"] == "1"} == {"X"}
+
+
+def test_trajectory_endpoint_labels_use_frame_order_and_show_unknown_identity(tmp_path, monkeypatch):
+    c = cal_with(make_ref_img(), tmp_path)
+    labels = []
+    original = cv2.putText
+    def text(image, label, *args, **kwargs):
+        labels.append(label)
+        return original(image, label, *args, **kwargs)
+    monkeypatch.setattr(cv2, "putText", text)
+    unordered = make_track(9, "bey", {35: (300, 180), 30: (200, 180)})
+    output.write_trajectory(tmp_path, rr(None, None), {}, [], c, 30, {}, unassigned=[unordered])
+    assert "? #9 start f30" in labels
+    assert "? #9 end f35" in labels
+    assert "X side" in labels and "B side" in labels
+    assert "Unknown side / fragments" in labels
+
+
+def test_trajectory_legend_does_not_cover_observed_evidence(tmp_path):
+    c = cal_with(make_ref_img(), tmp_path)
+    bey = {"X": make_track(1, "bey", {0: (30, 20), 1: (160, 20)})}
+    part = make_track(2, "bey_part", {1: (250, 40)})
+    _, png = output.write_trajectory(tmp_path, rr("burst", "X"), bey, [part], c, 30, {"finish": 1})
+    image = cv2.imread(str(png))
+    assert tuple(image[20, 100]) == (0, 159, 230)
+    assert tuple(image[40, 250]) == (0, 255, 255)
+    assert image.shape == (446, 640, 3)  # footer outside the original 360px evidence frame

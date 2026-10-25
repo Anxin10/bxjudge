@@ -141,8 +141,9 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
     png = trajectory_png(out, row["video"], row["round"])
     if png.is_file():
         st.image(
-            str(png), caption=f"{png.name}（X 藍、B 紅；缺失觀測不連線）", width="stretch"
+            str(png), caption=f"{png.name}（X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認）", width="stretch"
         )
+        st.caption("起點／終點是每段軌跡的首末觀測位置，不等於發射／停止位置；缺失觀測不連線。")
     else:
         st.info(f"此回合沒有軌跡圖（{png}）。")
 
