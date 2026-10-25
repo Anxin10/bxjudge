@@ -3,6 +3,32 @@
 Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X match videos）。
 所有程式都在 WSL2 Ubuntu 內執行；影片不上傳到任何雲端服務。
 
+## 本機統一工作台（目前開發資料）
+
+固定入口：<http://127.0.0.1:8504/>。首頁集中最新試跑、先前人工覆核、X／B 身分對照
+與中心接合原尺寸裁切；`launch-motion/` 等實驗頁保留為研究紀錄。此網址只在本機服務
+運行時可用。頁面是建置時的快照，新的判定或人工修訂後須重新建置。
+
+目前展示兩支開發原片，核心速度評估關閉 VLM；不能代表 109 支整批、獨立準確率或
+完整 VLM 處理速度。舊資料的三回合已覆核，與新 AI 試跑的待覆核狀態分開呈現。
+f1618 的深色 X／淺色 B 修訂另存版本，原提交、預測與瀏覽器草稿不改寫；修正標註
+不代表模型已改善，軌跡碎片與中心／勾爪接合模型仍待驗證。
+
+在 repo 根目錄建置既有資料的唯讀首頁（不啟動模型）：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
+  --site runs/dynamic-referee-20261025 \
+  --results runs/long-profile-20261026/full-originals-staged \
+  --human-results runs/trt-final-20261025/pilot \
+  --evidence runs/unified-workbench-20261026 \
+  --core-commit 4db135807d91592cd72e397f156b086655159b3f
+```
+
+`--core-commit` 記錄輸入結果實際量測的版本，不是首頁產生器版本。首頁來源與 SHA-256
+列於 `/_workbench/snapshot.json`。建置保留舊首頁與子頁備份，僅增加工作台導覽；
+不會重設原逐格核對頁的儲存端點或草稿。
+
 ## 環境設定
 
 ```bash
