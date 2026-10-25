@@ -19,5 +19,6 @@ stadium_follow:
   max_scale: 1.03
   min_edge_score: 0.65
   min_region_score: 0.65
-  ecc_iterations: 50
+  # Validated on 376 real frames + 232 controls; confidence/geometry gates unchanged.
+  ecc_iterations: 10
   ecc_epsilon: 0.00001
