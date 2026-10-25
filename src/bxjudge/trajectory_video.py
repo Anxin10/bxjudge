@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import yaml
 
-from . import autocalib, calibration, geometry
+from . import autocalib, calibration, dynamic_calibration, geometry, launch_phase
 from . import stadium_follow as follow
 from . import trajectory_plot as plot
 from .calibration import scale_calibration
@@ -35,7 +35,15 @@ _RENDERER_ID = hashlib.sha256(
     Path(__file__).read_bytes()
     + b"".join(
         Path(m.__file__).read_bytes()
-        for m in (plot, follow, autocalib, calibration, geometry)
+        for m in (
+            plot,
+            follow,
+            autocalib,
+            calibration,
+            geometry,
+            dynamic_calibration,
+            launch_phase,
+        )
     )
     + cv2.__version__.encode()
 ).hexdigest()
@@ -194,6 +202,9 @@ def animation_frames(
     coordinate_size,
     reference=None,
     background_frames=None,
+    dynamic_policy=None,
+    recorded_geometry=None,
+    source_fps=None,
 ):
     start, end = _bounds(row, points)
     scale = min(1.0, cfg["max_long_edge"] / max(coordinate_size))
@@ -202,10 +213,14 @@ def animation_frames(
     sx, sy = size[0] / coordinate_size[0], size[1] / coordinate_size[1]
     base = plot.base_image(scaled, reference)
     follower = (
-        follow.StadiumFollower(
+        dynamic_calibration.DynamicCalibration(
             scaled,
             cv2.imread(c.ref_frame) if reference is None else reference,
+            cfg["fps"],
             cfg["stadium_follow"],
+            dynamic_calibration.load_dynamic_policy()
+            if dynamic_policy is None
+            else dynamic_policy,
         )
         if background_frames is not None
         else None
@@ -270,7 +285,31 @@ def animation_frames(
                     "source footage ended before the trajectory timeline"
                 ) from error
             background = cv2.resize(background, size, interpolation=cv2.INTER_AREA)
-            alignment = follower.align(background)
+            if recorded_geometry is None:
+                sample = follower.update(index, background)
+                alignment = sample.alignment
+                status = sample.status
+            else:
+                frame_number = _frame_number(current, source_fps)
+                sample = recorded_geometry["samples"].get(frame_number)
+                alignment = (
+                    None
+                    if sample is None or sample["alignment"] is None
+                    else autocalib.Alignment(
+                        **{
+                            **sample["alignment"],
+                            "homography": tuple(
+                                tuple(float(v) for v in r)
+                                for r in _resize_recorded_h(
+                                    sample["alignment"]["homography"],
+                                    recorded_geometry["reference_size"],
+                                    size,
+                                )
+                            ),
+                        }
+                    )
+                )
+                status = "missing" if sample is None else sample["status"]
             if alignment is None:
                 image = background.copy()
                 alignment_status = ("Alignment lost: zones hidden", (80, 80, 255))
@@ -278,7 +317,7 @@ def animation_frames(
                 moved = autocalib.warp_calibration(scaled, alignment, size, scaled.name)
                 image = plot.base_image(moved, background)
                 alignment_status = (
-                    f"Follow preview: {alignment.score:.2f}",
+                    f"{'Recorded geometry' if recorded_geometry is not None else 'Follow preview'}: {alignment.score:.2f} {status}",
                     (80, 200, 80),
                 )
         mask = np.any(canvas != 0, axis=2)
@@ -430,6 +469,7 @@ def generate_trajectory_video(
     out: Path, row: dict, c: Calibration, *, source: Path, config=DEFAULT_VIDEO_CONFIG
 ) -> Path:
     cfg = load_video_policy(config)
+    dynamic_policy = dynamic_calibration.load_dynamic_policy()
     csv_path = trajectory_png(out, row["video"], row["round"]).with_suffix(".csv")
     raw = csv_path.read_bytes()
     points = _parse_observations(raw)
@@ -449,6 +489,10 @@ def generate_trajectory_video(
         raise ValueError("cannot decode recorded calibration reference") from error
     if reference is None:
         raise ValueError("cannot decode recorded calibration reference")
+    recorded_geometry = None
+    evidence = row.get("geometry_evidence")
+    if evidence is not None:
+        recorded_geometry = dynamic_calibration.read_geometry(out, row, source_before)
     timing = {key: row[key] for key in ("t_launch", "t_end", "finish", "landing_frame")}
     metadata = json.dumps(
         {
@@ -456,6 +500,8 @@ def generate_trajectory_video(
             "coordinate_size": coordinate_size,
             "timing": timing,
             "policy": cfg,
+            "dynamic_policy": dynamic_policy,
+            "recorded_geometry": evidence,
             "renderer": _RENDERER_ID,
             "source": {
                 "path": str(source),
@@ -491,6 +537,9 @@ def generate_trajectory_video(
                         coordinate_size=coordinate_size,
                         reference=reference,
                         background_frames=backgrounds,
+                        dynamic_policy=dynamic_policy,
+                        recorded_geometry=recorded_geometry,
+                        source_fps=info.fps,
                     ),
                     pending,
                     cfg,
@@ -503,3 +552,10 @@ def generate_trajectory_video(
             )
         pending.replace(output)
     return output
+
+
+def _resize_recorded_h(matrix, source_size, display_size):
+    scale = np.diag(
+        [display_size[0] / source_size[0], display_size[1] / source_size[1], 1.0]
+    )
+    return scale @ np.array(matrix) @ np.linalg.inv(scale)

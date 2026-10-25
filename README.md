@@ -518,3 +518,15 @@ uv run --no-sync bxjudge run ~/bx/videos/20261001 --calib calib \
 `config/detection.yaml` 的 `candidate_confidence` 僅供 `run` 的 ByteTrack 關聯；原 `confidence`（0.3）仍是裁判證據門檻。正式預設兩者皆為0.3：0.1候選門檻在兩支實片未改善追蹤，未採用為預設。實驗可透過完整的 `--config` 設定明確降低候選門檻，以下安全邊界一律適用。弱框不寫入交給裁判的軌跡、CSV 或旋轉影像，不因低分配對取得內部 ID 就提升成可信軌跡。只有高分種子再獲得高分配對才會輸出。長時間沒有高分觀測時，依 ByteTrack 原有失聯秒數上限切斷關聯，低分更新不能無限續命。
 
 `run` 的 provenance 記錄兩種門檻。偵測器獨立預設及 `compare` 的 `evaluation_confidence` 不變。設定缺欄位或讓弱框門檻／啟動條件繞過證據門檻會明確報錯。這個修正處理短漏偵的接線，不代表碰撞後的 X/B 身分已驗收；duplicate、missing、gap、id-swap 覆核仍保留。已人工覆核結果不受覆寫，修正比較應使用新的結果資料夾。
+
+### 動態校準參與裁判（明確啟用）
+
+`bxjudge run <影片資料夾> --calib calib --out <新的結果資料夾> --dynamic-calibration config/dynamic_calibration.yaml --trt-manifest weights/rfdetr-trt/manifest.json --no-vlm`
+
+小幅對位門檻仍取 `config/trajectory_video.yaml` 的 `stadium_follow`。持續拒絕才依 `config/dynamic_calibration.yaml` 定時對原始快照做較大範圍重新定位；候選須高分且多次一致，才建立新段。失敗影格保持未知，不延用上一格或回填。短暫遮擋後也需連續有效觀測才恢復顯示，避免接受／拒絕交替閃爍。
+
+動態模式的裁判觀測逆變換至基準盤面，原始影片裁切與CSV的x/y保持來源影格座標；CSV的zone依裁判座標計算，無幾何為unknown。原始盤面晃動仍相對本影片first-second frame量測，沒有先穩定畫面再量晃動。`geometry/` 使用內容雜湊檔名保存逐格矩陣、有效狀態、重新定位段、設定、來源影片雜湊及發射／碎片處理紀錄；回合以path及SHA256引用。動態回放、事件截圖與VLM影格讀取該次保存的幾何，不能重新套用當前校準。證據缺損則明確提示，不回退成固定區域。
+
+`config/launch_phase.yaml` 僅在動態模式啟用：以實際發射器身體觀測確認掛載及分離，排除已證明的前置掛載觀測；發射器消失不算分離，不以落地或終結倒推發射，也不延長既有3秒期限。短缺口碎片僅在位置／速度相容且前後候選唯一時接續，沒有插點；任何接續仍標記identity_join_requires_review，不能將ID數量下降當成X/B真值驗收。未觀察到分離者標記launch_release_unobserved。動態幾何缺失會阻止自動出界結論，重新定位段須覆核。
+
+新模式使用新out做比較最清楚；相同out在模式或設定改變時會重新分析，已覆核回合仍依原有保護規則保留。需重新測量含逐格對位的完整wall time；舊TensorRT速度PASS不適用本模式。原先靜態模式保留作實驗基準，動態失敗絕不自動切回靜態。

@@ -147,6 +147,7 @@ def row_to_result(row: dict) -> RoundResult:
         match_start=match_start,
         audit_sample=audit_sample,
         calibration_id=calibration_id,
+        geometry_evidence=row.get("geometry_evidence"),
         launch=launch,
         spin_dir={s: row[f"{s.lower()}_spin_dir"] for s in ("X", "B")}
         if row["spin_dir_present"]
@@ -546,6 +547,7 @@ def write_trajectory(
     events: dict[str, int | None],
     *,
     unassigned: list[Track] | None = None,
+    judgment_tracks: list[Track] | None = None,
 ) -> tuple[Path, Path]:
     png_p = trajectory_png(out_dir, r.video, r.round)
     csv_p = png_p.with_suffix(".csv")
@@ -555,6 +557,7 @@ def write_trajectory(
     def label(text, point, size, color):
         plot.label(image, text, point, size, color)
 
+    judgment_centres=None if judgment_tracks is None else {t.track_id:t.centers() for t in judgment_tracks}
     rows = []
     for side, track in [
         *bey.items(),
@@ -565,6 +568,10 @@ def write_trajectory(
         for f in range(track.first_frame(), track.last_frame() + 1):
             d = observations.get(f)
             x, y = centers[f] if d else (None, None)
+            zone=zone_of((x,y),c) if d else "unknown"
+            if judgment_centres is not None:
+                point=judgment_centres.get(track.track_id,{}).get(f)
+                zone="unknown" if point is None else zone_of(point,c)
             rows.append(
                 {
                     "frame": f,
@@ -574,7 +581,7 @@ def write_trajectory(
                     "cls": track.cls,
                     "x": x,
                     "y": y,
-                    "zone": zone_of((x, y), c) if d else "unknown",
+                    "zone": zone,
                     "score": d.score if d else None,
                 }
             )
@@ -629,3 +636,11 @@ def write_trajectory(
     pending.write_text(json.dumps({"coordinate_size": list(c.frame_size), "csv_sha256": csv_hash}) + "\n")
     pending.replace(metadata)
     return csv_p, png_p
+
+
+def record_video_analysis_policy(out_dir,video,policy):
+    """Latest successful attempt mode; never inferred from immutable reviewed rows."""
+    path=Path(out_dir)/'videos.json'
+    rows=_read_json(path,{})
+    rows[video]['analysis_policy']=policy
+    _write_json(path,rows)

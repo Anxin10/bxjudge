@@ -1,0 +1,10 @@
+# Observed launcher-body support only; never infer release from landing or finish.
+held_s: 0.2
+separation_s: 0.1
+body_margin_px: 12.0
+link_gap_s: 0.12
+link_error_px: 24.0
+link_scale_ratio: 1.5
+link_min_direction_cos: 0.5
+link_velocity_error_px_s: 120.0
+link_min_speed_px_s: 15.0

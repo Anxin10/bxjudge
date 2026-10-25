@@ -112,3 +112,6 @@ class RoundResult:
     # Id of the calibration snapshot (<results>/calibrations/<id>.json) the round was judged
     # with; None for a placeholder judged without one (e.g. recalibrate). JSON-only metadata.
     calibration_id: str | None = None
+
+    # Content-addressed per-frame moving-stadium geometry when dynamic judging is enabled.
+    geometry_evidence: dict | None = None

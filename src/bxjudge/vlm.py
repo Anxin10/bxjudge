@@ -615,6 +615,7 @@ def event_frames(
     snapshot: Snapshot,
     config: VlmConfig,
     th: Thresholds,
+    *, geometry_record=None,
 ) -> list[np.ndarray]:
     """``config.frames`` frames spread over ``t +- event_window_s`` playback seconds.
 
@@ -631,7 +632,7 @@ def event_frames(
     with closing(
         iter_frames(
             source,
-            start=lo,
+            start=0 if geometry_record is not None else lo,
             end=hi + 1 / info.fps,
             long_edge=config.image_long_edge,
             hwaccel=th.decode_hwaccel,
@@ -646,7 +647,18 @@ def event_frames(
         raise VlmFramesError(f"{source}: no frames decoded in [{lo:.2f}, {hi:.2f}] s")
     first = next(iter(picked.values()))
     scaled = scale_calibration(snapshot.calibration, (first.shape[1], first.shape[0]))
-    return [overlay_zones(frame, scaled, idx / info.fps) for idx, frame in sorted(picked.items())]
+    images=[]
+    for idx,frame in sorted(picked.items()):
+        current=scaled
+        if geometry_record is not None:
+            from .dynamic_calibration import recorded_calibration
+            current=recorded_calibration(snapshot.calibration,geometry_record,idx,(frame.shape[1],frame.shape[0]))
+        if current is None:
+            image=frame.copy()
+            _label(image,'Recorded geometry unknown - zones hidden',(12,28),_TIME_COLOR)
+        else:image=overlay_zones(frame,current,idx/info.fps)
+        images.append(image)
+    return images
 
 
 # --------------------------------------------------------------------------- results directory
@@ -769,7 +781,14 @@ def review_results_dir(
                 snapshot = _row_snapshot(out_dir, r, snapshots, vetoed, autocalib=autocalib)
                 if isinstance(source, str):
                     raise VlmFramesError(source)
-                return event_frames(source, event_time(r), snapshot, session.config, th)
+                options={}
+                if r.geometry_evidence is not None:
+                    import hashlib
+
+                    from .dynamic_calibration import read_geometry
+                    with source.open('rb') as f:source_sha=hashlib.file_digest(f,'sha256').hexdigest()
+                    options['geometry_record']=read_geometry(out_dir,{'geometry_evidence':r.geometry_evidence,'calibration_id':r.calibration_id},source_sha)
+                return event_frames(source, event_time(r), snapshot, session.config, th,**options)
 
             sent = len(session.requests)
             reviewed = review_low_confidence(results, get_frames, session=session)

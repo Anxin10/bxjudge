@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -33,6 +34,12 @@ from .calibration_store import (
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
+from .dynamic_calibration import (
+    DynamicCalibration,
+    load_dynamic_policy,
+    normalize_tracks,
+    save_geometry,
+)
 from .finish import (
     AFTER_FINISH_PREFIX,
     detect_finish,
@@ -42,7 +49,8 @@ from .finish import (
     spin_activity,
     stop_frame,
 )
-from .launch_check import analyze_launch
+from .launch_check import analyze_launch, assign_sides
+from .launch_phase import load_launch_policy, prepare_launch_tracks
 from .manifest import (
     VideoInfo,
     forget_processed,
@@ -55,6 +63,7 @@ from .output import (
     TRANSIENT_FAILURES,
     read_rounds,
     record_run_timing,
+    record_video_analysis_policy,
     record_video_attempt,
     record_video_calibration,
     record_video_status,
@@ -66,6 +75,7 @@ from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
+from .trajectory_video import load_video_policy
 from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames
 from .vlm import load_vlm_config, review_results_dir
@@ -135,7 +145,9 @@ def first_second_frame(info: VideoInfo, th: Thresholds) -> np.ndarray:
     return last
 
 
-_SELECT = object()  # judge_video default: select the snapshot from the decoded first second
+_SELECT = (
+    object()
+)  # judge_video default: select the snapshot from the decoded first second
 
 
 def judge_video(
@@ -150,6 +162,7 @@ def judge_video(
     detection_config: Path | str = "config/detection.yaml",
     autocalib: AutoCalibConfig,
     snapshot: Snapshot | None | object = _SELECT,
+    dynamic_config: Path | None = None,
     on_snapshot: Callable[[Snapshot | None], None] | None = None,
     vetoed: set[str] | frozenset[str] = frozenset(),
 ) -> list[RoundResult]:
@@ -167,6 +180,10 @@ def judge_video(
     compact observations survive. Short clips use their final available frame.
     """
     evidence_confidence = load_policy(detection_config)["confidence"]
+    source_before = None
+    if dynamic_config is not None:
+        with info.path.open("rb") as f:
+            source_before = hashlib.file_digest(f, "sha256").hexdigest()
     try:
         with closing(
             iter_frames(
@@ -201,6 +218,15 @@ def judge_video(
             # never the snapshot's reference image (another video's frame, or the manual
             # template), whose small offset would read as constant stadium displacement.
             ref = first
+            geometry = None
+            if dynamic_config is not None:
+                geometry = DynamicCalibration(
+                    c,
+                    cv2.imread(snap.calibration.ref_frame),
+                    info.fps,
+                    load_video_policy()["stadium_follow"],
+                    load_dynamic_policy(dynamic_config),
+                )
             disp = {}
             crops = {}
 
@@ -209,6 +235,8 @@ def judge_video(
                     chain(prefix, frames), c, ref
                 ):
                     disp[f] = displacement
+                    if geometry is not None:
+                        geometry.update(f, image)
                     yield f, image
                 prefix.clear()
 
@@ -224,8 +252,33 @@ def judge_video(
             tracks = track_frames(
                 measured(), detecting, info.fps, config=detection_config
             )
-        bey_tracks = [t for t in tracks if t.cls == "bey"]
+        phase = None
+        side_hints = {}
+        geometry_evidence = None
+        if geometry is not None:
+            side_hints = assign_sides(normalize_tracks(tracks, geometry.samples), c)
+            phase = prepare_launch_tracks(tracks, info.fps, load_launch_policy())
+            tracks = phase.tracks
+            with info.path.open("rb") as source:
+                source_sha = hashlib.file_digest(source, "sha256").hexdigest()
+            if source_sha != source_before:
+                raise ValueError("source changed during dynamic judging")
+            record = {
+                **geometry.record(),
+                "calibration_id": snap.id,
+                "source": str(info.path.resolve()),
+                "source_sha256": source_sha,
+                "follow_policy": load_video_policy()["stadium_follow"],
+                "phase_policy": load_launch_policy(),
+                "phase": phase.record(),
+            }
+            geometry_evidence = save_geometry(out_dir, info.path.name, record)
+        raw_tracks = tracks
+        raw_by_id = {t.track_id: t for t in raw_tracks}
+        bey_tracks = [t for t in raw_tracks if t.cls == "bey"]
         rounds = segment_rounds(bey_tracks, info.fps, th)
+        if geometry is not None:
+            tracks = normalize_tracks(raw_tracks, geometry.samples)
         if not rounds:
             return _calibrated(
                 _provenance(
@@ -260,7 +313,15 @@ def judge_video(
             ]
             current = [t for t in selected if t.cls == "bey" and t.dets]
             launchers = [t for t in tracks if t.cls == "launcher"]
-            analysis = analyze_launch(current, launchers, disp, c, th, info.fps)
+            analysis = analyze_launch(
+                current,
+                launchers,
+                disp,
+                c,
+                th,
+                info.fps,
+                **({"sides_override": side_hints} if geometry is not None else {}),
+            )
             launch, sides = analysis.check, analysis.sides
             counts = Counter(sides.values())
             bey = {
@@ -278,11 +339,12 @@ def judge_video(
                     else "unknown"
                 )
                 if t:
-                    observed_crops = {
-                        d.frame: crops[(d.frame, tuple(d.box))]
-                        for d in t.dets
-                        if (d.frame, tuple(d.box)) in crops
-                    }
+                    observed_crops = {}
+                    for d in t.dets:
+                        raw_box = raw_by_id[t.track_id].box_at(d.frame)
+                        key = (d.frame, tuple(raw_box))
+                        if key in crops:
+                            observed_crops[d.frame] = crops[key]
                     stopped, reason = stop_frame(
                         t,
                         spin_activity(observed_crops),
@@ -296,6 +358,30 @@ def judge_video(
                 else:
                     stops[side] = None
             finish = detect_finish(bey, parts, stops, c, th, info.fps)
+            dynamic_notes = []
+            if geometry is not None:
+                if any(
+                    geometry.samples[f].alignment is None for f in range(start, end + 1)
+                ):
+                    dynamic_notes.append("calibration_geometry_missing")
+                    # An unknown image cannot be treated as the top leaving the arena.
+                    finish = type(finish)(
+                        None,
+                        None,
+                        None,
+                        0.0,
+                        [*finish.reasons, "calibration_geometry_missing"],
+                    )
+                if any(
+                    geometry.samples[f].segment > 0 for f in range(start, end + 1)
+                ):
+                    dynamic_notes.append("calibration_relocated")
+                active_ids = {t.track_id for t in current}
+                dynamic_notes.extend(
+                    n for n in phase.notes if int(n.rsplit("@", 1)[1]) in active_ids
+                )
+                if any(len(phase.members.get(tid, [])) > 1 for tid in active_ids):
+                    dynamic_notes.append("identity_join_requires_review")
             # A stop arising only after the result is settled is a note (R55).
             stop_reasons = [
                 (
@@ -308,7 +394,13 @@ def judge_video(
             ]
             reasons = list(
                 dict.fromkeys(
-                    [*launch.notes, *finish.reasons, *stop_reasons, *calibration_notes]
+                    [
+                        *launch.notes,
+                        *finish.reasons,
+                        *stop_reasons,
+                        *calibration_notes,
+                        *dynamic_notes,
+                    ]
                 )
             )
             # These explain observed evidence, while reversals remain review-required;
@@ -353,6 +445,7 @@ def judge_video(
                 reasons,
                 spin_dir=spin,
             )
+            r.geometry_evidence = geometry_evidence
             lo, hi = analysis.window
             r.motion_evidence = {
                 "video": r.video,
@@ -370,8 +463,30 @@ def judge_video(
             write_trajectory(
                 out_dir,
                 r,
-                bey,
-                parts,
+                {
+                    side: Track(
+                        t.track_id,
+                        t.cls,
+                        [
+                            d
+                            for d in raw_by_id[t.track_id].dets
+                            if start <= d.frame <= end
+                        ],
+                    )
+                    for side, t in bey.items()
+                },
+                [
+                    Track(
+                        t.track_id,
+                        t.cls,
+                        [
+                            d
+                            for d in raw_by_id[t.track_id].dets
+                            if start <= d.frame <= part_end
+                        ],
+                    )
+                    for t in parts
+                ],
                 c,
                 info.fps,
                 {
@@ -380,10 +495,17 @@ def judge_video(
                     "air_collision": analysis.air_collision_frame,
                     "finish": finish.frame,
                 },
+                judgment_tracks=selected if geometry is not None else None,
                 unassigned=[
-                    t
-                    for t in current
-                    if t.track_id not in {v.track_id for v in bey.values()}
+                    Track(
+                        t.track_id,
+                        t.cls,
+                        [d for d in t.dets if start <= d.frame <= end],
+                    )
+                    for t in raw_tracks
+                    if t.cls == "bey"
+                    and any(start <= d.frame <= end for d in t.dets)
+                    and t.track_id not in {v.track_id for v in bey.values()}
                 ],
             )
         return _calibrated(_provenance(results, provenance), snap)
@@ -400,7 +522,7 @@ def _load_selection(path: Path, th: Thresholds) -> dict:
             f"{path}: no selected detector; train both detectors (`bxjudge train`) and "
             "write the selection with `bxjudge compare` first (README 完整流程)"
         )
-    data =json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("kind") not in ("rfdetr", "yolo26"):
         raise ValueError(f"{path}: expected selected detector kind")
     try:
@@ -476,14 +598,18 @@ def _read_statuses(out_dir: Path) -> dict[str, str | None]:
     rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     if not isinstance(rows, dict):
         raise ValueError(f"{path}: expected a JSON object keyed by video")  # noqa: TRY004
-    return {v: e.get("analysis_status") if isinstance(e, dict) else None
-            for v, e in rows.items()}
+    return {
+        v: e.get("analysis_status") if isinstance(e, dict) else None
+        for v, e in rows.items()
+    }
 
 
 def _has_real_rows(out_dir: Path, video: str) -> bool:
     """Whether ``rounds.json`` holds at least one real (non-placeholder) row of ``video``."""
-    return any(r["video"] == video and not is_not_a_round(r["review_reasons"])
-               for r in read_rounds(out_dir))
+    return any(
+        r["video"] == video and not is_not_a_round(r["review_reasons"])
+        for r in read_rounds(out_dir)
+    )
 
 
 def _read_vlm_seconds(out_dir: Path) -> dict[str, float]:
@@ -491,9 +617,11 @@ def _read_vlm_seconds(out_dir: Path) -> dict[str, float]:
     path = Path(out_dir) / "videos.json"
     rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     out = {}
-    for video, entry in (rows.items() if isinstance(rows, dict) else ()):
+    for video, entry in rows.items() if isinstance(rows, dict) else ():
         v = entry.get("vlm_s") if isinstance(entry, dict) else None
-        out[video] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+        out[video] = (
+            float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+        )
     return out
 
 
@@ -502,7 +630,7 @@ def _read_calibration_ids(out_dir: Path) -> dict[str, str | None]:
     path = Path(out_dir) / "videos.json"
     rows = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     out: dict[str, str | None] = {}
-    for video, entry in (rows.items() if isinstance(rows, dict) else ()):
+    for video, entry in rows.items() if isinstance(rows, dict) else ():
         cal = entry.get("calibration") if isinstance(entry, dict) else None
         sid = cal.get("id") if isinstance(cal, dict) else None
         out[video] = sid if isinstance(sid, str) else None
@@ -527,6 +655,7 @@ def run_batch(
     autocalib_config: Path = DEFAULT_AUTOCALIB_CONFIG,
     autocalib: AutoCalibConfig | None = None,
     rejudge: bool = False,
+    dynamic_config: Path | None = None,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -552,6 +681,10 @@ def run_batch(
     if not calib_dir.is_dir():
         raise ValueError(f"{calib_dir}: expected calibration directory (--calib)")
     validate_output_paths(out_dir, calib_dir)
+    if dynamic_config is not None:
+        load_dynamic_policy(dynamic_config)
+        load_launch_policy()
+        load_video_policy()
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
@@ -596,6 +729,24 @@ def run_batch(
             provenance["runtime"]["detector"] = detector.runtime
         else:
             provenance["runtime"]["detector"] = {"backend": "pytorch"}
+    dynamic_signature = None
+    if dynamic_config is not None:
+        dynamic_signature = {
+            "recovery": load_dynamic_policy(dynamic_config),
+            "follow": load_video_policy()["stadium_follow"],
+            "phase": load_launch_policy(),
+        }
+        if provenance is not None:
+            provenance["dynamic_calibration"] = dynamic_signature
+    video_records_path = out_dir / "videos.json"
+    video_records = (
+        json.loads(video_records_path.read_text())
+        if video_records_path.exists()
+        else {}
+    )
+    old_analysis_policies = {
+        name: entry.get("analysis_policy") for name, entry in video_records.items()
+    }
     db = out_dir / "processed_videos.json"
     failures = []
 
@@ -618,7 +769,9 @@ def run_batch(
     recorded_calibrations = _read_calibration_ids(out_dir)
     # Ruling R68: "previously judged" = at least one real (non-placeholder) row on disk.
     judged_before = {
-        r["video"] for r in read_rounds(out_dir) if not is_not_a_round(r["review_reasons"])
+        r["video"]
+        for r in read_rounds(out_dir)
+        if not is_not_a_round(r["review_reasons"])
     }
     candidates = sorted(
         [(i.path, i, False) for i in infos]
@@ -636,8 +789,10 @@ def run_batch(
     for path, info, cached in candidates:
         # C-X9: veto-kept videos (no judging) never use up --limit; once it is reached, only
         # veto candidates still get their attempt recorded (nothing else is judged).
-        limit_reached = limit is not None and len(
-            [p for p, _ in entries if p.name not in kept_only]) >= limit
+        limit_reached = (
+            limit is not None
+            and len([p for p, _ in entries if p.name not in kept_only]) >= limit
+        )
         # Ruling R66a: ONE timer per video, from its first decode (the selection pass of a
         # processed video, else judge_video's own) to its result write; selection and
         # judging run back to back, so no other video's work falls inside it.
@@ -647,13 +802,15 @@ def run_batch(
         # record, else (a changed file whose record was forgotten) videos.json.
         recorded = None
         if info is not None:
-            recorded = processed_calibration(db, info.path) or recorded_calibrations.get(
-                path.name)
+            recorded = processed_calibration(
+                db, info.path
+            ) or recorded_calibrations.get(path.name)
         # A previously judged video recorded with a vetoed snapshot goes through the same
         # selection even when scan reports it as new/changed (e.g. a touched mtime), so the
         # T4-3 keep rule below applies on every path.
-        vetoed_before = (info is not None and path.name in judged_before
-                         and recorded in vetoed)
+        vetoed_before = (
+            info is not None and path.name in judged_before and recorded in vetoed
+        )
         if limit_reached and not vetoed_before:
             continue
         if cached or vetoed_before:
@@ -666,20 +823,34 @@ def run_batch(
                     # never reanalysed (with no usable alternative that could only give a
                     # recalibrate placeholder, T4-3): its rows stay and the attempt is a
                     # transient failure (R68), retried on the next run.
-                    status = ("decode_error" if isinstance(error, VideoDecodeError)
-                              else "analysis_error")
-                    log.exception("%s: calibration selection failed (%s); keeping its "
-                                  "vetoed rows", path.name, status)
+                    status = (
+                        "decode_error"
+                        if isinstance(error, VideoDecodeError)
+                        else "analysis_error"
+                    )
+                    log.exception(
+                        "%s: calibration selection failed (%s); keeping its "
+                        "vetoed rows",
+                        path.name,
+                        status,
+                    )
                     entries.append((path, info))
                     kept_only.add(path.name)  # C-X9: kept, not judged: no --limit use
                     wall = time.perf_counter() - began
-                    record_video_status(out_dir, path.name, status, wall_s=wall,
-                                        duration_s=info.duration, run_id=run_id)
+                    record_video_status(
+                        out_dir,
+                        path.name,
+                        status,
+                        wall_s=wall,
+                        duration_s=info.duration,
+                        run_id=run_id,
+                    )
                     work[path.name], real[path.name] = wall, True
                     continue
                 # e.g. an unreadable first second: the normal per-video flow handles it.
-                log.exception("cannot re-select the calibration of %s; reanalysing it",
-                              info.path)
+                log.exception(
+                    "cannot re-select the calibration of %s; reanalysing it", info.path
+                )
             else:
                 current = snap.id if snap is not None else None
                 unchanged = not needs_reanalysis(recorded, current, vetoed)
@@ -695,8 +866,13 @@ def run_batch(
                     entries.append((path, info))
                     kept_only.add(path.name)
                     wall = time.perf_counter() - began
-                    record_video_attempt(out_dir, path.name, wall_s=wall,
-                                         duration_s=info.duration, run_id=run_id)
+                    record_video_attempt(
+                        out_dir,
+                        path.name,
+                        wall_s=wall,
+                        duration_s=info.duration,
+                        run_id=run_id,
+                    )
                     work[path.name], real[path.name] = wall, True
                     continue
                 if limit_reached:  # C-X9: --limit is used up; nothing more is judged
@@ -704,8 +880,13 @@ def run_batch(
                 # C-X2(a): otherwise only a latest status of ``ok`` lets an unchanged cached
                 # video keep its rows unjudged (never under --rejudge, R66b); any other status
                 # (a transient failure, R68, or none recorded) is re-judged.
-                if (cached and not rejudge and statuses.get(path.name) == "ok"
-                        and unchanged):
+                if (
+                    cached
+                    and not rejudge
+                    and old_analysis_policies.get(path.name) == dynamic_signature
+                    and statuses.get(path.name) == "ok"
+                    and unchanged
+                ):
                     continue
                 preselected = {"snapshot": snap}
         entries.append((path, info))
@@ -726,6 +907,11 @@ def run_batch(
                     autocalib=autocalib,
                     on_snapshot=chosen.append,
                     vetoed=vetoed,
+                    **(
+                        {"dynamic_config": dynamic_config}
+                        if dynamic_config is not None
+                        else {}
+                    ),
                     **preselected,
                 )
             except Exception:
@@ -744,11 +930,17 @@ def run_batch(
             # R66a: the attempt's own wall (attempt_wall_s) and the duration of the CURRENT
             # source file (its latest probe; none when the probe failed) are recorded with
             # the status, so neither the kept rows nor an old file's length can hide it.
-            log.warning("%s: %s on reanalysis; keeping its existing rows", path.name, status)
+            log.warning(
+                "%s: %s on reanalysis; keeping its existing rows", path.name, status
+            )
             wall = time.perf_counter() - began
             record_video_status(
-                out_dir, path.name, status, wall_s=wall,
-                duration_s=info.duration if info is not None else None, run_id=run_id,
+                out_dir,
+                path.name,
+                status,
+                wall_s=wall,
+                duration_s=info.duration if info is not None else None,
+                run_id=run_id,
             )
             work[path.name], real[path.name] = wall, True  # its rows are kept
             continue
@@ -768,6 +960,8 @@ def run_batch(
         real[path.name] = _has_real_rows(out_dir, path.name)
         record_video_calibration(out_dir, path.name, snap)
         record_video_status(out_dir, path.name, status)
+        if status == "ok":
+            record_video_analysis_policy(out_dir, path.name, dynamic_signature)
         # Placeholder-only videos await corrected input and are retried (R56): their record
         # is removed, never left stale with an earlier success's id (ruling T4-5).
         if all(is_not_a_round(r.review_reasons) for r in results):
@@ -816,7 +1010,9 @@ def run_batch(
             started_at=started_at,
             wall_s=time.perf_counter() - run_began,
             vlm_wall_s=vlm_wall_s,
-            videos={path.name: info.duration if info else 0.0 for path, info in entries},
+            videos={
+                path.name: info.duration if info else 0.0 for path, info in entries
+            },
             work={path.name: work.get(path.name, 0.0) for path, _ in entries},
             real={path.name: real.get(path.name, False) for path, _ in entries},
         )

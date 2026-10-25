@@ -570,7 +570,8 @@ def test_playback_zones_follow_current_frame_and_hide_on_failure(scene):
     assert tuple(frames[1][31, 250]) == green
     assert tuple(frames[1][35, 250]) != green
     assert not np.any(np.all(frames[2][:360] == green, axis=2))
-    assert tuple(frames[3][35, 250]) == green
+    assert tuple(frames[3][35, 250]) != green  # recovery waits for stable observed support
+    assert tuple(frames[5][35, 250]) == green
     # A bad frame keeps source footage and raw trajectory evidence, not stale zones.
     assert tuple(frames[2][100, 400]) == (128, 128, 128)
     assert tuple(frames[2][170, 110]) == tv.plot.SIDE_COLORS["X"]
@@ -585,3 +586,18 @@ def test_playback_requires_explicit_follow_policy(scene):
     policy.write_text(yaml.safe_dump(cfg))
     with pytest.raises(ValueError, match="incomplete"):
         load_video_policy(policy)
+
+
+def test_recorded_playback_uses_saved_geometry_instead_of_realigning(scene,monkeypatch):
+    from dataclasses import asdict
+
+    from bxjudge import trajectory_video as tv
+    from bxjudge.autocalib import Alignment
+    _,c,row,path,policy,_=scene
+    a=asdict(Alignment(((1.,0.,12.),(0.,1.,-4.),(0.,0.,1.)),1.,0.,0.,1.,0.))
+    record={'reference_size':[640,360],'samples':{100:{'frame':100,'alignment':a,'status':'tracking'},101:{'frame':101,'alignment':None,'status':'lost'}}}
+    def forbidden(*args):raise AssertionError('must consume saved geometry')
+    monkeypatch.setattr(tv.dynamic_calibration.DynamicCalibration,'update',forbidden)
+    frames=list(tv.animation_frames(row,c,tv.read_observations(path),tv.load_video_policy(policy),coordinate_size=(640,360),background_frames=iter(np.full((360,640,3),128,np.uint8) for _ in range(6)),recorded_geometry=record,source_fps=10))
+    assert tuple(frames[0][16,250])==(80,200,80)
+    assert not np.any(np.all(frames[1][:360]==(80,200,80),axis=2))

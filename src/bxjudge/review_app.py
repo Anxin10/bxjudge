@@ -45,10 +45,10 @@ def _args() -> argparse.Namespace:
 
 
 @st.cache_data(show_spinner="擷取畫面…", max_entries=256)
-def _frame(source: str, mtime: float, t: float, snapshot_id: str, thresholds: str, _calibration):
+def _frame(source: str, mtime: float, t: float, snapshot_id: str, thresholds: str, _calibration, geometry_sha="", _geometry=None):
     # Snapshots are immutable and content-addressed: snapshot_id ("" = no overlay) fully
     # identifies _calibration, so it needs no hashing.
-    return ui.evidence_frame(Path(source), t, _calibration, load_thresholds(thresholds))
+    return ui.evidence_frame(Path(source), t, _calibration, load_thresholds(thresholds), **({"geometry_record":_geometry} if _geometry is not None else {}))
 
 
 _NONE = "__none__"
@@ -118,6 +118,14 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
     st.subheader("發射與結束瞬間")
     if not isinstance(source, str):
         mtime = source.stat().st_mtime
+        geometry_record=None
+        if row.get('geometry_evidence') is not None:
+            from bxjudge.dynamic_calibration import read_geometry
+            from bxjudge.trajectory_video import _source_hash
+            try:geometry_record=read_geometry(out,row,_source_hash(source))
+            except (ValueError,OSError,KeyError) as error:
+                st.warning(f'動態幾何證據無法驗證：{error}')
+                calibration=None  # never silently draw fixed zones on a dynamic judgment
         cols = st.columns(2)
         for col, name, t in zip(
             cols, ("發射瞬間", "結束瞬間"), (row["t_launch"], row["t_end"]), strict=True
@@ -127,6 +135,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
                     image, actual, index = _frame(
                         str(source), mtime, float(t), snap.id if snap else "", a.thresholds,
                         calibration,
+                        row["geometry_evidence"]["sha256"] if row.get("geometry_evidence") else "",geometry_record,
                     )
                 except ui.ReviewMediaError as e:
                     st.warning(f"{name}畫面無法擷取：{e}")
@@ -149,7 +158,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
                 movie = generate_trajectory_video(out, row, calibration, source=source)
             st.video(str(movie), format="video/mp4")
             st.caption("軌跡動畫 · 1 倍速，可播放、暫停、拖曳進度；圖下 Video t 是原影片時刻。"
-                       "背景為原始影片，能直接看見真實陀螺；綠色區域隨盤緣對齊，對齊失敗時隱藏並提示。此為跟隨預覽，既有判決與原始影格座標軌跡不變。")
+                       "背景為原始影片，能直接看見真實陀螺；綠色區域隨盤緣對齊，對齊失敗時隱藏並提示。舊結果為跟隨預覽；動態判定結果則讀取當時保存的逐格幾何。原始影格座標軌跡及人工修正不變。")
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             st.warning(f"軌跡動畫無法產生：{error}")
     st.caption("X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認。"

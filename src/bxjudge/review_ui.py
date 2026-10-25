@@ -278,7 +278,7 @@ def preview_path(out_dir: Path, snap: Snapshot) -> Path:
 
 
 def evidence_frame(
-    source: Path, t: float, calibration: Calibration | None, th: Thresholds
+    source: Path, t: float, calibration: Calibration | None, th: Thresholds, *, geometry_record=None
 ) -> tuple[np.ndarray, float, int]:
     """RGB frame at playback second ``t`` with all 8 zones drawn (when calibrated).
 
@@ -294,13 +294,14 @@ def evidence_frame(
         with closing(
             iter_frames(
                 source,
-                start=start,
-                end=start + 1 / info.fps,
+                start=0 if geometry_record is not None else start,
+                end=None if geometry_record is not None else start + 1 / info.fps,
                 long_edge=th.infer_long_edge,
                 hwaccel=th.decode_hwaccel,
             )
         ) as frames:
             for idx, image in frames:
+                if geometry_record is not None and idx<index:continue
                 index, frame = idx, image
                 break
     except (VideoDecodeError, ValueError, OSError, RuntimeError) as e:
@@ -310,5 +311,10 @@ def evidence_frame(
     actual = index / info.fps
     if calibration is not None:
         scaled = scale_calibration(calibration, (frame.shape[1], frame.shape[0]))
-        frame = overlay_zones(frame, scaled, actual)
+        if geometry_record is not None:
+            from .dynamic_calibration import recorded_calibration
+            scaled=recorded_calibration(calibration,geometry_record,index,(frame.shape[1],frame.shape[0]))
+            if scaled is None:
+                cv2.putText(frame,'Recorded geometry unknown - zones hidden',(12,28),cv2.FONT_HERSHEY_SIMPLEX,.6,(80,80,255),1)
+        if scaled is not None:frame = overlay_zones(frame, scaled, actual)
     return cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_BGR2RGB), actual, index

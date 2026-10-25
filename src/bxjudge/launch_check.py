@@ -222,7 +222,7 @@ class LaunchAnalysis:
     air_collision_frame: int | None = None
 
 
-def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float) -> LaunchAnalysis:
+def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float, *, sides_override: dict[int,Side] | None = None) -> LaunchAnalysis:
     """Combine launch evidence without choosing between missing/duplicate side tracks.
 
     The missing-landing cap bounds the search for battle-area settling. Within that
@@ -232,7 +232,7 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
-    sides = assign_sides(bey_tracks, c)
+    sides = assign_sides(bey_tracks, c) if sides_override is None else {t.track_id:sides_override[t.track_id] for t in bey_tracks if t.track_id in sides_override}
     valid = [t for t in bey_tracks if t.track_id in sides]
     by_side = {side: [t for t in valid if sides[t.track_id] == side] for side in _SIDES}
     first = min((t.first_frame() for t in bey_tracks if t.cls == 'bey' and t.dets), default=0)
