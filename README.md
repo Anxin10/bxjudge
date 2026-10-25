@@ -34,6 +34,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
 
 [軌跡與身分通用規則](docs/superpowers/specs/2026-10-26-tracking-general-rules.md)
 已區分現有實作與待補能力；五組未接續案例保留作證據，不自動當成不同物件的真值。
+[遮擋與部分碰撞後重新辨識規格](docs/superpowers/specs/2026-10-26-occlusion-collision-reidentification.md)
+已制定；第一版規劃為只產生候選與證據的 shadow 模式，尚未實作。
 
 動態裁判以發射前的陀螺與發射器區域連續觀測建立 X／B 身分，再沿已通過接續檢查的
 成員繼承。中途跑到另一側，不會按當時畫面左右重新命名；沒有足夠證據就保留未知。
