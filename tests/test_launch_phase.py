@@ -243,3 +243,65 @@ def test_unknown_middle_fragment_cannot_bridge_opposite_known_sides():
     result = prepare_launch_tracks(tracks, 30, load_launch_policy(), side_hints={1: "X", 3: "B"})
     assert result.members == {1: [1, 2], 3: [3]}
     assert len(result.joins) == 1
+
+
+
+def test_single_box_jitter_does_not_reverse_the_short_motion_history():
+    a = make_track(1, "bey", {0:(100,180),1:(102,180),2:(104,180),3:(106,180),4:(105,180)})
+    b = make_track(2, "bey", {6:(109,180),7:(111,180),8:(113,180),9:(115,180),10:(117,180)})
+    result = prepare_launch_tracks([a,b],30,load_launch_policy())
+    assert result.members == {1:[1,2]}
+    assert [d.frame for d in result.tracks[0].dets] == [0,1,2,3,4,6,7,8,9,10]
+    assert result.joins[0]["motion"]["from_frames"] == [0,1,2,3,4]
+    assert result.joins[0]["motion"]["from_velocity_px_s"] == [60.0,0.0]
+
+
+def test_overlap_uses_actual_shared_position_instead_of_backward_extrapolation():
+    # Stable two-pixel/frame motion with an endpoint box displaced by 10px.
+    # Three actually shared frames agree within24px; backwards extrapolation
+    # from the shifted tail incorrectly places the first match over24px away.
+    a = make_track(1,"bey",{0:(90,180),1:(92,180),2:(94,180),3:(96,180),4:(108,180)},size=160)
+    b = make_track(2,"bey",{2:(70,180),3:(72,180),4:(74,180),5:(76,180),6:(78,180)},size=160)
+    result = prepare_launch_tracks([a,b],30,load_launch_policy())
+    assert result.members == {1:[1,2]}
+    assert result.joins[0]["motion"]["position_basis"] == "observed_shared_frame"
+    assert result.joins[0]["motion"]["position_error_px"] == 24.0
+
+
+def test_stationary_top_is_not_joined_to_a_different_moving_top():
+    a=make_track(1,"bey",{f:(100,180) for f in range(5)},size=60)
+    b=make_track(2,"bey",{f:(100+f*2,180) for f in range(4,9)},size=60)
+    result=prepare_launch_tracks([a,b],30,load_launch_policy())
+    assert result.members == {1:[1],2:[2]}
+
+
+def test_reliable_opposite_motion_and_long_occlusion_remain_unjoined():
+    a=make_track(1,"bey",{f:(100+f*2,180) for f in range(5)},size=60)
+    b=make_track(2,"bey",{f:(116-(f-4)*2,180) for f in range(4,9)},size=60)
+    far=make_track(3,"bey",{f:(100+f*2,180) for f in range(40,45)},size=60)
+    for other in (b,far):
+        result=prepare_launch_tracks([a,other],30,load_launch_policy())
+        assert len(result.tracks)==2
+
+
+
+def test_velocity_history_is_bounded_by_source_time_and_does_not_fill_gaps():
+    from bxjudge.launch_phase import _endpoint_motion
+    a=make_track(1,"bey",{0:(900,180),10:(100,180),12:(104,180),13:(106,180),14:(108,180)})
+    velocity, frames = _endpoint_motion(a.dets, 5, tail=True)
+    assert velocity == (2.0,0.0)
+    assert frames == [10,12,13,14]
+    assert [d.frame for d in a.dets] == [0,10,12,13,14]
+
+
+def test_velocity_window_policy_requires_explicit_integer_budget(tmp_path):
+    import pytest
+    import yaml
+
+    from bxjudge.launch_phase import load_launch_policy
+    base=load_launch_policy()
+    for invalid in (True, 1, 2.5, 0, -1):
+        path=tmp_path/"policy.yaml"
+        path.write_text(yaml.safe_dump({**base,"link_velocity_frames":invalid}))
+        with pytest.raises(ValueError):
+            load_launch_policy(path)

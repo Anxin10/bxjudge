@@ -10,3 +10,5 @@ link_velocity_error_px_s: 120.0
 link_min_speed_px_s: 15.0
 # Conservative duplicate-ID handoff; every shared source frame must meet this IoU.
 link_overlap_iou: 0.6
+# Median actual observed displacements within this many source frames at each end.
+link_velocity_frames: 5

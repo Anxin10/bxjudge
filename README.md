@@ -19,9 +19,9 @@ f1618 的深色 X／淺色 B 修訂另存版本，原提交、預測與瀏覽器
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --site runs/dynamic-referee-20261025 \
-  --results runs/identity-recovery-20261026/pilot \
+  --results runs/fragment-refinement-20261026/pilot \
   --human-results runs/trt-final-20261025/pilot \
-  --evidence runs/identity-recovery-20261026/evidence \
+  --evidence runs/fragment-refinement-20261026/evidence \
   --core-commit "$(git rev-parse HEAD)"
 ```
 
@@ -41,9 +41,18 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
 身分與證據寫在 geometry 的 `identity`；有效但未知身分的陀螺會要求覆核並禁止自動勝方。
 舊的靜態模式仍是明確的獨立流程，不能把其半邊判定當成動態身分錨點。
 
-前輪完整重跑的軌跡為 30→29，本輪相同偵測重播與完整原片重跑皆為 27 條（累計三次交接）。完整處理時間
-225.56 秒；正式速度 gate 為 0.882 PASS（關閉 VLM，兩支開發原片）。66 筆重複使用的開發影格觀測中，目前38筆指派與人工一致、
-28筆未知、0筆指派不一致；未知不計入判對。這不是獨立身分或勝負準確率驗收。
+初始兩支影片有30條陀螺候選軌跡，前輪為27條；本輪相同原始偵測重播與完整原片重跑皆為26條，保留
+原有三次接續、新增一組重複追蹤的交接。正式速度 gate 為0.897 PASS（兩支開發原片、
+關閉VLM）；三回合仍待覆核，沒有整體準確率通過的依據。
+66 筆重複使用的開發影格觀測中，目前38筆指派與人工一致、28筆未知、0筆指派不一致；
+未知不計入判對，也不是獨立身分或勝負準確率驗收。
+
+本輪接續使用最近 `link_velocity_frames` 個來源影格內實際位移的中位數；有缺格時
+除以實際來源影格差，不補造座標。重疊交接使用真實共格位置，非重疊的短缺口仍預測。
+方向、距離、時間等門檻數值保持；估計方法的改變仍會改變接受集合，須以原片驗證。
+`phase.joins[].motion` 保存取樣影格、速度、位置依據與殘差。工作台的
+`/fragment-refinement/` 列出原片對照與五組仍被拒絕的代表案例；這些拒絕原因不是人工
+身分真值，不能據此認定兩段必定不同。長遮擋不靠相近位置或顏色硬接。
 
 接續沿用互相唯一、速度、方向、尺度與位置條件。短暫重疊必須每格有雙方實際框且
 IoU 達 `config/launch_phase.yaml` 門檻；相反身分錨點拒絕接續。共用影格保留較早

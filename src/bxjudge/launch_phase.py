@@ -32,6 +32,7 @@ def load_launch_policy(path=DEFAULT_LAUNCH_POLICY):
         "link_velocity_error_px_s",
         "link_min_speed_px_s",
         "link_overlap_iou",
+        "link_velocity_frames",
     }
     if not isinstance(raw, dict) or set(raw) != names:
         raise ValueError("incomplete launch_phase policy")
@@ -40,6 +41,8 @@ def load_launch_policy(path=DEFAULT_LAUNCH_POLICY):
         for v in raw.values()
     ):
         raise ValueError("launch_phase values must be positive finite")
+    if type(raw["link_velocity_frames"]) is not int or raw["link_velocity_frames"] < 2:
+        raise ValueError("link_velocity_frames must be an integer >=2")
     if raw["link_min_direction_cos"] > 1:
         raise ValueError("link_min_direction_cos must be <=1")
     if raw["link_overlap_iou"] > 1:
@@ -122,6 +125,23 @@ def _overlap_observations(a, b, policy):
     if np.any(np.diag(sv.box_iou_batch(boxes_a, boxes_b)) < policy["link_overlap_iou"]):
         return None
     return [asdict(by_b[f]) for f in frames]
+
+
+def _endpoint_motion(ordered, frames, *, tail):
+    """Median observed displacement per source frame in a bounded time window.
+
+    A missing detection contributes no synthetic point. Source index deltas
+    normalize any actual observed pair within the window.
+    """
+    edge = ordered[-1].frame if tail else ordered[0].frame
+    samples = [d for d in ordered if abs(d.frame - edge) < frames]
+    points = np.asarray([
+        ((d.box[0] + d.box[2]) / 2, (d.box[1] + d.box[3]) / 2)
+        for d in samples
+    ])
+    indices = np.asarray([d.frame for d in samples])
+    velocity = np.median(np.diff(points, axis=0) / np.diff(indices)[:, None], axis=0)
+    return tuple(map(float, velocity)), list(map(int, indices))
 
 
 def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
@@ -246,12 +266,13 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
         if len(a.dets) < 2:
             continue
         da = sorted(a.dets, key=lambda d: d.frame)
-        p0 = a.center_at(da[-2].frame)
         p1 = a.center_at(da[-1].frame)
         dt = da[-1].frame - da[-2].frame
         if dt != 1:
             continue
-        velocity = ((p1[0] - p0[0]) / dt, (p1[1] - p0[1]) / dt)
+        velocity, from_frames = _endpoint_motion(
+            da, policy["link_velocity_frames"], tail=True
+        )
         for b in beys:
             if a is b:
                 continue
@@ -277,8 +298,9 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
             if len(db) < 2 or db[1].frame - db[0].frame != 1:
                 continue
             pb = b.center_at(b.first_frame())
-            next_b = b.center_at(db[1].frame)
-            velocity_b = (next_b[0] - pb[0], next_b[1] - pb[1])
+            velocity_b, to_frames = _endpoint_motion(
+                db, policy["link_velocity_frames"], tail=False
+            )
             va = math.hypot(*velocity) * fps
             vb = math.hypot(*velocity_b) * fps
             if (
@@ -298,7 +320,10 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
                 )
                 if cosine < policy["link_min_direction_cos"]:
                     continue
-            pred = (p1[0] + velocity[0] * gap, p1[1] + velocity[1] * gap)
+            pred = (
+                (p1[0] + velocity[0] * gap, p1[1] + velocity[1] * gap)
+                if gap > 0 else a.center_at(b.first_frame())
+            )
             sa = _size(da[-1].box)
             sb = _size(b.box_at(b.first_frame()))
             if (
@@ -313,6 +338,15 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
                     "to_track": b.track_id,
                     "kind": "gap" if gap > 0 else "overlap",
                     "replaced_observations": replaced,
+                    "motion": {
+                        "from_frames": from_frames,
+                        "to_frames": to_frames,
+                        "from_velocity_px_s": [v * fps for v in velocity],
+                        "to_velocity_px_s": [v * fps for v in velocity_b],
+                        "position_basis": "predicted_gap" if gap > 0 else "observed_shared_frame",
+                        "position_frame": b.first_frame(),
+                        "position_error_px": math.dist(pred, pb),
+                    },
                 }
     outgoing = {}
     incoming = {}
