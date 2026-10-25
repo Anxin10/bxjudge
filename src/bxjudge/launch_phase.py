@@ -5,9 +5,11 @@ Unknown release/identity remains review-required instead of being silently resol
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
+import supervision as sv
 import yaml
 
 from .config import config_loader
@@ -29,6 +31,7 @@ def load_launch_policy(path=DEFAULT_LAUNCH_POLICY):
         "link_min_direction_cos",
         "link_velocity_error_px_s",
         "link_min_speed_px_s",
+        "link_overlap_iou",
     }
     if not isinstance(raw, dict) or set(raw) != names:
         raise ValueError("incomplete launch_phase policy")
@@ -39,6 +42,8 @@ def load_launch_policy(path=DEFAULT_LAUNCH_POLICY):
         raise ValueError("launch_phase values must be positive finite")
     if raw["link_min_direction_cos"] > 1:
         raise ValueError("link_min_direction_cos must be <=1")
+    if raw["link_overlap_iou"] > 1:
+        raise ValueError("link_overlap_iou must be <=1")
     if raw["link_scale_ratio"] < 1:
         raise ValueError("link_scale_ratio must be >=1")
     return dict(raw)
@@ -52,6 +57,7 @@ class PreparedLaunch:
     excluded_held: list[int]
     notes: list[str]
     diagnostics: dict[int, dict]
+    joins: list[dict]
 
     def record(self):
         return {
@@ -60,6 +66,7 @@ class PreparedLaunch:
             "excluded_held": self.excluded_held,
             "notes": self.notes,
             "diagnostics": {str(k): v for k, v in self.diagnostics.items()},
+            "joins": self.joins,
         }
 
 
@@ -103,9 +110,24 @@ def _box_clear_runs(detections, bodies, owner, margin, required):
     return runs
 
 
-def prepare_launch_tracks(tracks, fps, policy):
+def _overlap_observations(a, b, policy):
+    """Require actual consistent boxes throughout a short boundary overlap."""
+    frames = range(b.first_frame(), a.last_frame() + 1)
+    by_a = {d.frame: d for d in a.dets}
+    by_b = {d.frame: d for d in b.dets}
+    if any(f not in by_a or f not in by_b for f in frames):
+        return None
+    boxes_a = np.asarray([by_a[f].box for f in frames])
+    boxes_b = np.asarray([by_b[f].box for f in frames])
+    if np.any(np.diag(sv.box_iou_batch(boxes_a, boxes_b)) < policy["link_overlap_iou"]):
+        return None
+    return [asdict(by_b[f]) for f in frames]
+
+
+def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("fps must be positive finite")
+    side_hints = dict(side_hints or {})
     held_n = max(2, math.ceil(policy["held_s"] * fps))
     free_n = max(2, math.ceil(policy["separation_s"] * fps))
     bodies = {}
@@ -219,6 +241,7 @@ def prepare_launch_tracks(tracks, fps, policy):
     members = {t.track_id: [t.track_id] for t in prepared}
     beys = [t for t in prepared if t.cls == "bey" and t.dets]
     candidates = []
+    join_evidence = {}
     for a in beys:
         if len(a.dets) < 2:
             continue
@@ -233,7 +256,17 @@ def prepare_launch_tracks(tracks, fps, policy):
             if a is b:
                 continue
             gap = b.first_frame() - a.last_frame()
-            if gap <= 0 or gap / fps > policy["link_gap_s"]:
+            if (
+                a.first_frame() >= b.first_frame()
+                or a.last_frame() >= b.last_frame()
+                or abs(gap) / fps > policy["link_gap_s"]
+            ):
+                continue
+            if (a.track_id in side_hints and b.track_id in side_hints
+                    and side_hints[a.track_id] != side_hints[b.track_id]):
+                continue
+            replaced = [] if gap > 0 else _overlap_observations(a, b, policy)
+            if replaced is None:
                 continue
             # Never join a newly mounted/released top onto another top's identity.
             if b.track_id in releases or any(
@@ -275,6 +308,12 @@ def prepare_launch_tracks(tracks, fps, policy):
                 continue
             if math.dist(pred, pb) <= policy["link_error_px"]:
                 candidates.append((a.track_id, b.track_id))
+                join_evidence[a.track_id, b.track_id] = {
+                    "from_track": a.track_id,
+                    "to_track": b.track_id,
+                    "kind": "gap" if gap > 0 else "overlap",
+                    "replaced_observations": replaced,
+                }
     outgoing = {}
     incoming = {}
     for a, b in candidates:
@@ -288,19 +327,29 @@ def prepare_launch_tracks(tracks, fps, policy):
     by_id = {t.track_id: t for t in prepared}
     consumed = set()
     result = []
+    joins = []
     for t in sorted(prepared, key=lambda t: t.first_frame() if t.dets else -1):
         if t.track_id in consumed:
             continue
         ids = [t.track_id]
-        dets = list(t.dets)
+        dets = {d.frame: d for d in t.dets}
+        known_sides = {side_hints[t.track_id]} if t.track_id in side_hints else set()
         tail = t.track_id
         while tail in links:
-            tail = links[tail]
+            successor = links[tail]
+            if (successor in side_hints and known_sides
+                    and side_hints[successor] not in known_sides):
+                break
+            joins.append(join_evidence[tail, successor])
+            tail = successor
+            if tail in side_hints:
+                known_sides.add(side_hints[tail])
             ids.append(tail)
-            dets.extend(by_id[tail].dets)
+            for d in by_id[tail].dets:
+                dets.setdefault(d.frame, d)
             consumed.add(tail)
         members[t.track_id] = ids
-        result.append(Track(t.track_id, t.cls, sorted(dets, key=lambda d: d.frame)))
+        result.append(Track(t.track_id, t.cls, [dets[f] for f in sorted(dets)]))
     return PreparedLaunch(
         result,
         {t.track_id: members[t.track_id] for t in result},
@@ -308,4 +357,5 @@ def prepare_launch_tracks(tracks, fps, policy):
         excluded,
         notes,
         diagnostics,
+        joins,
     )

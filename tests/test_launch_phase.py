@@ -180,3 +180,66 @@ def test_clearance_confirmation_needs_actual_consecutive_observations():
     result = prepare_launch_tracks([bey, body], 30, load_launch_policy())
     assert result.releases == {}
     assert result.diagnostics[1]["box_clear_runs"] == []
+
+
+
+def test_same_frame_handoff_keeps_original_observations_without_duplicate_frame():
+    a = make_track(1, "bey", {f: (100 + f, 180) for f in range(5)}, size=40)
+    b = make_track(2, "bey", {f: (100 + f, 180) for f in range(4, 9)}, size=40)
+    result = prepare_launch_tracks([a, b], 30, load_launch_policy())
+    assert result.members == {1: [1, 2]}
+    assert [d.frame for d in result.tracks[0].dets] == list(range(9))
+    assert result.tracks[0].dets[4] is a.dets[4]
+    assert len(a.dets) == len(b.dets) == 5
+
+
+def test_duplicate_overlap_keeps_replaced_raw_observations_as_evidence():
+    a = make_track(1, "bey", {f: (100 + f, 180) for f in range(7)}, size=40)
+    b = make_track(2, "bey", {f: (101 + f, 180) for f in range(4, 11)}, size=40)
+    result = prepare_launch_tracks([a, b], 30, load_launch_policy())
+    assert result.members == {1: [1, 2]}
+    assert len(result.tracks[0].dets) == 11
+    join = result.record()["joins"][0]
+    assert (join["from_track"], join["to_track"]) == (1, 2)
+    assert [d["frame"] for d in join["replaced_observations"]] == [4, 5, 6]
+    assert join["replaced_observations"][0]["box"] == b.dets[0].box
+
+
+def test_overlapping_different_objects_and_missing_overlap_evidence_stay_separate():
+    a = make_track(1, "bey", {f: (100 + f, 180) for f in range(7)}, size=40)
+    b = make_track(2, "bey", {f: (100 + f, 210) for f in range(4, 11)}, size=40)
+    missing = make_track(3, "bey", {f: (100 + f, 180) for f in (4, 6, 7, 8)}, size=40)
+    for other in (b, missing):
+        result = prepare_launch_tracks([a, other], 30, load_launch_policy())
+        assert len(result.tracks) == 2
+
+
+def test_fragment_continuation_never_combines_conflicting_side_hints():
+    a = make_track(1, "bey", {f: (100 + f, 180) for f in range(5)}, size=40)
+    b = make_track(2, "bey", {f: (100 + f, 180) for f in range(4, 9)}, size=40)
+    result = prepare_launch_tracks([a, b], 30, load_launch_policy(), side_hints={1: "X", 2: "B"})
+    assert result.members == {1: [1], 2: [2]}
+
+
+def test_ambiguous_overlap_successors_and_full_lifetime_overlap_are_not_joined():
+    a = make_track(1, "bey", {f: (100 + f, 180) for f in range(7)}, size=40)
+    b = make_track(2, "bey", {f: (100 + f, 180) for f in range(4, 11)}, size=40)
+    c = make_track(3, "bey", {f: (101 + f, 180) for f in range(4, 11)}, size=40)
+    assert len(prepare_launch_tracks([a, b, c], 30, load_launch_policy()).tracks) == 3
+    same_span = make_track(4, "bey", {f: (100 + f, 180) for f in range(7)}, size=40)
+    assert len(prepare_launch_tracks([a, same_span], 30, load_launch_policy()).tracks) == 2
+
+
+def test_same_frame_handoff_chain_is_order_independent_and_never_adds_observations():
+    tracks = [make_track(i + 1, "bey", {f: (100 + f, 180) for f in range(i*4, i*4+5)}, size=40) for i in range(3)]
+    result = prepare_launch_tracks(tracks[::-1], 30, load_launch_policy())
+    assert result.members == {1: [1, 2, 3]}
+    assert [d.frame for d in result.tracks[0].dets] == list(range(13))
+
+
+
+def test_unknown_middle_fragment_cannot_bridge_opposite_known_sides():
+    tracks = [make_track(i + 1, "bey", {f: (100 + f, 180) for f in range(i*4, i*4+5)}, size=40) for i in range(3)]
+    result = prepare_launch_tracks(tracks, 30, load_launch_policy(), side_hints={1: "X", 3: "B"})
+    assert result.members == {1: [1, 2], 3: [3]}
+    assert len(result.joins) == 1

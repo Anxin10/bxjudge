@@ -268,7 +268,9 @@ def judge_video(
         geometry_evidence = None
         if geometry is not None:
             side_hints = assign_sides(normalize_tracks(tracks, geometry.samples), c)
-            phase = prepare_launch_tracks(tracks, info.fps, load_launch_policy())
+            phase = prepare_launch_tracks(
+                tracks, info.fps, load_launch_policy(), side_hints=side_hints
+            )
             tracks = phase.tracks
             with info.path.open("rb") as source:
                 source_sha = hashlib.file_digest(source, "sha256").hexdigest()

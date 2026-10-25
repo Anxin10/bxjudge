@@ -8,3 +8,5 @@ link_scale_ratio: 1.5
 link_min_direction_cos: 0.5
 link_velocity_error_px_s: 120.0
 link_min_speed_px_s: 15.0
+# Conservative duplicate-ID handoff; every shared source frame must meet this IoU.
+link_overlap_iou: 0.6

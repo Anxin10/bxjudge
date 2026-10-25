@@ -19,15 +19,28 @@ f1618 的深色 X／淺色 B 修訂另存版本，原提交、預測與瀏覽器
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --site runs/dynamic-referee-20261025 \
-  --results runs/long-profile-20261026/full-originals-staged \
+  --results runs/identity-continuation-20261026/pilot \
   --human-results runs/trt-final-20261025/pilot \
-  --evidence runs/unified-workbench-20261026 \
-  --core-commit 4db135807d91592cd72e397f156b086655159b3f
+  --evidence runs/identity-continuation-20261026/evidence \
+  --core-commit "$(git rev-parse HEAD)"
 ```
 
-`--core-commit` 記錄輸入結果實際量測的版本，不是首頁產生器版本。首頁來源與 SHA-256
+`--core-commit` 必須記錄輸入結果實際量測的版本；上例只適用程式仍與當次量測一致時。
+如果已修改程式，請改填量測記錄的版本，不能用新的 HEAD 冒充重新量測。首頁來源與 SHA-256
 列於 `/_workbench/snapshot.json`。建置保留舊首頁與子頁備份，僅增加工作台導覽；
 不會重設原逐格核對頁的儲存端點或草稿。
+
+### 軌跡接續現況
+
+兩支開發原片在本輪完整重跑，陀螺軌跡由 30 條降為 29 條，僅接回第二片 f1021
+的 4→6 同格交接。66 個既有人工物件仍能精確追溯且沒有 X／B 標記衝突；其餘碎片
+尚未解決，不能把軌跡減少當作整體身分或勝負準確率通過。
+
+接續沿用互相唯一、速度、方向、尺度與位置條件。短暫重疊必須每格有雙方實際框且
+IoU 達 `config/launch_phase.yaml` 門檻；既有 side 提示矛盾時拒絕。共用影格保留較早
+軌跡的觀測，被取代原始框及分數另存於 geometry 的 `phase.joins`，成員 ID 在
+`phase.members`。不插補漏格、不中斷追溯，也不以此推定物理分離。接續結果仍加上
+`identity_join_requires_review`，保持人工覆核。
 
 ## 環境設定
 
