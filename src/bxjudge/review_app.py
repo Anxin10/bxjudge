@@ -149,7 +149,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
                 movie = generate_trajectory_video(out, row, calibration, source=source)
             st.video(str(movie), format="video/mp4")
             st.caption("軌跡動畫 · 1 倍速，可播放、暫停、拖曳進度；圖下 Video t 是原影片時刻。"
-                       "背景為原始影片，能直接看見真實陀螺；線條依已存觀測逐步出現。")
+                       "背景為原始影片，能直接看見真實陀螺；綠色區域隨盤緣對齊，對齊失敗時隱藏並提示。此為跟隨預覽，既有判決與原始影格座標軌跡不變。")
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             st.warning(f"軌跡動畫無法產生：{error}")
     st.caption("X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認。"

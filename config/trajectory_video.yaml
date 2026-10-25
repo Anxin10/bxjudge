@@ -4,3 +4,20 @@ max_long_edge: 1280
 crf: 23
 preset: veryfast
 encoder_threads: 2
+# Reference-anchored review overlay; reject uncertain/large motion, never carry it forward.
+stadium_follow:
+  work_width: 640
+  features: 2000
+  ratio_test: 0.75
+  ransac_reprojection_px: 2.0
+  min_inliers: 16
+  min_inlier_fraction: 0.6
+  min_quadrants: 3
+  max_shift_frac: 0.05
+  max_rotation_deg: 4.0
+  min_scale: 0.97
+  max_scale: 1.03
+  min_edge_score: 0.65
+  min_region_score: 0.65
+  ecc_iterations: 50
+  ecc_epsilon: 0.00001

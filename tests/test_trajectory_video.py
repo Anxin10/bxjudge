@@ -71,6 +71,8 @@ def scene(tmp_path):
         ]
     )
     policy = tmp_path / "video.yaml"
+    from bxjudge.trajectory_video import DEFAULT_VIDEO_CONFIG
+
     policy.write_text(
         yaml.safe_dump(
             {
@@ -79,6 +81,9 @@ def scene(tmp_path):
                 "crf": 18,
                 "preset": "ultrafast",
                 "encoder_threads": 1,
+                "stadium_follow": yaml.safe_load(DEFAULT_VIDEO_CONFIG.read_text())[
+                    "stadium_follow"
+                ],
             }
         )
     )
@@ -538,3 +543,45 @@ def test_source_sampling_counts_from_original_frame_zero_instead_of_approximate_
     )
     assert seen["start"] == 0 and seen["end"] is None
     assert [int(x[0, 0, 0]) for x in images] == [2, 3]
+
+
+def test_playback_zones_follow_current_frame_and_hide_on_failure(scene):
+    from bxjudge import trajectory_video as tv
+    from tests.helpers import stadium_scene
+
+    _, _, row, path, policy, _ = scene
+    ref, c = stadium_scene(size=(640, 360))
+    moved, _ = stadium_scene(size=(640, 360), shift=(12, -4))
+    backgrounds = [ref, moved, np.full_like(ref, 128), ref, moved, ref]
+    frames = list(
+        tv.animation_frames(
+            row,
+            c,
+            tv.read_observations(path),
+            tv.load_video_policy(policy),
+            coordinate_size=(640, 360),
+            reference=ref,
+            background_frames=iter(backgrounds),
+        )
+    )
+    green = (80, 200, 80)
+    # Horizontal stadium rim y=35 translates to y=31. It must not remain at y=35.
+    assert tuple(frames[0][35, 250]) == green
+    assert tuple(frames[1][31, 250]) == green
+    assert tuple(frames[1][35, 250]) != green
+    assert not np.any(np.all(frames[2][:360] == green, axis=2))
+    assert tuple(frames[3][35, 250]) == green
+    # A bad frame keeps source footage and raw trajectory evidence, not stale zones.
+    assert tuple(frames[2][100, 400]) == (128, 128, 128)
+    assert tuple(frames[2][170, 110]) == tv.plot.SIDE_COLORS["X"]
+
+
+def test_playback_requires_explicit_follow_policy(scene):
+    from bxjudge.trajectory_video import load_video_policy
+
+    *_, policy, _ = scene
+    cfg = yaml.safe_load(policy.read_text())
+    del cfg["stadium_follow"]
+    policy.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(ValueError, match="incomplete"):
+        load_video_policy(policy)

@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 import yaml
 
+from . import autocalib, calibration, geometry
+from . import stadium_follow as follow
 from . import trajectory_plot as plot
 from .calibration import scale_calibration
 from .config import config_loader
@@ -30,7 +32,12 @@ DEFAULT_VIDEO_CONFIG = (
 )
 # Frozen at import, so a running module never labels its output with newer source bytes.
 _RENDERER_ID = hashlib.sha256(
-    Path(__file__).read_bytes() + Path(plot.__file__).read_bytes()
+    Path(__file__).read_bytes()
+    + b"".join(
+        Path(m.__file__).read_bytes()
+        for m in (plot, follow, autocalib, calibration, geometry)
+    )
+    + cv2.__version__.encode()
 ).hexdigest()
 
 
@@ -43,6 +50,7 @@ def load_video_policy(path: Path | str = DEFAULT_VIDEO_CONFIG) -> dict:
         "crf",
         "preset",
         "encoder_threads",
+        "stadium_follow",
     }:
         raise ValueError(f"{path}: incomplete trajectory video policy")
     for key in ("fps", "max_long_edge", "encoder_threads"):
@@ -62,6 +70,7 @@ def load_video_policy(path: Path | str = DEFAULT_VIDEO_CONFIG) -> dict:
         "veryslow",
     ):
         raise ValueError(f"{path}: unsupported libx264 preset")
+    cfg["stadium_follow"] = follow.validate_follow_policy(cfg["stadium_follow"])
     return cfg
 
 
@@ -192,6 +201,15 @@ def animation_frames(
     scaled = scale_calibration(c, size)
     sx, sy = size[0] / coordinate_size[0], size[1] / coordinate_size[1]
     base = plot.base_image(scaled, reference)
+    follower = (
+        follow.StadiumFollower(
+            scaled,
+            cv2.imread(c.ref_frame) if reference is None else reference,
+            cfg["stadium_follow"],
+        )
+        if background_frames is not None
+        else None
+    )
     canvas = np.zeros_like(base)
     last = {o.key: o.frame for o in points}
     previous = {}
@@ -241,6 +259,7 @@ def animation_frames(
                     canvas, f"finish@{o.frame} (part)", point, 0.4, (0, 255, 255)
                 )
             previous[o.key] = o
+        alignment_status = None
         if background_frames is None:
             image = base.copy()
         else:
@@ -250,7 +269,18 @@ def animation_frames(
                 raise RuntimeError(
                     "source footage ended before the trajectory timeline"
                 ) from error
-            image = plot.base_image(scaled, background)
+            background = cv2.resize(background, size, interpolation=cv2.INTER_AREA)
+            alignment = follower.align(background)
+            if alignment is None:
+                image = background.copy()
+                alignment_status = ("Alignment lost: zones hidden", (80, 80, 255))
+            else:
+                moved = autocalib.warp_calibration(scaled, alignment, size, scaled.name)
+                image = plot.base_image(moved, background)
+                alignment_status = (
+                    f"Follow preview: {alignment.score:.2f}",
+                    (80, 200, 80),
+                )
         mask = np.any(canvas != 0, axis=2)
         image[mask] = canvas[mask]
         image = plot.with_legend(image)
@@ -268,6 +298,9 @@ def animation_frames(
             0.45,
             (240, 240, 240),
         )
+        if alignment_status is not None:
+            text, color = alignment_status
+            plot.label(image, text, (430, canvas.shape[0] + 76), 0.35, color)
         yield image
 
 
