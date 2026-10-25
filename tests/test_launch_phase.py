@@ -111,3 +111,72 @@ def test_opposite_observed_velocity_refuses_fragment_join():
     b = make_track(11, "bey", {4: (140, 180), 5: (130, 180), 6: (120, 180)})
     result = prepare_launch_tracks([a, b], 30, load_launch_policy())
     assert result.members == {10: [10], 11: [11]}
+
+
+def test_bey_gap_records_later_box_clearance_without_resetting_release():
+    frames = [f for f in range(40) if f != 20]
+    bey = make_track(1, "bey", {f: (100, 90 if f < 25 else 180) for f in frames})
+    body = make_track(9, "launcher", {f: (100, 70) for f in range(40)}, size=40)
+    result = prepare_launch_tracks([bey, body], 30, load_launch_policy())
+    assert result.releases == {}
+    assert next(t for t in result.tracks if t.cls == "bey").first_frame() == 0
+    assert 20 not in next(t for t in result.tracks if t.cls == "bey").centers()
+    evidence = result.record()["diagnostics"]["1"]
+    assert evidence["interruption"] == {
+        "reason": "bey_observation_gap",
+        "frame": 20,
+        "next_bey_frame": 21,
+    }
+    assert evidence["box_clear_runs"] == [
+        {
+            "body_track_id": 9,
+            "first_frame": 25,
+            "confirmed_at_frame": 27,
+            "last_frame": 39,
+        }
+    ]
+
+
+def test_missing_body_records_geometric_evidence_without_delayed_release():
+    bey = make_track(1, "bey", {f: (100, 90 if f < 20 else 180) for f in range(250)})
+    body = make_track(
+        9, "launcher", {f: (100, 70) for f in [*range(20), *range(200, 250)]}, size=40
+    )
+    result = prepare_launch_tracks([bey, body], 30, load_launch_policy())
+    assert result.releases == {}
+    assert next(t for t in result.tracks if t.cls == "bey").first_frame() == 0
+    assert result.diagnostics[1]["interruption"] == {
+        "reason": "launcher_observation_missing",
+        "frame": 20,
+    }
+    assert result.diagnostics[1]["box_clear_runs"][0]["first_frame"] == 200
+    assert "launch_release_unobserved@1" in result.notes
+
+
+def test_ambiguous_mounting_does_not_choose_a_body_for_clearance():
+    bey = make_track(1, "bey", {f: (100, 90 if f < 20 else 180) for f in range(40)})
+    bodies = [
+        make_track(tid, "launcher", {f: (100, 70) for f in range(40)}, size=40)
+        for tid in (8, 9)
+    ]
+    result = prepare_launch_tracks([bey, *bodies], 30, load_launch_policy())
+    evidence = result.diagnostics[1]
+    assert evidence["body_track_id"] is None
+    assert evidence["interruption"] == {
+        "reason": "prefix_launcher_ambiguous",
+        "frame": 0,
+    }
+    assert evidence["box_clear_runs"] == []
+    assert result.releases == {}
+
+
+def test_clearance_confirmation_needs_actual_consecutive_observations():
+    # Two clear observations on either side of a missing image cannot make a
+    # three-frame confirmed geometric run; no point is inserted at frame22.
+    bey = make_track(
+        1, "bey", {f: (100, 90 if f < 20 else 180) for f in [*range(22), 23, 24]}
+    )
+    body = make_track(9, "launcher", {f: (100, 70) for f in range(25)}, size=40)
+    result = prepare_launch_tracks([bey, body], 30, load_launch_policy())
+    assert result.releases == {}
+    assert result.diagnostics[1]["box_clear_runs"] == []

@@ -51,6 +51,7 @@ class PreparedLaunch:
     releases: dict[int, int]
     excluded_held: list[int]
     notes: list[str]
+    diagnostics: dict[int, dict]
 
     def record(self):
         return {
@@ -58,6 +59,7 @@ class PreparedLaunch:
             "releases": {str(k): v for k, v in self.releases.items()},
             "excluded_held": self.excluded_held,
             "notes": self.notes,
+            "diagnostics": {str(k): v for k, v in self.diagnostics.items()},
         }
 
 
@@ -69,6 +71,36 @@ def _distance(a, b):
 
 def _size(box):
     return math.hypot(box[2] - box[0], box[3] - box[1])
+
+
+def _box_clear_runs(detections, bodies, owner, margin, required):
+    """Observed rectangle clearance only; never a physical-release estimate."""
+    if owner is None:
+        return []
+    runs = []
+    current = []
+
+    def finish():
+        if len(current) >= required:
+            runs.append(
+                {
+                    "body_track_id": owner,
+                    "first_frame": current[0],
+                    "confirmed_at_frame": current[required - 1],
+                    "last_frame": current[-1],
+                }
+            )
+
+    for detection in detections:
+        observed = [box for tid, box in bodies.get(detection.frame, []) if tid == owner]
+        clear = len(observed) == 1 and _distance(detection.box, observed[0]) > margin
+        if not clear or (current and detection.frame != current[-1] + 1):
+            finish()
+            current = []
+        if clear:
+            current.append(detection.frame)
+    finish()
+    return runs
 
 
 def prepare_launch_tracks(tracks, fps, policy):
@@ -85,6 +117,7 @@ def prepare_launch_tracks(tracks, fps, policy):
     releases = {}
     excluded = []
     notes = []
+    diagnostics = {}
     for t in tracks:
         if t.cls != "bey" or not t.dets:
             prepared.append(Track(t.track_id, t.cls, list(t.dets)))
@@ -95,8 +128,14 @@ def prepare_launch_tracks(tracks, fps, policy):
         owner = None
         release = None
         mounted = False
+        interruption = None
         for index, d in enumerate(ordered):
             if mounted and d.frame != ordered[index - 1].frame + 1:
+                interruption = {
+                    "reason": "bey_observation_gap",
+                    "frame": ordered[index - 1].frame + 1,
+                    "next_bey_frame": d.frame,
+                }
                 break
             candidates = [
                 tid
@@ -115,10 +154,22 @@ def prepare_launch_tracks(tracks, fps, policy):
                     held = []
                 # Only an observed prefix mounting can redefine this track's first appearance.
                 if not held:
+                    interruption = {
+                        "reason": "prefix_launcher_ambiguous"
+                        if candidates
+                        else "prefix_launcher_missing",
+                        "frame": d.frame,
+                    }
                     break
             else:
                 observed = [b for tid, b in bodies.get(d.frame, []) if tid == owner]
                 if len(observed) != 1:
+                    interruption = {
+                        "reason": "launcher_observation_missing"
+                        if not observed
+                        else "launcher_observation_ambiguous",
+                        "frame": d.frame,
+                    }
                     break
                 if (
                     len(observed) == 1
@@ -132,6 +183,20 @@ def prepare_launch_tracks(tracks, fps, policy):
                         break
                 else:
                     free = []
+        # This evidence can recover after an interruption, but cannot change the
+        # strict release result, track lifetime, or eligibility deadline.
+        diagnostics[t.track_id] = {
+            "original_first_frame": ordered[0].frame,
+            "body_track_id": owner if mounted else None,
+            "interruption": interruption,
+            "box_clear_runs": _box_clear_runs(
+                ordered,
+                bodies,
+                owner if mounted else None,
+                policy["body_margin_px"],
+                free_n,
+            ),
+        }
         if release is not None:
             releases[t.track_id] = release
             ordered = [d for d in ordered if d.frame >= release]
@@ -242,4 +307,5 @@ def prepare_launch_tracks(tracks, fps, policy):
         releases,
         excluded,
         notes,
+        diagnostics,
     )
