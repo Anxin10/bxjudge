@@ -733,6 +733,14 @@ def run_batch(
             provenance["runtime"]["detector"] = detector.runtime
         else:
             provenance["runtime"]["detector"] = {"backend": "pytorch"}
+    # Framework imports may reset OpenCV's global thread count. Apply the requested
+    # budget once after initialization and before any decoding/prefetch worker starts.
+    cv2.setNumThreads(policy["opencv_threads"])
+    if provenance is not None:
+        provenance["runtime"]["opencv_threads"] = {
+            "requested": policy["opencv_threads"],
+            "actual": cv2.getNumThreads(),
+        }
     dynamic_signature = None
     if dynamic_config is not None:
         dynamic_signature = {

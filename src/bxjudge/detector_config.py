@@ -141,6 +141,7 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
         "candidate_confidence",
         "evaluation_confidence",
         "device",
+        "opencv_threads",
         "selection_tie_ap",
         "latency_warmup_frames",
         "tracking",
@@ -166,6 +167,8 @@ def load_policy(path: Path | str = "config/detection.yaml") -> dict:
         or cfg["latency_warmup_frames"] < 0
     ):
         raise ValueError("latency_warmup_frames must be a nonnegative integer")
+    if not _positive_int(cfg["opencv_threads"]):
+        raise ValueError("opencv_threads must be a positive integer")
     validate_training(cfg["training"])
     if cfg["training"]["policy"] != "production":
         # Smoke settings live only in their own explicitly selected file.
