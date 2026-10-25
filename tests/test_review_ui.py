@@ -622,14 +622,18 @@ def test_app_trajectory_progress_uses_recorded_csv_and_native_video(tmp_path,mon
     from tests.helpers import make_track
 
     out=results_with_auto_snapshot(tmp_path)
-    row=read_rounds(out)[0]
+    rows=read_rounds(out)
+    rows[0]['t_end']=2.0  # fixture footage is only 3 seconds long
+    (out/'rounds.json').write_text(json.dumps(rows))
+    row=rows[0]
     snap=review_ui.row_calibration(out,row,autocalib=shipped_autocalib())
-    write_trajectory(out,row_to_result(row),{"X":make_track(1,"bey",{0:(200,180),1:(230,180)})},
+    write_trajectory(out,row_to_result(row),{"X":make_track(1,"bey",{30:(200,180),31:(230,180)})},
                      [],snap.calibration,30,{})
     at=app_test(out,monkeypatch).run()
     assert not at.exception,at.exception
     assert len(at.get("video"))==2  # original footage plus seekable trajectory animation
     assert "軌跡動畫" in _text(at) and "原影片時刻" in _text(at)
+    assert '真實陀螺' in _text(at)
     assert any(e.label=="靜態軌跡總覽" for e in at.expander)
     widget(at.button,"確認無誤")
 

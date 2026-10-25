@@ -82,6 +82,9 @@ def scene(tmp_path):
             }
         )
     )
+    from tests.helpers import make_video
+
+    make_video(tmp_path / "source.mp4", seconds=12, fps=10, size=(640, 360))
     return tmp_path, c, row, path, policy, write
 
 
@@ -171,8 +174,8 @@ def test_bad_observations_do_not_create_a_movie(scene, invalid):
     }[invalid]
     write(points)
     with pytest.raises(ValueError):
-        generate_trajectory_video(out, row, c, config=policy)
-    assert not list(out.rglob("*.mp4"))
+        generate_trajectory_video(out, row, c, source=out / "source.mp4", config=policy)
+    assert not list((out / "trajectories").rglob("*.mp4"))
 
 
 def test_real_h264_video_has_expected_duration_and_cache_identity(scene, monkeypatch):
@@ -180,7 +183,9 @@ def test_real_h264_video_has_expected_duration_and_cache_identity(scene, monkeyp
 
     out, c, row, csv_path, policy, write = scene
     protected = csv_path.read_bytes()
-    path = tv.generate_trajectory_video(out, row, c, config=policy)
+    path = tv.generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     data = json.loads(
         subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)]
@@ -191,18 +196,32 @@ def test_real_h264_video_has_expected_duration_and_cache_identity(scene, monkeyp
     assert stream["width"] == 640 and stream["height"] == 446
     assert float(stream["duration"]) == pytest.approx(0.6, abs=0.02)
     before = path.stat().st_mtime_ns
-    assert tv.generate_trajectory_video(out, row, c, config=policy) == path
+    assert (
+        tv.generate_trajectory_video(
+            out, row, c, source=out / "source.mp4", config=policy
+        )
+        == path
+    )
     assert path.stat().st_mtime_ns == before and csv_path.read_bytes() == protected
     c.name = "different snapshot metadata"
-    changed = tv.generate_trajectory_video(out, row, c, config=policy)
+    changed = tv.generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     assert changed != path and changed.is_file()
     write([(1, 10, "X", 1, 350, 200)])
-    changed2 = tv.generate_trajectory_video(out, row, c, config=policy)
+    changed2 = tv.generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     assert changed2 not in (path, changed)
     c_image = cv2.imread(c.ref_frame)
     c_image[200, 350] = (1, 2, 3)
     cv2.imwrite(c.ref_frame, c_image)
-    assert tv.generate_trajectory_video(out, row, c, config=policy) != changed2
+    assert (
+        tv.generate_trajectory_video(
+            out, row, c, source=out / "source.mp4", config=policy
+        )
+        != changed2
+    )
 
 
 def test_failed_encoder_never_publishes_partial_movie(scene, monkeypatch):
@@ -212,12 +231,14 @@ def test_failed_encoder_never_publishes_partial_movie(scene, monkeypatch):
     real = tv.subprocess.Popen
 
     def failing(command, **kwargs):
-        return real(["/bin/false"], **kwargs)
+        return real(["/bin/false"] if "-c:v" in command else command, **kwargs)
 
     monkeypatch.setattr(tv.subprocess, "Popen", failing)
     with pytest.raises(RuntimeError, match="ffmpeg"):
-        tv.generate_trajectory_video(out, row, c, config=policy)
-    assert not list(out.rglob("*.mp4"))
+        tv.generate_trajectory_video(
+            out, row, c, source=out / "source.mp4", config=policy
+        )
+    assert not list((out / "trajectories").rglob("*.mp4"))
 
 
 @pytest.mark.parametrize("change", ["time", "policy", "renderer"])
@@ -227,7 +248,9 @@ def test_cache_is_invalidated_by_timeline_policy_and_renderer(
     from bxjudge import trajectory_video as tv
 
     out, c, row, _, policy, _ = scene
-    first = tv.generate_trajectory_video(out, row, c, config=policy)
+    first = tv.generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     if change == "time":
         row["t_end"] += 0.1
     elif change == "policy":
@@ -236,7 +259,9 @@ def test_cache_is_invalidated_by_timeline_policy_and_renderer(
         policy.write_text(yaml.safe_dump(cfg))
     else:
         monkeypatch.setattr(tv, "_RENDERER_ID", "another renderer")
-    second = tv.generate_trajectory_video(out, row, c, config=policy)
+    second = tv.generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     assert second != first and second.is_file()
 
 
@@ -260,9 +285,11 @@ def test_interruption_reaps_encoder_without_publishing(scene, monkeypatch):
     monkeypatch.setattr(tv, "animation_frames", interrupt)
     monkeypatch.setattr(tv.subprocess, "Popen", record)
     with pytest.raises(KeyboardInterrupt):
-        tv.generate_trajectory_video(out, row, c, config=policy)
+        tv.generate_trajectory_video(
+            out, row, c, source=out / "source.mp4", config=policy
+        )
     assert processes and all(p.poll() is not None for p in processes)
-    assert not list(out.rglob("*.mp4"))
+    assert not list((out / "trajectories").rglob("*.mp4"))
 
 
 def test_final_floating_point_tick_contains_last_observation(scene):
@@ -332,7 +359,7 @@ def test_empty_reference_is_a_handled_media_error(scene):
     out, c, row, _, policy, _ = scene
     Path(c.ref_frame).write_bytes(b"")
     with pytest.raises(ValueError, match="reference"):
-        generate_trajectory_video(out, row, c, config=policy)
+        generate_trajectory_video(out, row, c, source=out / "source.mp4", config=policy)
 
 
 @pytest.mark.parametrize("bad", ["missing", "digest", "size"])
@@ -355,8 +382,8 @@ def test_coordinate_metadata_is_required_and_bound_to_csv(scene, bad):
             data["coordinate_size"] = [True, 360]
         meta.write_text(json.dumps(data))
     with pytest.raises((OSError, ValueError)):
-        generate_trajectory_video(out, row, c, config=policy)
-    assert not list(out.rglob("*.mp4"))
+        generate_trajectory_video(out, row, c, source=out / "source.mp4", config=policy)
+    assert not list((out / "trajectories").rglob("*.mp4"))
 
 
 def test_static_writer_records_coordinate_plane_and_csv_digest(scene):
@@ -378,9 +405,136 @@ def test_cache_includes_recorded_coordinate_plane(scene):
     from bxjudge.trajectory_video import generate_trajectory_video
 
     out, c, row, path, policy, _ = scene
-    first = generate_trajectory_video(out, row, c, config=policy)
+    first = generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     meta = json.loads(path.with_suffix(".json").read_text())
     meta["coordinate_size"] = [1280, 720]
     path.with_suffix(".json").write_text(json.dumps(meta))
-    second = generate_trajectory_video(out, row, c, config=policy)
+    second = generate_trajectory_video(
+        out, row, c, source=out / "source.mp4", config=policy
+    )
     assert first != second
+
+
+def test_real_footage_remains_visible_under_progressive_paths(scene):
+    from bxjudge import trajectory_video as tv
+
+    _, c, row, path, policy, _ = scene
+    cfg = tv.load_video_policy(policy)
+    # A moving synthetic top in untouched source frames, away from trajectory strokes.
+    backgrounds = []
+    for x in range(6):
+        frame = np.full((360, 640, 3), 255, np.uint8)
+        cv2.circle(frame, (350 + x * 20, 200), 10, (30, 40, 200), -1)
+        backgrounds.append(frame)
+    frames = list(
+        tv.animation_frames(
+            row,
+            c,
+            tv.read_observations(path),
+            cfg,
+            coordinate_size=(640, 360),
+            background_frames=iter(backgrounds),
+        )
+    )
+    assert tuple(frames[0][200, 350]) == (30, 40, 200)
+    assert tuple(frames[3][200, 410]) == (30, 40, 200)
+    assert tuple(frames[3][200, 350]) == (
+        255,
+        255,
+        255,
+    )  # old body image must not accumulate
+    assert tuple(frames[3][170, 110]) == (0, 159, 230)  # trajectory still accumulates
+
+
+def test_source_sampling_uses_current_real_frame_at_fractional_and_final_times(
+    tmp_path,
+):
+    from bxjudge.manifest import probe
+    from bxjudge.trajectory_video import footage_frames
+
+    frames = [np.full((180, 320, 3), (i * 20, 30, 40), np.uint8) for i in range(10)]
+    source = tmp_path / "moving.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            "320x180",
+            "-r",
+            "10",
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "0",
+            "-pix_fmt",
+            "yuv444p",
+            str(source),
+        ],
+        input=b"".join(f.tobytes() for f in frames),
+        check=True,
+        capture_output=True,
+    )
+    images = list(footage_frames(source, 0.15, 0.36, 10, 320, probe(source)))
+    assert len(images) == 4  # .15 .25 .35 .36 => frames1,2,3,3
+    assert [int(img[90, 160, 0]) for img in images] == pytest.approx(
+        [20, 40, 60, 60], abs=2
+    )
+
+
+def test_changed_source_content_never_reuses_previous_background(scene):
+    from bxjudge import trajectory_video as tv
+    from tests.helpers import make_video
+
+    out, c, row, _, policy, _ = scene
+    source = out / "source.mp4"
+    first = tv.generate_trajectory_video(out, row, c, source=source, config=policy)
+    make_video(source, seconds=12, fps=12, size=(640, 360))
+    second = tv.generate_trajectory_video(out, row, c, source=source, config=policy)
+    assert second != first and first.is_file() and second.is_file()
+
+
+def test_missing_source_is_an_explicit_error_without_fixed_image_substitution(scene):
+    from bxjudge.trajectory_video import generate_trajectory_video
+
+    out, c, row, _, policy, _ = scene
+    with pytest.raises(OSError):
+        generate_trajectory_video(
+            out, row, c, source=out / "missing.mp4", config=policy
+        )
+    assert not list((out / "trajectories").rglob("*.mp4"))
+
+
+def test_source_sampling_counts_from_original_frame_zero_instead_of_approximate_seek(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from bxjudge import trajectory_video as tv
+
+    seen = {}
+
+    def decode(source, **kwargs):
+        seen.update(kwargs)
+        for i in range(5):
+            yield i, np.full((2, 2, 3), i, np.uint8)
+
+    monkeypatch.setattr(tv, "iter_frames", decode)
+    images = list(
+        tv.footage_frames(
+            Path("source.mp4"), 0.2, 0.3, 10, 1280, SimpleNamespace(fps=10, duration=1)
+        )
+    )
+    assert seen["start"] == 0 and seen["end"] is None
+    assert [int(x[0, 0, 0]) for x in images] == [2, 3]

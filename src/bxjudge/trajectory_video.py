@@ -7,7 +7,7 @@ import json
 import math
 import subprocess
 import tempfile
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import asdict, dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
@@ -20,8 +20,10 @@ from . import trajectory_plot as plot
 from .calibration import scale_calibration
 from .config import config_loader
 from .detector_config import CLASSES
+from .manifest import probe
 from .output import trajectory_png
 from .types import Calibration
+from .video import VideoDecodeError, iter_frames
 
 DEFAULT_VIDEO_CONFIG = (
     Path(__file__).resolve().parents[2] / "config/trajectory_video.yaml"
@@ -182,13 +184,15 @@ def animation_frames(
     *,
     coordinate_size,
     reference=None,
+    background_frames=None,
 ):
     start, end = _bounds(row, points)
     scale = min(1.0, cfg["max_long_edge"] / max(coordinate_size))
     size = tuple(max(1, round(v * scale)) for v in coordinate_size)
     scaled = scale_calibration(c, size)
     sx, sy = size[0] / coordinate_size[0], size[1] / coordinate_size[1]
-    canvas = plot.base_image(scaled, reference)
+    base = plot.base_image(scaled, reference)
+    canvas = np.zeros_like(base)
     last = {o.key: o.frame for o in points}
     previous = {}
     cursor = 0
@@ -237,7 +241,19 @@ def animation_frames(
                     canvas, f"finish@{o.frame} (part)", point, 0.4, (0, 255, 255)
                 )
             previous[o.key] = o
-        image = plot.with_legend(canvas)
+        if background_frames is None:
+            image = base.copy()
+        else:
+            try:
+                background = next(background_frames)
+            except StopIteration as error:
+                raise RuntimeError(
+                    "source footage ended before the trajectory timeline"
+                ) from error
+            image = plot.base_image(scaled, background)
+        mask = np.any(canvas != 0, axis=2)
+        image[mask] = canvas[mask]
+        image = plot.with_legend(image)
         plot.label(
             image,
             f"Video t={current:.3f}s",
@@ -313,7 +329,7 @@ def _encode(frames, path: Path, cfg):
             proc.wait()
             errors.seek(0)
             raise RuntimeError(
-                f"ffmpeg encoding failed: {errors.read().decode(errors='replace')[-1500:]}"
+                f"ffmpeg encoding failed: {error}; {errors.read().decode(errors='replace')[-1500:]}"
             ) from error
         finally:
             # Kill before flushing/closing stdin, including on KeyboardInterrupt.
@@ -326,15 +342,71 @@ def _encode(frames, path: Path, cfg):
         raise RuntimeError("ffmpeg did not produce a complete MP4")
 
 
+def _sample_time(start, end, fps):
+    count = (
+        int(
+            ((Decimal(str(end)) - Decimal(str(start))) * fps).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        + 1
+    )
+    for index in range(count):
+        yield end if index == count - 1 else min(end, start + index / fps)
+
+
+def _frame_number(t, fps):
+    value = t * fps
+    nearest = round(value)
+    return (
+        nearest
+        if math.isclose(value, nearest, rel_tol=0, abs_tol=1e-7)
+        else math.floor(value)
+    )
+
+
+def footage_frames(
+    source: Path, start: float, end: float, fps: int, long_edge: int, info
+):
+    """Sample the original displayed source frame at or before each animation time."""
+    # The saved tracks count frames from source zero. Timestamp seeking can land at
+    # another frame on phone/VFR clips, so discard the prefix by its actual frame index.
+    with closing(
+        iter_frames(source, start=0, end=None, long_edge=long_edge, hwaccel="cpu")
+    ) as decoded:
+        upcoming = next(decoded, None)
+        last = None
+        for current in _sample_time(start, end, fps):
+            target = _frame_number(current, info.fps)
+            while upcoming is not None and upcoming[0] <= target:
+                last = upcoming
+                upcoming = next(decoded, None)
+            if last is None or last[0] != target:
+                raise RuntimeError(
+                    f"source footage missing frame {target}; no image substitution"
+                )
+            yield last[1]
+
+
+def _source_hash(source):
+    with source.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def generate_trajectory_video(
-    out: Path, row: dict, c: Calibration, *, config=DEFAULT_VIDEO_CONFIG
+    out: Path, row: dict, c: Calibration, *, source: Path, config=DEFAULT_VIDEO_CONFIG
 ) -> Path:
     cfg = load_video_policy(config)
     csv_path = trajectory_png(out, row["video"], row["round"]).with_suffix(".csv")
     raw = csv_path.read_bytes()
     points = _parse_observations(raw)
     coordinate_size = read_coordinate_size(csv_path, raw)
-    _bounds(row, points)
+    start, end = _bounds(row, points)
+    source = Path(source).resolve()
+    source_before = _source_hash(source)
+    info = probe(source)
+    if end >= info.duration:
+        raise ValueError("trajectory timeline extends beyond the source video")
     reference_raw = Path(c.ref_frame).read_bytes()
     try:
         reference = cv2.imdecode(
@@ -352,6 +424,12 @@ def generate_trajectory_video(
             "timing": timing,
             "policy": cfg,
             "renderer": _RENDERER_ID,
+            "source": {
+                "path": str(source),
+                "sha256": source_before,
+                "fps": info.fps,
+                "size": [info.width, info.height],
+            },
         },
         sort_keys=True,
     ).encode()
@@ -365,17 +443,30 @@ def generate_trajectory_video(
         return output
     with tempfile.TemporaryDirectory(prefix=".render-", dir=cache) as directory:
         pending = Path(directory) / "movie.mp4"
-        _encode(
-            animation_frames(
-                timing,
-                c,
-                points,
-                cfg,
-                coordinate_size=coordinate_size,
-                reference=reference,
-            ),
-            pending,
-            cfg,
-        )
+        try:
+            with closing(
+                footage_frames(
+                    source, start, end, cfg["fps"], cfg["max_long_edge"], info
+                )
+            ) as backgrounds:
+                _encode(
+                    animation_frames(
+                        timing,
+                        c,
+                        points,
+                        cfg,
+                        coordinate_size=coordinate_size,
+                        reference=reference,
+                        background_frames=backgrounds,
+                    ),
+                    pending,
+                    cfg,
+                )
+        except VideoDecodeError as error:
+            raise RuntimeError(f"cannot decode source footage: {error}") from error
+        if _source_hash(source) != source_before:
+            raise RuntimeError(
+                "source footage changed during rendering; result not published"
+            )
         pending.replace(output)
     return output

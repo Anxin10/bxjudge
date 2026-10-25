@@ -141,13 +141,15 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
     st.subheader("該回合軌跡圖")
     if calibration is None:
         st.warning("沒有判定時的校準參考圖，無法產生軌跡動畫。")
+    elif isinstance(source,str):
+        st.warning("沒有可讀取的原始影片，無法產生實景軌跡動畫。")
     else:
         try:
             with st.spinner("產生軌跡動畫…首次需要一點時間，之後可直接重播"):
-                movie = generate_trajectory_video(out, row, calibration)
+                movie = generate_trajectory_video(out, row, calibration, source=source)
             st.video(str(movie), format="video/mp4")
             st.caption("軌跡動畫 · 1 倍速，可播放、暫停、拖曳進度；圖下 Video t 是原影片時刻。"
-                       "背景是判定時的固定校準參考圖，線條依已存觀測逐步出現。")
+                       "背景為原始影片，能直接看見真實陀螺；線條依已存觀測逐步出現。")
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             st.warning(f"軌跡動畫無法產生：{error}")
     st.caption("X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認。"
