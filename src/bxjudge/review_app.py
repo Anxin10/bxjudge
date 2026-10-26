@@ -148,7 +148,9 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
     else:
         st.info("沒有原始影片，無法擷取截圖。")
     st.subheader("該回合軌跡圖")
-    if calibration is None:
+    if 'two_bey_singleton_segment' in row['review_reasons']:
+        st.info('此片段尚未確認兩顆陀螺，不建立新的正式陀螺身分；原始觀測仍保留供覆核，請查看上方原片與前後文。')
+    elif calibration is None:
         st.warning("沒有判定時的校準參考圖，無法產生軌跡動畫。")
     elif isinstance(source,str):
         st.warning("沒有可讀取的原始影片，無法產生實景軌跡動畫。")
@@ -162,7 +164,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             st.warning(f"軌跡動畫無法產生：{error}")
     st.caption("X 橘、B 藍；○ 起點、× 終點；灰色／? 為身分未確認。"
-               "起終點是每段軌跡的首末觀測，不等於發射／停止位置；缺失觀測不連線。")
+               "起終點是實測首末點，不等於發射／停止。兩實體結果以穩定編號與不同顏色區分未知側別，虛線是顯示插值、不作裁判證據；舊結果不補線。")
     png = trajectory_png(out, row["video"], row["round"])
     with st.expander("靜態軌跡總覽"):
         if png.is_file():

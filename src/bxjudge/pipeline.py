@@ -375,6 +375,17 @@ def judge_video(
                 for t in round_tracks
             ]
             current = [t for t in selected if t.cls == "bey" and t.dets]
+            if number in physical_rounds and physical_rounds[number].record['segment_status']=='pair_not_confirmed':
+                # This candidate stays in the evaluation/review population, but
+                # cannot acquire a new physical ID or fabricated launch analysis.
+                r=RoundResult(info.path.name,number,start/info.fps,end/info.fps,None,None,None,0,0.,True,
+                    ['two_bey_tracking_requires_review','two_bey_singleton_segment','two_bey_unassigned_identity_unknown',*calibration_notes])
+                r.geometry_evidence=geometry_evidence
+                results.append(r)
+                write_trajectory(out_dir,r,{},[],c,info.fps,
+                    {'landing_X':None,'landing_B':None,'air_collision':None,'finish':None},
+                    judgment_tracks=[],unassigned=[])
+                continue
             launchers = [t for t in tracks if t.cls == "launcher"]
             analysis = analyze_launch(
                 current,

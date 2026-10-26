@@ -24,26 +24,30 @@ PYTHONPATH=src .venv/bin/python -m bxjudge.cli run \
   --two-bey-tracking config/two_bey_tracking.yaml --no-vlm --rejudge
 ```
 
-`two_bey_tracking.yaml`管理最多兩個身分、關聯、重複框及Kalman參數。每個來源回合重設，
+`two_bey_tracking.yaml`管理最多兩個身分、關聯、重複框及Kalman參數。連續兩個來源影格
+都實際觀測到兩顆後，才發布該回合的正式物理身分；單顆或未連續共現的片段只保留
+暫定觀測，不發布新的正式身分，也不產生發射／勝負分析。每個來源回合重設，
 Hungarian一對一配對不會讓同一框同時屬兩顆；固定native歸屬矛盾時保留未指派，不悄悄
 交換身份。首次建立身分仍可能誤認，因此新模式繼續要求覆核。沒有足夠身分／幾何或
 仍有未解釋原框時，不輸出確定勝方。無新回合也保存原始偵測與動態幾何。
 
-本次正式重跑：7279筆來源陀螺觀測中，7133筆進入兩實體軌跡、146筆另存未指派；
+本次正式重跑：7279筆來源陀螺觀測中，7121筆進入兩實體軌跡、158筆另存未指派；
 兩個主要回合分別只有2個物理ID。66/66已人工核對的X/B原框匹配，10組已確認同物件
 案例的身分歸屬一致（重複原框可由同實體代表框表示，不當額外採納的裁判觀測）。
 顯示補點516筆，全部標為非裁判證據。這些是兩支重複使用的開發片，不是獨立準確率。
-完整核心wall time 250.31秒／253.43秒影片，正式R66a speed_ratio 0.994 PASS，關閉VLM；
+完整批次wall time 242.48秒／253.43秒影片，正式R66a speed_ratio 0.957 PASS，關閉VLM；
 測量時另有測試程序運行，不能外推其他片、硬體或含VLM的速度。
 
-另一個原分段只有0.37秒、僅一顆觀測，仍列為未確認片段；未假造第二顆或改掉舊人工
-判決。這段是否屬賽後收拾仍待確認，故不宣稱全部分段／全片身分已驗收。
+另一個原分段只有0.37秒、僅一顆觀測；12筆原始觀測全部保留於未確認片段，不新增
+第三個正式身分，也不假造第二顆。該列仍在覆核及評估人口中；未修改舊人工判決，
+也未擅自認定它是賽後收拾。兩實體整合與連續播放已接入，仍未具備全片逐框真值
+或獨立裁判準確率驗收；三列新結果都要求人工覆核。
 
 從正式新結果匯出可播放證據（兩個out都必須是新資料夾）：
 
 ```bash
 PYTHONPATH=src:. .venv/bin/python scripts/export_two_bey_results.py \
-  --results runs/two-bey-tracking-20261026/core-final \
+  --results runs/two-bey-tracking-20261026/core-paired \
   --reference-pointer .superpowers/sdd/launch-state-20261026/current-confirmed-reference.json \
   --out runs/two-bey-tracking-20261026/new-export
 PYTHONPATH=src:. .venv/bin/python scripts/render_two_beys.py \
@@ -78,7 +82,7 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --appearance-set runs/reid-appearance-20261026/diagnostics-final \
   --contrast-set runs/reid-contrast-20261026/diagnostics-final \
   --challenge-set runs/reid-challenge-20261026/site \
-  --two-bey-set runs/two-bey-tracking-20261026/published-preview
+  --two-bey-set runs/two-bey-tracking-20261026/paired-preview
 ```
 
 `--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。

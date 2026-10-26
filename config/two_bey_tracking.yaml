@@ -1,5 +1,6 @@
 # Per-round reconstruction of two physical tops; no adjudication from predictions.
 max_targets: 2
+pair_confirmation_frames: 2
 duplicate_iou: 0.6
 position_weight: 2.0
 appearance_weight: 1.0

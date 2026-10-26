@@ -248,6 +248,9 @@ def build(reconstruction_path, config_path, output):
                     "sha256": sha(path),
                     "frame_count": count,
                     "entity_count": row["observed_entity_count"],
+                    "tentative_entity_count": row["tentative_entity_count"]
+                    if data["origin"] == "formal_saved_two_bey_geometry"
+                    else row["observed_entity_count"],
                     "interpolated_points": row["interpolated_frames"],
                     "unassigned_observations": len(row["unassigned"]),
                     "matched_human_observations": sum(
@@ -281,7 +284,7 @@ def build(reconstruction_path, config_path, output):
             note = (
                 "兩個持續身分；橘／藍實線為實測，虛線或十字為插值。"
                 if r["entity_count"] == 2
-                else "此舊分段只觀測到一顆；不虛構第二顆，分段是否為新回合仍待修正。"
+                else f"此段有{r['tentative_entity_count']}個暫定物件，未確認雙顆對戰；原框保留供覆核，不建立第三個正式身分。"
             )
             target_cards = cards if r["entity_count"] == 2 else unconfirmed_cards
             target_cards.append(

@@ -16,6 +16,7 @@ def load_policy(path):
     p = yaml.safe_load(Path(path).read_text())
     keys = {
         "max_targets",
+        "pair_confirmation_frames",
         "duplicate_iou",
         "position_weight",
         "appearance_weight",
@@ -38,6 +39,8 @@ def load_policy(path):
         or p["max_targets"] != 2
     ):
         raise ValueError("two-bey policy must explicitly configure exactly two targets")
+    if type(p['pair_confirmation_frames']) is not int or p['pair_confirmation_frames']<2:
+        raise ValueError('two-bey pair requires at least two actual source frames')
     for k in keys - {"max_targets", "appearance_bins"}:
         if type(p[k]) not in (int, float) or not math.isfinite(p[k]) or p[k] <= 0:
             raise ValueError("invalid two-bey policy value")

@@ -72,6 +72,28 @@ def reconstruct_round_tracks(
             for d in result["unassigned"]
         )
     entities = sorted({d["entity_id"] for d in observations})
+    per_frame = Counter(d["frame"] for d in observations)
+    streak = 0
+    confirmed_at = None
+    for f in range(first, last + 1):
+        streak = streak + 1 if per_frame[f] == 2 else 0
+        if streak >= policy["pair_confirmation_frames"]:
+            confirmed_at = f
+            break
+    hypotheses = []
+    tentative_entities = len(entities)
+    if confirmed_at is None:
+        hypotheses = observations
+        unassigned.extend(
+            {
+                **{k: v for k, v in d.items() if k != "entity_id"},
+                "tentative_entity_id": d["entity_id"],
+                "reason": "pair_not_confirmed",
+            }
+            for d in hypotheses
+        )
+        observations = []
+        entities = []
     physical = [
         Track(
             id_offset + eid,
@@ -99,6 +121,12 @@ def reconstruct_round_tracks(
             "last_frame": last,
             "configured_slots": 2,
             "observed_entities": len(entities),
+            "segment_status": "paired_observations"
+            if confirmed_at is not None
+            else "pair_not_confirmed",
+            "pair_confirmed_at_frame": confirmed_at,
+            "tentative_entities": tentative_entities,
+            "hypothesis_observations": hypotheses,
             "max_physical_tops_per_frame": max(
                 Counter(d["frame"] for d in observations).values(), default=0
             ),

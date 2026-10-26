@@ -40,8 +40,11 @@ def build(results, reference_pointer, output):
         if row.get("geometry_evidence") is None:
             raise ValueError("formal two-bey row is missing saved geometry")
         path = (results / row["geometry_evidence"]["path"]).resolve()
-        if not path.is_relative_to(results/'geometry') or sha(path)!=row['geometry_evidence']['sha256']:
-            raise ValueError('formal geometry path or SHA mismatch')
+        if (
+            not path.is_relative_to(results / "geometry")
+            or sha(path) != row["geometry_evidence"]["sha256"]
+        ):
+            raise ValueError("formal geometry path or SHA mismatch")
         raw = read(path)
         source = Path(raw["source"]).resolve()
         digest = sha(source)
@@ -64,6 +67,12 @@ def build(results, reference_pointer, output):
         entities = sorted({d["entity_id"] for d in observations})
         if len(entities) > 2 or stored["configured_slots"] != 2:
             raise ValueError("formal geometry contains more than two physical tops")
+        if (
+            stored["segment_status"] == "paired_observations" and len(entities) != 2
+        ) or (stored["segment_status"] == "pair_not_confirmed" and entities):
+            raise ValueError(
+                "formal paired-segment status contradicts physical trajectories"
+            )
         matches = []
         for r in human:
             if (
@@ -117,6 +126,9 @@ def build(results, reference_pointer, output):
                 "coordinate_size": geometry["reference_size"],
                 "configured_entity_slots": 2,
                 "observed_entity_count": len(entities),
+                "segment_status": stored["segment_status"],
+                "tentative_entity_count": stored["tentative_entities"],
+                "hypothesis_observations": stored["hypothesis_observations"],
                 "observed": observations,
                 "unassigned": stored["unassigned"],
                 "points": points,

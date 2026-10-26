@@ -139,6 +139,8 @@ def validate_two_bey_set(folder: Path):
         path=(folder/preview['path']).resolve()
         if not path.is_relative_to(folder) or _sha(path)!=preview['sha256'] or not 0<=preview['entity_count']<=2:
             raise ValueError('two-bey video SHA or entity count mismatch')
+        if manifest['formal_core_applied_two_bey_tracking'] and preview['entity_count'] not in (0,2):
+            raise ValueError('formal preview must not publish a singleton physical identity')
     return manifest
 
 

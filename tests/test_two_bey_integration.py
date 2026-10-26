@@ -59,8 +59,47 @@ def test_a_new_round_has_fresh_physical_ownership():
         load_policy(Path("config/two_bey_tracking.yaml")),
         200,
     )
-    assert len(result.tracks) == 1 and result.tracks[0].track_id == 201
-    assert result.members == {201: [3]}
+    assert result.tracks == [] and result.members == {}
+    assert result.record["segment_status"] == "pair_not_confirmed"
+    assert result.record["tentative_entities"] == 1
+    assert [d["native_id"] for d in result.record["unassigned"]] == [3, 3]
+    assert all(d["reason"] == "pair_not_confirmed" for d in result.record["unassigned"])
+
+
+def test_two_sequential_objects_never_observed_together_do_not_confirm_a_battle():
+    result = reconstruct_round_tracks(
+        [t(1, [0, 1], 10), t(2, [5, 6], 100)],
+        0,
+        6,
+        30,
+        (200, 100),
+        {},
+        load_policy(Path("config/two_bey_tracking.yaml")),
+        100,
+    )
+    assert result.tracks == []
+    assert result.record["pair_confirmed_at_frame"] is None
+    assert (
+        result.record["raw_input_bey_observations"]
+        == len(result.record["unassigned"])
+        == 4
+    )
+
+
+def test_pair_confirmation_requires_consecutive_actual_source_frames():
+    tracks = [t(1, [0, 2, 4], 10), t(2, [0, 2, 4], 100)]
+    r = reconstruct_round_tracks(
+        tracks,
+        0,
+        4,
+        30,
+        (200, 100),
+        {},
+        load_policy(Path("config/two_bey_tracking.yaml")),
+        100,
+    )
+    assert r.tracks == [] and r.record["pair_confirmed_at_frame"] is None
+    assert len(r.record["hypothesis_observations"]) == 6
 
 
 def test_cli_forwards_the_explicit_two_bey_policy(tmp_path, monkeypatch):
@@ -149,6 +188,32 @@ def invoke_two_pipeline(source, tmp_path, rules, th):
         dynamic_config=DEFAULT_DYNAMIC_CONFIG,
         two_bey_config=Path("config/two_bey_tracking.yaml"),
     )
+
+
+def test_single_top_candidate_preserves_population_without_publishing_a_third_id(
+    tmp_path, monkeypatch, th, rules
+):
+    import csv
+    import json
+
+    from bxjudge.rules import is_not_a_round
+    from tests.helpers import make_track
+
+    tracks = [make_track(1, "bey", {f: (350, 360) for f in range(35, 75)})]
+    source = pipeline_setup(monkeypatch, tmp_path, tracks)
+    [r] = invoke_two_pipeline(source, tmp_path, rules, th)
+    assert r.needs_review and r.finish is None and r.winner is None
+    assert not is_not_a_round(r.review_reasons)
+    assert r.launch is None and r.motion_evidence is None
+    assert "two_bey_singleton_segment" in r.review_reasons
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_bytes())[
+        "two_bey_tracking"
+    ]["rounds"]["1"]
+    assert data["observed_entities"] == 0 and data["tentative_entities"] == 1
+    assert len(data["hypothesis_observations"]) == len(data["unassigned"]) == 40
+    assert data["observations"] == [] and data["members"] == {}
+    csv_path = next((tmp_path / "out/trajectories").glob("*.csv"))
+    assert not any(d["cls"] == "bey" for d in csv.DictReader(csv_path.open()))
 
 
 def test_unassigned_unknown_native_observations_still_block_a_winner(

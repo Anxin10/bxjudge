@@ -203,6 +203,18 @@ def test_app_lists_rounds_and_shows_evidence(batch):
     widget(at.checkbox, "此回合另起新場")
 
 
+def test_unconfirmed_pair_does_not_present_a_single_top_as_a_new_trajectory(batch):
+    path=batch/'rounds.json'
+    rows=json.loads(path.read_bytes())
+    rows[0]['review_reasons'].append('two_bey_singleton_segment')
+    path.write_text(json.dumps(rows))
+    before=path.read_bytes()
+    at=pick(app().run(),'a.mp4::1')
+    text=' '.join(e.value for e in at.info)
+    assert '尚未確認兩顆陀螺' in text and '不建立新的正式陀螺身分' in text
+    assert path.read_bytes()==before
+
+
 def test_app_saves_a_correction_that_persists(batch):
     at = pick(app().run(), "a.mp4::1")
     widget(at.selectbox, "獲勝方").set_value("B")
