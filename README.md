@@ -22,13 +22,51 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --results runs/fragment-refinement-20261026/pilot \
   --human-results runs/trt-final-20261025/pilot \
   --evidence runs/fragment-refinement-20261026/evidence \
-  --core-commit "$(git rev-parse HEAD)"
+  --core-commit 6e68fcc250f73dd181803a90cef2e7d8a2ee3041 \
+  --review-set runs/reid-review-20261026/site-ready
 ```
 
-`--core-commit` 必須記錄輸入結果實際量測的版本；上例只適用程式仍與當次量測一致時。
-如果已修改程式，請改填量測記錄的版本，不能用新的 HEAD 冒充重新量測。首頁來源與 SHA-256
+`--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。
+文件或核對工具的新提交不能冒充已重新量測裁判核心。首頁來源與 SHA-256
 列於 `/_workbench/snapshot.json`。建置保留舊首頁與子頁備份，僅增加工作台導覽；
 不會重設原逐格核對頁的儲存端點或草稿。
+
+### 新增的斷點局部核對
+
+固定入口：<http://127.0.0.1:8504/reid-review/>。只核對保留的五組疑點，不重做原本三回合。
+播放來源影格計數的前後短片，比較①／②候選框，選同一顆／不同顆／看不清及同回合
+狀態，再勾「這組已核對」。X／B、可見性與是否碰撞是獨立欄位，可以留空或選不知道。
+同回合的局部答案不會自動建立全場已驗證 scope，也不自動建立外觀參考庫或改判決。
+
+按「保存到專案」後，收到檔名和 SHA-256 才是已存版本；瀏覽器草稿與匯出 JSON 都
+不等於專案保存。每次修訂另存 `runs/reid-review-20261026/submissions/reid-<sha>.json`，
+可用「載入選定版本」跨瀏覽器手動取回，不自動覆蓋目前草稿。原 identity-audit 頁與
+它的提交仍使用原本獨立資料夾和既有格式，沒有轉換舊提交或改寫原人工標記。
+
+建立新核對版本（輸出必須是新目錄，不覆寫已有核對集；沒有模型推論）：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_reid_review.py \
+  --diagnostics runs/fragment-refinement-20261026/evidence/fragment-refinement/diagnostics.json \
+  --tracks-dir .superpowers/sdd/identity-continuation-20261026 \
+  --out runs/reid-review-20261026/site-ready \
+  --coordinate-size 1280 720 --context-s 1.0
+```
+
+來源影片、原始 native boxes、FPS、裁切影格範圍、影片／端點圖 SHA 和產生器版本存於
+`manifest.json`；目前輸入 cache 是之前保存的原始觀測，未包含新的人工作證。
+上方工作台建置會驗證媒體並安裝這份核對集；新 manifest 不會靜默取代已安裝的不同版本。
+
+同一個服務維護兩個核對頁的現行保存端點，僅綁 localhost；若8504已有服務勿重複啟動。
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bxjudge.workbench_server \
+  --site runs/dynamic-referee-20261025 \
+  --identity-submissions .superpowers/sdd/identity-launch-20261025/submissions \
+  --reid-submissions runs/reid-review-20261026/submissions --port 8504
+```
+
+此層僅收集人工疑點資料；全場範圍確認、凍結參考庫、外觀提案與重新辨識匹配仍未實作。
 
 ### 軌跡接續現況
 
