@@ -24,7 +24,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --evidence runs/fragment-refinement-20261026/evidence \
   --core-commit 6e68fcc250f73dd181803a90cef2e7d8a2ee3041 \
   --review-set runs/reid-review-20261026/site-ready \
-  --appearance-set runs/reid-appearance-20261026/diagnostics-final
+  --appearance-set runs/reid-appearance-20261026/diagnostics-final \
+  --contrast-set runs/reid-contrast-20261026/diagnostics-final
 ```
 
 `--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。
@@ -94,6 +95,27 @@ PYTHONPATH=src .venv/bin/python scripts/analyze_reid_appearance.py \
 
 JSON凍結來源／設定／人工修訂／程式與crop雜湊；CLI輸出完整離線工具wall time，頁面另標
 取樣特徵時間的範圍。這不是整套裁判時間，不沿用舊核心速度PASS到新模組。
+
+### 沿用人工標記的不同顆對照
+
+<http://127.0.0.1:8504/reid-contrast/> 已加入統一工作台，不需重做核對。工具只取人工確認、
+同一影格中唯一X與B皆為陀螺且已分離的原框；掛載／未知／壞偵測不作負對照，不沿native
+ID外推其他格。最新f1618修訂包含在來源中。原38個標註影格保留人口統計，6個符合條件，
+其餘10個缺乏唯一雙側、22個含未分離狀態；6對來自2支影片、3個相關區間，不是6場獨立比賽。
+
+這批同顆案例的色彩距離中位數範圍0.174–0.398，不同顆同格距離0.671–0.826；梯度紋理
+範圍有重疊。兩種取樣條件不等價、同片資料相關，也尚未包含足夠同色陀螺，因此不選
+匹配閾值、不計新準確率或啟用自動接續。所有`applied=false`。來源原片、人工參考修訂、
+原始觀測manifest與裁切皆綁SHA，獨立保存到新資料夾；工作台發布前重新驗證。
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/analyze_reid_contrast.py \
+  --reference-pointer .superpowers/sdd/launch-state-20261026/current-confirmed-reference.json \
+  --identity-manifest runs/dynamic-referee-20261025/identity-audit/manifest.json \
+  --appearance-set runs/reid-appearance-20261026/diagnostics-final \
+  --config config/reid_appearance.yaml \
+  --out runs/reid-contrast-20261026/new-diagnostics
+```
 
 ### 軌跡接續現況
 
