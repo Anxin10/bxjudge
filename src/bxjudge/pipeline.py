@@ -78,6 +78,8 @@ from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
 from .track import track_frames
 from .trajectory_video import load_video_policy
+from .two_bey_integration import appearance_descriptor, reconstruct_round_tracks
+from .two_bey_tracking import load_policy as load_two_bey_policy
 from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames, prefetched
 from .vlm import load_vlm_config, review_results_dir
@@ -165,6 +167,7 @@ def judge_video(
     autocalib: AutoCalibConfig,
     snapshot: Snapshot | None | object = _SELECT,
     dynamic_config: Path | None = None,
+    two_bey_config: Path | None = None,
     on_snapshot: Callable[[Snapshot | None], None] | None = None,
     vetoed: set[str] | frozenset[str] = frozenset(),
 ) -> list[RoundResult]:
@@ -181,6 +184,9 @@ def judge_video(
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
     """
+    if two_bey_config is not None and dynamic_config is None:
+        raise ValueError('two-bey tracking requires dynamic calibration')
+    two_policy=load_two_bey_policy(two_bey_config) if two_bey_config is not None else None
     evidence_confidence = load_policy(detection_config)["confidence"]
     source_before = None
     if dynamic_config is not None:
@@ -233,6 +239,7 @@ def judge_video(
                 )
             disp = {}
             crops = {}
+            appearances={}
 
             def measured():
                 for f, image, displacement in iter_stadium_displacement(
@@ -254,6 +261,8 @@ def judge_video(
                 detections = detector(image, f)
                 for d in detections:
                     if d.cls == "bey" and d.score >= evidence_confidence:
+                        if two_policy is not None:
+                            appearances[(d.frame,tuple(d.box))]=appearance_descriptor(image,d.box,two_policy['appearance_bins'])
                         crop = _crop(image, d.box)
                         if crop is not None:
                             crops[(d.frame, tuple(d.box))] = crop
@@ -265,6 +274,7 @@ def judge_video(
                     prepared_frames, detecting, info.fps, config=detection_config
                 )
         phase = None
+        native_tracks=list(tracks)
         side_hints = {}
         geometry_evidence = None
         if geometry is not None:
@@ -297,23 +307,51 @@ def judge_video(
                     "sides": {str(k): v for k, v in side_hints.items()},
                 },
             }
-            geometry_evidence = save_geometry(out_dir, info.path.name, record)
+            if two_policy is None:
+                geometry_evidence = save_geometry(out_dir, info.path.name, record)
         raw_tracks = tracks
         raw_by_id = {t.track_id: t for t in raw_tracks}
         bey_tracks = [t for t in raw_tracks if t.cls == "bey"]
         rounds = segment_rounds(bey_tracks, info.fps, th)
+        physical_rounds={}
+        adjudication_rounds={}
+        if two_policy is not None:
+            offset=max((t.track_id for t in native_tracks),default=0)
+            phase_keys={(d.frame,tuple(d.box),d.score) for t in raw_tracks if t.cls=='bey' for d in t.dets}
+            for number,(start,end) in enumerate(rounds,1):
+                physical=reconstruct_round_tracks(native_tracks,start,end,info.fps,c.frame_size,appearances,two_policy,offset+number*2)
+                physical_rounds[number]=physical
+                adjudication_rounds[number]=[Track(t.track_id,t.cls,[d for d in t.dets if (d.frame,tuple(d.box),d.score) in phase_keys]) for t in physical.tracks]
+                for track in physical.tracks:
+                    raw_by_id[track.track_id]=track
+                    known={anchors.sides[tid] for tid in physical.members[track.track_id] if tid in anchors.sides}
+                    if len(known)==1:
+                        side_hints[track.track_id]=next(iter(known))
+            record['two_bey_tracking']={'policy':two_policy,'rounds':{str(n):p.record for n,p in physical_rounds.items()},
+                'raw_source_tracks':[asdict(t) for t in native_tracks], 'association_source':'native_tracks',
+                'adjudication_filter':'observed_phase_prepared_points_only'}
+            record['identity']['physical_sides']={str(t.track_id):side_hints.get(t.track_id) for p in physical_rounds.values() for t in p.tracks}
+            geometry_evidence=save_geometry(out_dir,info.path.name,record)
         if geometry is not None:
             tracks = normalize_tracks(raw_tracks, geometry.samples)
         if not rounds:
+            empty_results=[_review(info.path.name,info.duration,'no_round')]
+            if two_policy is not None:
+                empty_results[0].geometry_evidence=geometry_evidence
             return _calibrated(
                 _provenance(
-                    [_review(info.path.name, info.duration, "no_round")], provenance
+                    empty_results, provenance
                 ),
                 snap,
             )
         results = []
         last_decoded_frame = max(disp)
         for number, (start, end) in enumerate(rounds, 1):
+            round_raw_tracks=raw_tracks
+            round_tracks=tracks
+            if number in physical_rounds:
+                round_raw_tracks=[t for t in raw_tracks if t.cls!='bey']+physical_rounds[number].tracks
+                round_tracks=normalize_tracks([t for t in raw_tracks if t.cls!='bey']+adjudication_rounds[number],geometry.samples)
             next_start = (
                 rounds[number][0] if number < len(rounds) else last_decoded_frame + 1
             )
@@ -334,7 +372,7 @@ def judge_video(
                         <= (part_end if t.cls == "bey_part" else end)
                     ],
                 )
-                for t in tracks
+                for t in round_tracks
             ]
             current = [t for t in selected if t.cls == "bey" and t.dets]
             launchers = [t for t in tracks if t.cls == "launcher"]
@@ -404,7 +442,7 @@ def judge_video(
                 # Geometry may hide a raw unidentified opponent. Its absence in
                 # normalized tracks cannot turn it into evidence for a winner.
                 active_ids = {
-                    t.track_id for t in raw_tracks
+                    t.track_id for t in round_raw_tracks
                     if t.cls == "bey" and any(start <= d.frame <= end for d in t.dets)
                 }
                 unanchored = sorted(active_ids - side_hints.keys())
@@ -416,8 +454,18 @@ def judge_video(
                         [*finish.reasons, "identity_unanchored"],
                     )
                 dynamic_notes.extend(
-                    n for n in phase.notes if int(n.rsplit("@", 1)[1]) in active_ids
+                    n for n in phase.notes if int(n.rsplit("@", 1)[1]) in active_ids or
+                    (number in physical_rounds and any(int(n.rsplit('@',1)[1]) in ids for ids in physical_rounds[number].members.values()))
                 )
+                if number in physical_rounds:
+                    dynamic_notes.append('two_bey_tracking_requires_review')
+                    if physical_rounds[number].record['observed_entities']<2:
+                        dynamic_notes.append('two_bey_singleton_segment')
+                    if physical_rounds[number].record['unassigned']:
+                        dynamic_notes.append('two_bey_unassigned_observations')
+                        if any(d['reason']!='duplicate_box' for d in physical_rounds[number].record['unassigned']):
+                            dynamic_notes.append('two_bey_unassigned_identity_unknown')
+                            finish=type(finish)(None,None,None,0.,[*finish.reasons,'two_bey_unassigned_identity_unknown'])
                 if any(len(phase.members.get(tid, [])) > 1 for tid in active_ids):
                     dynamic_notes.append("identity_join_requires_review")
             # A stop arising only after the result is settled is a note (R55).
@@ -540,7 +588,7 @@ def judge_video(
                         t.cls,
                         [d for d in t.dets if start <= d.frame <= end],
                     )
-                    for t in raw_tracks
+                    for t in round_raw_tracks
                     if t.cls == "bey"
                     and any(start <= d.frame <= end for d in t.dets)
                     and t.track_id not in {v.track_id for v in bey.values()}
@@ -694,6 +742,7 @@ def run_batch(
     autocalib: AutoCalibConfig | None = None,
     rejudge: bool = False,
     dynamic_config: Path | None = None,
+    two_bey_config: Path | None = None,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -723,6 +772,10 @@ def run_batch(
         load_dynamic_policy(dynamic_config)
         load_launch_policy()
         load_video_policy()
+    if two_bey_config is not None:
+        if dynamic_config is None:
+            raise ValueError('two-bey tracking requires dynamic calibration')
+        load_two_bey_policy(two_bey_config)
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
@@ -782,6 +835,12 @@ def run_batch(
             "follow": load_video_policy()["stadium_follow"],
             "phase": load_launch_policy(),
         }
+        if two_bey_config is not None:
+            dynamic_signature['two_bey_tracking']={
+                'policy':load_two_bey_policy(two_bey_config),
+                'implementation_sha256':{name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                         for name in ('two_bey_tracking.py','two_bey_integration.py')},
+            }
         if provenance is not None:
             provenance["dynamic_calibration"] = dynamic_signature
     video_records_path = out_dir / "videos.json"
@@ -959,6 +1018,7 @@ def run_batch(
                         else {}
                     ),
                     **preselected,
+                    **({'two_bey_config':two_bey_config} if two_bey_config is not None else {}),
                 )
             except Exception:
                 log.exception("analysis failed for %s; continuing batch", path)

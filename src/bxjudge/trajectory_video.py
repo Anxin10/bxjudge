@@ -91,10 +91,37 @@ class Observation:
     t: float
     x: float
     y: float
+    kind: str = 'observed'
 
     @property
     def key(self):
         return self.side, self.track_id, self.cls
+
+
+def two_bey_display_points(points,source_fps):
+    if not math.isfinite(source_fps) or source_fps<=0:
+        raise ValueError('invalid two-bey source FPS')
+    groups={}
+    for p in points:
+        if p.cls=='bey':
+            groups.setdefault(p.track_id,[]).append(p)
+    if len(groups)>2:
+        raise ValueError('two-bey view contains more than two physical top IDs')
+    output=[]
+    for rows in groups.values():
+        rows=sorted(rows,key=lambda p:p.frame)
+        previous=None
+        for p in rows:
+            if previous is not None:
+                if p.frame<=previous.frame:
+                    raise ValueError('duplicate two-bey observation at source frame')
+                for frame in range(previous.frame+1,p.frame):
+                    a=(frame-previous.frame)/(p.frame-previous.frame)
+                    output.append(Observation(p.side,p.track_id,'bey',frame,previous.t+(p.t-previous.t)*a,
+                        previous.x+(p.x-previous.x)*a,previous.y+(p.y-previous.y)*a,'interpolated'))
+            output.append(p)
+            previous=p
+    return sorted(output,key=lambda p:(p.t,p.frame,p.track_id))
 
 
 def _parse_observations(raw: bytes) -> list[Observation]:
@@ -206,6 +233,22 @@ def animation_frames(
     recorded_geometry=None,
     source_fps=None,
 ):
+    physical_entries=None
+    physical_colors={}
+    if recorded_geometry is not None and 'two_bey_tracking' in recorded_geometry:
+        points=two_bey_display_points(points,source_fps)
+        ids=sorted({p.track_id for p in points})
+        used=[]
+        for tid in ids:
+            sides={p.side for p in points if p.track_id==tid and p.side}
+            if len(sides)==1:
+                physical_colors[tid]=plot.SIDE_COLORS[next(iter(sides))]
+                used.append(physical_colors[tid])
+        for tid in ids:
+            if tid not in physical_colors:
+                physical_colors[tid]=next(c for c in plot.SIDE_COLORS.values() if c not in used)
+                used.append(physical_colors[tid])
+        physical_entries=[(f'{next((p.side for p in points if p.track_id==tid and p.side), "Top ?")} #{tid}',physical_colors[tid]) for tid in ids]
     start, end = _bounds(row, points)
     scale = min(1.0, cfg["max_long_edge"] / max(coordinate_size))
     size = tuple(max(1, round(v * scale)) for v in coordinate_size)
@@ -243,27 +286,26 @@ def animation_frames(
             o = points[cursor]
             cursor += 1
             point = (round(o.x * sx), round(o.y * sy))
-            color = plot.SIDE_COLORS.get(o.side, plot.UNKNOWN_COLOR)
+            color = physical_colors.get(o.track_id,plot.SIDE_COLORS.get(o.side, plot.UNKNOWN_COLOR))
             if o.cls == "bey":
                 # Every actual point must appear, even when isolated between gaps.
-                cv2.circle(canvas, point, 2, color, -1)
+                if o.kind=='observed':
+                    cv2.circle(canvas, point, 2, color, -1)
                 old = previous.get(o.key)
-                if old is not None and o.frame == old.frame + 1:
-                    cv2.line(
-                        canvas, (round(old.x * sx), round(old.y * sy)), point, color, 2
-                    )
+                if old is not None and o.frame == old.frame + 1 and ((o.kind=='observed' and old.kind=='observed') or o.frame%2==0):
+                    cv2.line(canvas,(round(old.x*sx),round(old.y*sy)),point,color,2)
                 if old is None:
-                    plot.endpoint(canvas, point, o.side, o.track_id, o.frame)
+                    plot.endpoint(canvas, point, o.side, o.track_id, o.frame,color=color)
                 if o.frame == last[o.key]:
-                    plot.endpoint(canvas, point, o.side, o.track_id, o.frame, end=True)
+                    plot.endpoint(canvas, point, o.side, o.track_id, o.frame, end=True,color=color)
                 events = []
                 if (
-                    o.side
+                    o.kind=='observed' and o.side
                     and row["landing_frame"]
                     and row["landing_frame"][o.side] == o.frame
                 ):
                     events.append(f"landing_{o.side}@{o.frame}")
-                if o.side and row["finish"] is not None and o.t == row["t_end"]:
+                if o.kind=='observed' and o.side and row["finish"] is not None and o.t == row["t_end"]:
                     events.append(f"finish@{o.frame}")
                 for event in events:
                     cv2.drawMarker(canvas, point, color, cv2.MARKER_CROSS, 12, 2)
@@ -322,7 +364,7 @@ def animation_frames(
                 )
         mask = np.any(canvas != 0, axis=2)
         image[mask] = canvas[mask]
-        image = plot.with_legend(image)
+        image = plot.with_legend(image,entries=physical_entries)
         plot.label(
             image,
             f"Video t={current:.3f}s",

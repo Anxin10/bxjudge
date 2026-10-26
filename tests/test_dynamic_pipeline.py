@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pytest
 
 from bxjudge import pipeline
 from bxjudge.dynamic_calibration import DEFAULT_DYNAMIC_CONFIG
@@ -9,8 +10,9 @@ from tests.helpers import cal_with, make_track, shipped_autocalib, stadium_scene
 from tests.test_pipeline import _snapshot, info
 
 
+@pytest.mark.parametrize('two_bey',[False,True])
 def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
-    tmp_path, monkeypatch, th, rules
+    tmp_path, monkeypatch, th, rules,two_bey
 ):
     ref, c = stadium_scene(size=(640, 360))
     cal_with(ref, tmp_path)
@@ -63,6 +65,7 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
         out_dir=tmp_path / "out",
         autocalib=shipped_autocalib(),
         dynamic_config=DEFAULT_DYNAMIC_CONFIG,
+        **({'two_bey_config':__import__('pathlib').Path('config/two_bey_tracking.yaml')} if two_bey else {}),
     )
     assert np.linalg.norm(np.array(observed[0].center_at(35)) - [250, 220]) < 1
     assert r.geometry_evidence["coordinates"] == "reference_pixels"
@@ -71,8 +74,14 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
     data = json.loads(record.read_text())
     assert data["calibration_id"] == r.calibration_id
     assert data["identity"]["sides"] == {}
-    assert "identity_unanchored@1" in r.review_reasons
-    assert "identity_unanchored@2" in r.review_reasons
+    for track in observed:
+        assert f'identity_unanchored@{track.track_id}' in r.review_reasons
+    if two_bey:
+        tracking=data['two_bey_tracking']['rounds']['1']
+        assert tracking['configured_slots']==2 and tracking['observed_entities']==2
+        assert tracking['interpolation_used_for_judging'] is False
+        assert len(observed)==2
+        assert 'two_bey_tracking_requires_review' in r.review_reasons
     assert r.needs_review and r.finish is None and r.winner is None
     # Missing identity extends the launch window to its configured cap. Frames
     # beyond the decoded clip remain unknown, never manufactured as no motion.

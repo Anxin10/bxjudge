@@ -11,6 +11,45 @@ import numpy as np
 import pytest
 import yaml
 
+
+def test_two_bey_display_bridges_are_tagged_and_never_change_saved_observations():
+    from bxjudge.trajectory_video import Observation, two_bey_display_points
+
+    raw=[Observation('X',40,'bey',0,0.,10.,10.),Observation('X',40,'bey',3,.3,40.,10.),
+         Observation('',41,'bey',0,0.,100.,100.),Observation('',41,'bey',1,.1,101.,100.)]
+    result=two_bey_display_points(raw,10)
+    xs=[p for p in result if p.track_id==40]
+    assert [p.frame for p in xs]==[0,1,2,3]
+    assert [p.kind for p in xs]==['observed','interpolated','interpolated','observed']
+    assert xs[1].x==20 and xs[2].x==30
+    assert len(raw)==4 and all(p.kind=='observed' for p in raw)
+    assert sorted({p.track_id for p in result})==[40,41]
+
+
+def test_two_bey_display_refuses_a_third_physical_top():
+    from bxjudge.trajectory_video import Observation, two_bey_display_points
+
+    with pytest.raises(ValueError,match='two'):
+        two_bey_display_points([Observation('',i,'bey',0,0.,float(i),10.) for i in (1,2,3)],30)
+
+
+def test_two_bey_mode_renders_an_estimated_gap_without_changing_csv(scene):
+    from bxjudge.trajectory_plot import SIDE_COLORS
+    from bxjudge.trajectory_video import (
+        animation_frames,
+        load_video_policy,
+        read_observations,
+    )
+
+    _out,c,row,path,config,_=scene
+    before=path.read_bytes()
+    points=[p for p in read_observations(path) if p.track_id in (1,2)]
+    frames=list(animation_frames(row,c,points,load_video_policy(config),coordinate_size=(640,360),
+        recorded_geometry={'two_bey_tracking':{}},source_fps=10))
+    assert tuple(frames[2][170,140])==SIDE_COLORS['X']
+    assert path.read_bytes()==before
+    assert all(p.kind=='observed' for p in points)
+
 from bxjudge.output import trajectory_png
 from tests.helpers import cal_with
 

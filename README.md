@@ -3,6 +3,57 @@
 Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X match videos）。
 所有程式都在 WSL2 Ubuntu 內執行；影片不上傳到任何雲端服務。
 
+## 兩顆陀螺的連續軌跡
+
+最新播放入口：<http://127.0.0.1:8504/two-bey/>，也在統一工作台導覽。這次影片直接來自
+正式分析保存的兩實體軌跡，不另重算配對。兩個主要回合各有兩個持續身分；同一顆換
+native ID或漏偵後接回仍沿用物件身分。發射器另以綠框顯示，零件保留作burst證據，不當第三顆。
+
+實線是原片實際觀測，虛線／十字是兩個實測端點間的顯示插值；插值不寫入裁判CSV、
+不支持落點／碰撞／停止事件，也不是遮擋期間的真實位置保證。多餘框、重複框與被拒
+配對的原始觀測都完整保留在geometry證據，不因上限兩顆而刪除或算成已正確辨識。
+
+正式模式明確啟用，輸出到新資料夾：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m bxjudge.cli run \
+  runs/fragment-refinement-20261026/inputs --calib calib \
+  --out runs/two-bey-tracking-20261026/new-core \
+  --trt-manifest weights/rfdetr-trt/manifest.json \
+  --dynamic-calibration config/dynamic_calibration.yaml \
+  --two-bey-tracking config/two_bey_tracking.yaml --no-vlm --rejudge
+```
+
+`two_bey_tracking.yaml`管理最多兩個身分、關聯、重複框及Kalman參數。每個來源回合重設，
+Hungarian一對一配對不會讓同一框同時屬兩顆；固定native歸屬矛盾時保留未指派，不悄悄
+交換身份。首次建立身分仍可能誤認，因此新模式繼續要求覆核。沒有足夠身分／幾何或
+仍有未解釋原框時，不輸出確定勝方。無新回合也保存原始偵測與動態幾何。
+
+本次正式重跑：7279筆來源陀螺觀測中，7133筆進入兩實體軌跡、146筆另存未指派；
+兩個主要回合分別只有2個物理ID。66/66已人工核對的X/B原框匹配，10組已確認同物件
+案例的身分歸屬一致（重複原框可由同實體代表框表示，不當額外採納的裁判觀測）。
+顯示補點516筆，全部標為非裁判證據。這些是兩支重複使用的開發片，不是獨立準確率。
+完整核心wall time 250.31秒／253.43秒影片，正式R66a speed_ratio 0.994 PASS，關閉VLM；
+測量時另有測試程序運行，不能外推其他片、硬體或含VLM的速度。
+
+另一個原分段只有0.37秒、僅一顆觀測，仍列為未確認片段；未假造第二顆或改掉舊人工
+判決。這段是否屬賽後收拾仍待確認，故不宣稱全部分段／全片身分已驗收。
+
+從正式新結果匯出可播放證據（兩個out都必須是新資料夾）：
+
+```bash
+PYTHONPATH=src:. .venv/bin/python scripts/export_two_bey_results.py \
+  --results runs/two-bey-tracking-20261026/core-final \
+  --reference-pointer .superpowers/sdd/launch-state-20261026/current-confirmed-reference.json \
+  --out runs/two-bey-tracking-20261026/new-export
+PYTHONPATH=src:. .venv/bin/python scripts/render_two_beys.py \
+  --reconstruction runs/two-bey-tracking-20261026/new-export/report.json \
+  --config config/trajectory_video.yaml --out runs/two-bey-tracking-20261026/new-preview
+```
+
+原覆核頁的軌跡影片亦識別保存的`two_bey_tracking`證據；只在該模式畫虛線橋接，原CSV
+不變。X/B未知時用兩種穩定顏色與物件編號區分，不把顏色直接當作側別真值。
+
 ## 本機統一工作台（目前開發資料）
 
 固定入口：<http://127.0.0.1:8504/>。首頁集中最新試跑、先前人工覆核、X／B 身分對照
@@ -26,7 +77,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --review-set runs/reid-review-20261026/site-ready \
   --appearance-set runs/reid-appearance-20261026/diagnostics-final \
   --contrast-set runs/reid-contrast-20261026/diagnostics-final \
-  --challenge-set runs/reid-challenge-20261026/site
+  --challenge-set runs/reid-challenge-20261026/site \
+  --two-bey-set runs/two-bey-tracking-20261026/published-preview
 ```
 
 `--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。

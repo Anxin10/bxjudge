@@ -29,8 +29,8 @@ def base_image(c: Calibration, reference: np.ndarray | None = None) -> np.ndarra
     return image
 
 
-def endpoint(image, point, side, track_id, frame, *, end=False):
-    color = SIDE_COLORS.get(side, UNKNOWN_COLOR)
+def endpoint(image, point, side, track_id, frame, *, end=False,color=None):
+    color = SIDE_COLORS.get(side, UNKNOWN_COLOR) if color is None else color
     identity = f"{side or '?'} #{track_id}"
     if end:
         cv2.drawMarker(image, point, (15, 15, 15), cv2.MARKER_TILTED_CROSS, 16, 5)
@@ -54,20 +54,20 @@ def endpoint(image, point, side, track_id, frame, *, end=False):
         )
 
 
-def with_legend(image):
+def with_legend(image,*,entries=None):
     footer_y = image.shape[0]
     image = cv2.copyMakeBorder(
         image, 0, 86, 0, 0, cv2.BORDER_CONSTANT, value=(20, 20, 20)
     )
-    for side, x in (("X", 18), ("B", 190)):
-        color = SIDE_COLORS[side]
+    labels=[(side+' side',SIDE_COLORS[side]) for side in ('X','B')] if entries is None else entries
+    for (name,color),x in zip(labels,(18,190) if entries is None else (18,240)):
         cv2.line(image, (x, footer_y + 26), (x + 25, footer_y + 26), color, 3)
-        label(image, f"{side} side", (x + 33, footer_y + 31), 0.5, color)
+        label(image, name, (x + 33, footer_y + 31), 0.5, color)
     cv2.circle(image, (26, footer_y + 51), 7, (240, 240, 240), 2)
     label(image, "Start", (42, footer_y + 56), 0.45, (240, 240, 240))
     cv2.drawMarker(
         image, (198, footer_y + 51), (240, 240, 240), cv2.MARKER_TILTED_CROSS, 14, 2
     )
     label(image, "End", (216, footer_y + 56), 0.45, (240, 240, 240))
-    label(image, "Unknown side / fragments", (18, footer_y + 76), 0.4, UNKNOWN_COLOR)
+    label(image, "Unknown side / fragments" if entries is None else 'Dashed: interpolated, not judgment', (18, footer_y + 76), 0.4, UNKNOWN_COLOR)
     return image

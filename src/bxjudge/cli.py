@@ -149,6 +149,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   autocalib_config=Path(args.autocalib).expanduser(),
                   rejudge=args.rejudge,
                   dynamic_config=Path(args.dynamic_calibration).expanduser() if args.dynamic_calibration else None,
+                  two_bey_config=Path(args.two_bey_tracking).expanduser() if args.two_bey_tracking else None,
                   trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
     except (ValueError, OSError, RuntimeError) as error:
         if args.debug:
@@ -166,6 +167,7 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--selection", default="weights/selected.json",
                    help="explicit selected detector manifest; synthetic output requires review")
     p.add_argument("--dynamic-calibration", metavar="YAML", help="record moving-stadium geometry, observed launch release and conservative identity evidence")
+    p.add_argument('--two-bey-tracking',metavar='YAML',help='reconstruct at most two physical top identities per round; requires dynamic calibration; no interpolation in adjudication')
     p.add_argument("--trt-manifest", help="verified RF-DETR TensorRT export manifest (no fallback)")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")

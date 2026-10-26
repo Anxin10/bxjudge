@@ -1,0 +1,16 @@
+# Per-round reconstruction of two physical tops; no adjudication from predictions.
+max_targets: 2
+duplicate_iou: 0.6
+position_weight: 2.0
+appearance_weight: 1.0
+native_id_bonus: 0.25
+unmatched_cost: 1.5
+initial_separation_ratio: 0.7
+kalman_process_noise: 0.01
+kalman_measurement_noise: 0.1
+position_gate_ratio: 0.4
+appearance_gate: 0.8
+appearance_bins: [8, 4, 4]
+appearance_update_alpha: 0.05
+missing_velocity_decay: 0.8
+min_frame_border_px: 1.0
