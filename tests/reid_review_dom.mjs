@@ -22,7 +22,7 @@ const manifest = { cases: [{
 }] };
 let importNumber = 0;
 
-async function mount({ badDraft = false } = {}) {
+async function mount({ badDraft = false, pagePath = '/reid-review/' } = {}) {
   const initialCases = [originalCase()];
   if (badDraft) initialCases[0].unexpected = 'original raw must survive validation failure';
   const initialRaw = JSON.stringify({ manifest_sha256: sha, parent: null, cases: initialCases });
@@ -49,6 +49,7 @@ async function mount({ badDraft = false } = {}) {
   }
   element('data').textContent = JSON.stringify({ manifest, sha });
   globalThis.document = {
+    baseURI: 'http://127.0.0.1:8504' + pagePath,
     getElementById: element,
     querySelectorAll: () => [...controls, ...elements.values()],
     createElement: () => ({ click() {}, remove() {} })
@@ -62,7 +63,7 @@ async function mount({ badDraft = false } = {}) {
   };
   globalThis.confirm = () => false;
   globalThis.fetch = async (path, options) => {
-    if (path === '/reid-review/save') {
+    if (path === pagePath + 'save') {
       if (failPost) throw new Error('SYNTHETIC POST failure');
       postCount++;
       savedPayload = JSON.parse(options.body);
@@ -71,7 +72,7 @@ async function mount({ badDraft = false } = {}) {
         return { saved: true, sha256: parentSha, filename: 'reid-' + parentSha + '.json', reviewed_cases: 1 };
       } };
     }
-    assert.equal(path, '/reid-review/saved');
+    assert.equal(path, pagePath + 'saved');
     return { ok: true, async json() { return { snapshots: [] }; } };
   };
   await import('data:text/javascript;base64,' +
@@ -146,4 +147,11 @@ test('editing while a save is pending never enables parallel save or restore', a
   assert.equal(ui.element('save').disabled, false);
   assert.equal(ui.saved().cases[0].relation, 'same');
   assert.match(ui.element('status').textContent, /較新的未存修改/);
+});
+
+test('the same review form saves to the explicitly loaded challenge page route', async () => {
+  const ui = await mount({pagePath:'/reid-challenge/'});
+  await ui.save();
+  assert.equal(ui.saved().cases[0].case_id, 'a');
+  assert.match(ui.element('status').textContent, /已保存/);
 });

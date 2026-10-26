@@ -1,9 +1,10 @@
-"""Loopback workbench: independent immutable stores for both active review pages."""
+"""Loopback workbench: independent immutable stores for active review pages."""
 
 import argparse
 import functools
 import hashlib
 import json
+import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -27,11 +28,15 @@ class WorkbenchHandler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path != "/reid-review/saved":
+        save_route = self.path.removesuffix("/saved") + "/save"
+        route = (
+            self.server.review_routes.get(save_route)
+            if self.path.endswith("/saved")
+            else None
+        )
+        if route is None or route[4] != "reid":
             return super().do_GET()
-        manifest, digest, folder, validator, _prefix, _ = self.server.review_routes[
-            "/reid-review/save"
-        ]
+        manifest, digest, folder, validator, _prefix, _ = route
         snapshots = []
         for path in sorted(
             folder.glob("reid-*.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True
@@ -93,7 +98,9 @@ class WorkbenchHandler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, UnicodeError) as exc:
             return self.reply(422, {"error": str(exc)})
         except OSError:
-            return self.reply(500, {"error": "本機寫檔失敗，專案尚未儲存；請保留頁面或匯出備份"})
+            return self.reply(
+                500, {"error": "本機寫檔失敗，專案尚未儲存；請保留頁面或匯出備份"}
+            )
         return self.reply(
             201,
             {"saved": True, "filename": target.name, "sha256": saved_sha, **summary},
@@ -101,17 +108,32 @@ class WorkbenchHandler(SimpleHTTPRequestHandler):
 
 
 def make_server(
-    site: Path, identity_submissions: Path, reid_submissions: Path, port: int
+    site: Path, identity_submissions: Path, reid_sets: dict[str, Path], port: int
 ):
     site = Path(site).resolve()
+    if (
+        not isinstance(reid_sets, dict)
+        or not reid_sets
+        or any(re.fullmatch(r"reid-[a-z0-9-]+", name) is None for name in reid_sets)
+    ):
+        raise ValueError("invalid explicit reid sets")
+    folders = [
+        Path(identity_submissions).resolve(),
+        *(Path(p).resolve() for p in reid_sets.values()),
+    ]
+    if len(folders) != len(set(folders)):
+        raise ValueError("review stores must be distinct")
     routes = {}
     for name, folder, validator, prefix in (
         ("identity-audit", identity_submissions, validate_identity, "labels"),
-        ("reid-review", reid_submissions, validate_submission, "reid"),
+        *(
+            (name, folder, validate_submission, "reid")
+            for name, folder in reid_sets.items()
+        ),
     ):
         raw = (site / name / "manifest.json").read_bytes()
         manifest = json.loads(raw, parse_constant=_reject_constant)
-        if name == "reid-review" and manifest["schema"] != MANIFEST_SCHEMA:
+        if prefix == "reid" and manifest["schema"] != MANIFEST_SCHEMA:
             raise ValueError("invalid reidentification review manifest")
         routes[f"/{name}/save"] = (
             manifest,
@@ -132,12 +154,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--identity-submissions", type=Path, required=True)
-    parser.add_argument("--reid-submissions", type=Path, required=True)
+    parser.add_argument(
+        "--reid-set",
+        nargs=2,
+        action="append",
+        required=True,
+        metavar=("NAME", "SUBMISSIONS"),
+    )
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
-    server = make_server(
-        args.site, args.identity_submissions, args.reid_submissions, args.port
-    )
+    reid_sets = {name: Path(folder) for name, folder in args.reid_set}
+    if len(reid_sets) != len(args.reid_set):
+        parser.error("duplicate reid set names")
+    server = make_server(args.site, args.identity_submissions, reid_sets, args.port)
     print(f"Local workbench http://127.0.0.1:{server.server_port}/", flush=True)
     try:
         server.serve_forever()

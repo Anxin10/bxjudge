@@ -25,7 +25,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --core-commit 6e68fcc250f73dd181803a90cef2e7d8a2ee3041 \
   --review-set runs/reid-review-20261026/site-ready \
   --appearance-set runs/reid-appearance-20261026/diagnostics-final \
-  --contrast-set runs/reid-contrast-20261026/diagnostics-final
+  --contrast-set runs/reid-contrast-20261026/diagnostics-final \
+  --challenge-set runs/reid-challenge-20261026/site
 ```
 
 `--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。
@@ -59,16 +60,45 @@ PYTHONPATH=src .venv/bin/python scripts/build_reid_review.py \
 `manifest.json`；目前輸入 cache 是之前保存的原始觀測，未包含新的人工作證。
 上方工作台建置會驗證媒體並安裝這份核對集；新 manifest 不會靜默取代已安裝的不同版本。
 
-同一個服務維護兩個核對頁的現行保存端點，僅綁 localhost；若8504已有服務勿重複啟動。
+同一個服務維護逐格核對與兩套斷點核對的保存端點，僅綁 localhost；若8504已有服務勿重複啟動。
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m bxjudge.workbench_server \
   --site runs/dynamic-referee-20261025 \
   --identity-submissions .superpowers/sdd/identity-launch-20261025/submissions \
-  --reid-submissions runs/reid-review-20261026/submissions --port 8504
+  --reid-set reid-review runs/reid-review-20261026/submissions \
+  --reid-set reid-challenge runs/reid-challenge-20261026/submissions --port 8504
 ```
 
 此層僅收集人工疑點資料；全場範圍確認、凍結參考庫、外觀提案與重新辨識匹配仍未實作。
+
+### 新增六組困難候選核對
+
+入口：<http://127.0.0.1:8504/reid-challenge/>。這是新一批，原五組答案保留，不用重做。
+第1–2組是重疊前後、第3–4組是同格外觀相近、第5–6組是低清晰度測量候選。只選
+同一顆／不同顆／看不清、同回合狀態，再勾已核對並保存。X/B與可見性可以不知道；
+若框到發射頭或其他物件，選無法判定並在補充註記說明。原圖／短片只作人工核對，
+同nativeID、IoU、低Laplacian或色彩相近都不當成真值。
+
+挑片參數在`config/reid_challenge.yaml`：每6來源格取樣，每類最多2組；排除已核對的
+區間與鄰近重複片段。740個取樣來源格、1215個原生框量測選出6組，來自相同兩支開發片，
+不是同色陀螺或碰撞的獨立驗收。候選範圍及缺額明列，沒有預填人工答案或改判決。
+`selection.json`保存挑選原因／參數／來源SHA；媒體manifest與新瀏覽器草稿各自綁SHA。
+
+```bash
+PYTHONPATH=src:. .venv/bin/python scripts/select_reid_challenges.py \
+  --tracks-dir .superpowers/sdd/identity-continuation-20261026 \
+  --prior-manifest runs/reid-review-20261026/site-ready/manifest.json \
+  --reference-pointer .superpowers/sdd/launch-state-20261026/current-confirmed-reference.json \
+  --appearance-policy config/reid_appearance.yaml \
+  --selection-policy config/reid_challenge.yaml \
+  --out runs/reid-challenge-20261026/new-selection
+```
+
+再用`build_reid_review.py`對`new-selection/selection.json`產生**新**核對集，並將同一份
+selection.json複製入該新資料夾；工作台建置時驗證它與manifest及全部來源一致。
+已安裝版本不同時拒絕覆寫，保留現有草稿。服務以明確`--reid-set NAME SUBMISSIONS`配置
+兩個隔離資料集，不掃描任意資料夾自動接收新manifest。
 
 ### 多格外觀離線診斷
 

@@ -27,6 +27,7 @@ export function exportText(data){return JSON.stringify(data,null,2)+String.fromC
 const escapeText=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function mount(){
  const {manifest,sha}=JSON.parse(document.getElementById('data').textContent);
+ const saveURL=new URL('save',document.baseURI).pathname,savedURL=new URL('saved',document.baseURI).pathname;
  const key='bxjudge.reid-review.'+sha;
  let cases=manifest.cases.map(c=>blankCase(c.case_id)),parent=null;
  let originalRaw=null,blocked=false,storageAvailable=true,persisted=false,saving=false;
@@ -92,7 +93,7 @@ function mount(){
   try{
    const p=payload(cases,sha,parent);if(!stats(cases).reviewed)throw Error('尚未確認任何一組');
    saving=true;render();
-   const response=await fetch('/reid-review/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+   const response=await fetch(saveURL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
    const result=await response.json();
    if(!response.ok||!result.saved)throw Error(result.error||'沒有收到儲存成功回執');
    parent=result.sha256;remember();
@@ -115,7 +116,7 @@ function mount(){
  });
  let saved=[];
  async function refreshSaved(){
-  const response=await fetch('/reid-review/saved');if(!response.ok)throw Error('無法讀取已存版本清單');
+  const response=await fetch(savedURL);if(!response.ok)throw Error('無法讀取已存版本清單');
   saved=(await response.json()).snapshots;const select=document.getElementById('saved');
   select.innerHTML=saved.length?saved.map((x,i)=>`<option value="${i}">${escapeText(x.payload.submitted_at)} · ${x.reviewed_cases}組 · ${x.sha256.slice(0,10)}</option>`).join(''):'<option>目前尚無專案保存版本</option>';
   document.getElementById('restore').disabled=saving||!saved.length;

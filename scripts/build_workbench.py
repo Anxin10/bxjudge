@@ -95,20 +95,11 @@ def validate_contrast_set(contrast_set: Path, appearance_set: Path):
     return contrast
 
 
-def build(site: Path, results: Path, human_results: Path, evidence: Path, core_commit: str, review_set: Path, appearance_set: Path, contrast_set: Path):
-    site, results, human_results, evidence = (
-        p.resolve() for p in (site, results, human_results, evidence)
-    )
-    if site in (results, human_results, evidence):
-        raise ValueError("site must be separate from input results and evidence")
-    review_set = Path(review_set).resolve()
+def validate_review_set(review_set: Path):
     review_manifest = _read(review_set / "manifest.json")
     if review_manifest["schema"] != "bxjudge.reid-review-manifest.v1":
         raise ValueError("invalid local reidentification review set")
     review_sha = _sha(review_set / "manifest.json")
-    destination = site / "reid-review"
-    if (destination / "manifest.json").exists() and _sha(destination / "manifest.json") != review_sha:
-        raise ValueError("installed review version differs; preserve drafts and deploy a distinct version")
     for case in review_manifest["cases"]:
         for relative, digest in [(case["clip"]["path"], case["clip"]["sha256"]),
                                  (case["before"]["image"], case["before"]["image_sha256"]),
@@ -120,10 +111,40 @@ def build(site: Path, results: Path, human_results: Path, evidence: Path, core_c
         if (Path(source).name in ("reid_review.js", "reid_review.css")
                 and _sha(review_set / Path(source).name) != digest):
             raise ValueError("review UI version changed")
+    return review_manifest, review_sha
+
+
+def validate_challenge_selection(challenge_set: Path, challenge_manifest: dict):
+    selection = _read(challenge_set / 'selection.json')
+    if selection['schema'] != 'bxjudge.reid-challenge-selection.v1' or selection['applied'] is not False or _sha(challenge_set / 'selection.json') != challenge_manifest['diagnostics_sha256']:
+        raise ValueError('challenge selection version mismatch')
+    for source, digest in selection['input_sha256'].items():
+        if _sha(Path(source)) != digest:
+            raise ValueError('challenge selection source SHA mismatch')
+    return selection
+
+
+def build(site: Path, results: Path, human_results: Path, evidence: Path, core_commit: str, review_set: Path, appearance_set: Path, contrast_set: Path, challenge_set: Path):
+    site, results, human_results, evidence = (
+        p.resolve() for p in (site, results, human_results, evidence)
+    )
+    if site in (results, human_results, evidence):
+        raise ValueError("site must be separate from input results and evidence")
+    review_set = Path(review_set).resolve()
+    review_manifest, review_sha = validate_review_set(review_set)
+    destination = site / "reid-review"
+    if (destination / "manifest.json").exists() and _sha(destination / "manifest.json") != review_sha:
+        raise ValueError("installed review version differs; preserve drafts and deploy a distinct version")
     appearance_set = Path(appearance_set).resolve()
     appearance = validate_appearance_set(appearance_set, review_set, review_sha)
     contrast_set = Path(contrast_set).resolve()
     contrast = validate_contrast_set(contrast_set, appearance_set)
+    challenge_set = Path(challenge_set).resolve()
+    challenge_manifest, challenge_sha = validate_review_set(challenge_set)
+    challenge_destination = site / 'reid-challenge'
+    if (challenge_destination / 'manifest.json').exists() and _sha(challenge_destination / 'manifest.json') != challenge_sha:
+        raise ValueError('installed challenge version differs; preserve its existing drafts')
+    selection = validate_challenge_selection(challenge_set, challenge_manifest)
     rows = read_rounds(results)
     human_rows = read_rounds(human_results)
     timings = _read(results / "videos.json")
@@ -161,6 +182,7 @@ def build(site: Path, results: Path, human_results: Path, evidence: Path, core_c
     source_files += sorted(p for p in review_set.rglob("*") if p.is_file())
     source_files += sorted(p for p in appearance_set.rglob("*") if p.is_file())
     source_files += sorted(p for p in contrast_set.rglob("*") if p.is_file())
+    source_files += sorted(p for p in challenge_set.rglob("*") if p.is_file())
     source_files += sorted((results / "trajectories").glob("*.csv"))
     source_files.append(Path("config/evaluation.yaml").resolve())
     source_files += [results / "geometry" / name for name in identity["source_geometry_sha256"]]
@@ -190,6 +212,7 @@ def build(site: Path, results: Path, human_results: Path, evidence: Path, core_c
                                    "population": appearance["population"], "applied": False},
         "contrast_diagnostics": {"report_sha256": _sha(contrast_set / "report.json"),
                                  "population": contrast["population"], "applied": False},
+        "challenge_review": {"manifest_sha256": challenge_sha, "selected_by_category": selection['selected_by_category'], "applied": False},
         "source_sha256": {str(p): _sha(p) for p in source_files},
         "scope": "local read-only hub; speed applies only to supplied two development originals with VLM disabled; no autonomous referee accuracy claim",
     }
@@ -199,6 +222,7 @@ def build(site: Path, results: Path, human_results: Path, evidence: Path, core_c
     shutil.copytree(review_set, destination, dirs_exist_ok=True)
     shutil.copytree(appearance_set, site / "reid-appearance", dirs_exist_ok=True)
     shutil.copytree(contrast_set, site / "reid-contrast", dirs_exist_ok=True)
+    shutil.copytree(challenge_set, challenge_destination, dirs_exist_ok=True)
     shutil.copytree(evidence / "fragment-refinement", site / "fragment-refinement", dirs_exist_ok=True)
     for name in ("identity-three-frames.jpg", "identity-evidence.json", "attachment-evidence.json"):
         shutil.copyfile(evidence / name, assets / name)
@@ -225,7 +249,7 @@ def build(site: Path, results: Path, human_results: Path, evidence: Path, core_c
 </style><header data-bx-workbench="1"><div class="shell"><div class="brand">BXJUDGE <span style="font-weight:400">工作台</span></div><nav aria-label="工作台導覽"><a href="#results">目前結果</a><a href="#identity">X／B 身分</a><a href="#attachment">中心接合</a><a href="#history">研究紀錄</a></nav></div></header><main class="shell"><p class="muted">統一入口 · 以原始影片與已保存人工紀錄為準</p><h1>{headline}；勝負仍需人工覆核</h1><p>這裡集中最新結果與證據。原本的 launch-motion、launch-state 等頁面保留作研究紀錄，不再當作最新首頁。</p><div class="cards"><article class="card">兩支開發原片的核心速度<b class="{speed_class}">{speed} · {metrics.speed_ratio:.3f} 倍</b><small>關閉 VLM；未代表整批 109 片或準確率</small></article><article class="card">最新 AI 試跑<b>{all_review}／{len(result_rows)} 待覆核</b><small>尚無可直接採用的自動勝負結果</small></article><article class="card">你先前的人工紀錄<b>{manual_count} 回合已覆核</b><small>原紀錄保留，沒有被新試跑覆寫</small></article></div>
 <section id="results"><h2>目前結果</h2><p class="notice">「原紀錄已覆核」與「新 AI 試跑待覆核」是兩組不同資料。人工紀錄沒有消失，也不要求你重做全部核對。未填的終結欄位不會擅自當作平手或重賽。</p><div class="tablewrap"><table><thead><tr><th>來源回合</th><th>最新 AI 試跑</th><th>先前人工紀錄</th></tr></thead><tbody>{body_rows}</tbody></table></div><details style="margin-top:18px"><summary>你對事件先後與重賽的補充</summary><pre>{_text(note or "此資料夾沒有另存的事件補充。")}</pre></details><p><a href="/optimization/">前輪速度與驗收記錄</a> · <a href="/_workbench/snapshot.json">本頁資料來源與雜湊</a></p></section>
 <section id="identity"><h2>X／B 身分與軌跡接續</h2><p><a href="/reid-review/">核對新增的 {len(review_manifest['cases'])} 組斷點：同一顆／不同顆／看不清</a>。獨立保存新標記，不必重做原三回合覆核。</p><p class="notice">本輪完整原片重跑：軌跡由 {continuation['before_tracks']} 條變成 {continuation['after_tracks']} 條，累計接回 {continuation['applied_joins']} 次 ID 交接；相較上一輪再減少 {continuation['additional_track_reduction']} 條。軌跡總數可能含誤偵或賽後拾取，不等於斷點次數。接續仍要求覆核；其餘候選保留分開，尚未解決全部碎片。</p><p>本輪改用多格位移估速度，降低單格框抖動造成的錯誤拒絕；重疊影格直接使用實際位置。<a href="/fragment-refinement/">看這次接回的原片對照，以及仍拒絕接續的原因</a>。</p><p>已將 <b>{identity['uniquely_exact_matched']} 筆</b>人工標記的影格觀測，依相同來源影格、類別、中心與分數精確對上原始觀測與接續紀錄（含 {identity['archived_overlap_objects']} 筆接續前重複框）。目前人工標記衝突 <b>{snapshot['identity_label_conflicts']} 筆</b>；整片仍有 <b>{identity['track_count']} 條</b>陀螺軌跡，不能因此宣稱身分追蹤已全面穩定。</p><p class="notice">身分自動指派另行計算：{side_assignment['correct']} 筆與人工一致、{side_assignment['wrong']} 筆不一致、{side_assignment['unknown']} 筆未知。未知沒有算成判對；此為重複使用的開發樣本，不是獨立準確率。</p><p>f1618 已依你確認更正為深色 X、淺色 B。下圖保留修訂時的原始追蹤編號；最新接續後的成員關係另存於逐物件對照證據，沒有改寫原始人工提交。</p><img class="triptych" src="/_workbench/identity-three-frames.jpg" alt="f1617、f1618、f1619 的深色與淺色陀螺，人工更正後一致"><p><a href="{revision_link}">目前人工修訂</a> · <a href="/_workbench/identity-evidence.json">逐物件對照證據</a></p></section>
-<section id="appearance"><h2>遮擋前後的多格外觀</h2><p><a href="/reid-contrast/">已確認不同顆的對照與距離比較</a>：沿用既有人工標記，不必再核對；沒有自動接續或已校準門檻。</p><p><a href="/reid-appearance/">查看五組已核對案例的多格原始裁切與診斷</a>。人工答案已凍結為獨立來源；第5組藍框的發射頭端排除於陀螺配對比較。目前沒有不同顆對照，描述子距離不當身分機率；尚未自動接續或改判決。</p></section>
+<section id="appearance"><h2>遮擋前後的多格外觀</h2><p><a href="/reid-challenge/">新增6組：重疊前後、外觀相近、低清晰度候選核對</a>。與原五組分開保存；不是已確認碰撞或同色真值。</p><p><a href="/reid-contrast/">已確認不同顆的對照與距離比較</a>：沿用既有人工標記，不必再核對；沒有自動接續或已校準門檻。</p><p><a href="/reid-appearance/">查看五組已核對案例的多格原始裁切與診斷</a>。人工答案已凍結為獨立來源；第5組藍框的發射頭端排除於陀螺配對比較。目前沒有不同顆對照，描述子距離不當身分機率；尚未自動接續或改判決。</p></section>
 <section id="attachment"><h2>中心接合：原始畫面與確認範圍</h2><p>觀察重點是<b>陀螺中心與發射器勾爪是否仍接合</b>。整個物件框有交集，不足以判定仍掛載；框分開的時間也不等於物理分離時間。</p><div class="gallery">{''.join(cards)}</div><p class="notice">已確認：f1565 仍掛載，f1567、f1568 已分離；f1566 尚未確認，因此首次已分離可能在 f1566 或 f1567，尚不能縮成單一影格。這些畫面尚無人工定位的中心／勾爪關鍵點，也沒有通過驗證的接合模型，不能用框中心冒充機械接合點。</p><p>下一步先處理軌跡碎片與接合點的可見性證據；原有三秒期限與未知狀態保持，不以之後落地倒推發射時點。</p><p><a href="/_workbench/attachment-evidence.json">原尺寸裁切、人工狀態與來源</a></p></section>
 <section id="history"><h2>研究紀錄與既有核對頁</h2><p class="muted">以下是不同階段的實驗與核對工具。查目前狀態請回這個工作台。</p><div class="links"><a href="/identity-audit/">既有逐格核對與儲存（保留草稿）</a><a href="/optimization/">前輪速度與驗收記錄</a><a href="/launch-motion/">相對運動實驗（未採用）</a><a href="/launch-state/">VLM 三狀態實驗（保留不確定）</a><a href="/launch-diagnostics/">掛載／框分離診斷</a><a href="/index-before-unified.html">舊整合報告（歷史測量）</a></div></section><footer>裁判實測版本 {_text(core_commit[:7])} · 人工參考 {_text(reference['revision'][:16])}<br>本頁為本機唯讀工作台。未覆寫來源影片、模型預測、既有人工覆核或瀏覽器草稿。</footer></main></html>'''
     previous = site / "index.html"
@@ -273,8 +297,9 @@ def main():
     parser.add_argument("--review-set", type=Path, required=True)
     parser.add_argument("--appearance-set", type=Path, required=True)
     parser.add_argument("--contrast-set", type=Path, required=True)
+    parser.add_argument("--challenge-set", type=Path, required=True)
     args = parser.parse_args()
-    snapshot = build(args.site, args.results, args.human_results, args.evidence, args.core_commit, args.review_set, args.appearance_set, args.contrast_set)
+    snapshot = build(args.site, args.results, args.human_results, args.evidence, args.core_commit, args.review_set, args.appearance_set, args.contrast_set, args.challenge_set)
     print(json.dumps({k: snapshot[k] for k in ("core_commit", "speed_gate", "review_ratio", "identity_label_conflicts")}, ensure_ascii=False))
 
 

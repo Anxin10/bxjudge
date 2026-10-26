@@ -1,0 +1,8 @@
+# Candidate sampling only; no matching or visibility/collision truth gates.
+mode: review_candidates
+frame_stride: 6
+per_category: 2
+context_s: 1.0
+endpoint_offset_s: 0.15
+endpoint_search_s: 0.5
+coordinate_size: [1280, 720]

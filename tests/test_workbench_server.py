@@ -64,7 +64,15 @@ def server(tmp_path):
     site = tmp_path / "site"
     old, payload = identity_fixture()
     m, _, new = fixtures()
-    for name, data in (("identity-audit", old), ("reid-review", m)):
+    challenge = {
+        **m,
+        "cases": [dict(c, case_id=c["case_id"] + "-challenge") for c in m["cases"]],
+    }
+    for name, data in (
+        ("identity-audit", old),
+        ("reid-review", m),
+        ("reid-challenge", challenge),
+    ):
         path = site / name
         path.mkdir(parents=True)
         (path / "manifest.json").write_text(json.dumps(data))
@@ -75,7 +83,12 @@ def server(tmp_path):
         (site / "reid-review/manifest.json").read_bytes()
     ).hexdigest()
     new["cases"][0].update(reviewed=True, relation="uncertain", scope="unknown")
-    srv = make_server(site, tmp_path / "old", tmp_path / "new", port=0)
+    srv = make_server(
+        site,
+        tmp_path / "old",
+        {"reid-review": tmp_path / "new", "reid-challenge": tmp_path / "challenge"},
+        port=0,
+    )
     thread = Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield srv, tmp_path, payload, new
@@ -136,3 +149,38 @@ def test_reid_revision_parent_must_exist_in_the_same_manifest(server):
     new["supersedes"] = "f" * 64
     assert post(srv, "/reid-review/save", new)[0] == 422
     assert not (root / "new").exists()
+
+
+def test_challenge_manifest_labels_and_revisions_are_isolated_from_original_review(
+    server,
+):
+    import copy
+
+    srv, root, _old, new = server
+    assert post(srv, "/reid-review/save", new)[0] == 201
+    assert post(srv, "/reid-challenge/save", new)[0] == 422
+    base = f"http://127.0.0.1:{srv.server_port}"
+    manifest_raw = (root / "site/reid-challenge/manifest.json").read_bytes()
+    challenge = copy.deepcopy(new)
+    challenge["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+    for c in challenge["cases"]:
+        c["case_id"] += "-challenge"
+    status, receipt = post(srv, "/reid-challenge/save", challenge)
+    assert status == 201
+    with urlopen(base + "/reid-challenge/saved", timeout=3) as response:
+        saved = json.load(response)["snapshots"]
+    assert len(saved) == 1 and saved[0]["sha256"] == receipt["sha256"]
+    assert (root / "challenge" / receipt["filename"]).exists()
+    assert not (root / "new" / receipt["filename"]).exists()
+    assert post(srv, "/reid-review/save", challenge)[0] == 422
+
+
+def test_review_routes_cannot_share_storage_or_escape_their_url_prefix(tmp_path):
+    from bxjudge.workbench_server import make_server
+
+    with pytest.raises(ValueError, match="distinct"):
+        make_server(
+            tmp_path, tmp_path / "labels", {"reid-review": tmp_path / "labels"}, 0
+        )
+    with pytest.raises(ValueError, match="explicit"):
+        make_server(tmp_path, tmp_path / "labels", {"../x": tmp_path / "new"}, 0)
