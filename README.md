@@ -23,7 +23,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_workbench.py \
   --human-results runs/trt-final-20261025/pilot \
   --evidence runs/fragment-refinement-20261026/evidence \
   --core-commit 6e68fcc250f73dd181803a90cef2e7d8a2ee3041 \
-  --review-set runs/reid-review-20261026/site-ready
+  --review-set runs/reid-review-20261026/site-ready \
+  --appearance-set runs/reid-appearance-20261026/diagnostics-final
 ```
 
 `--core-commit` 必須記錄輸入結果實際量測的版本；上例的核心量測版本為 `6e68fcc`。
@@ -67,6 +68,32 @@ PYTHONPATH=src .venv/bin/python -m bxjudge.workbench_server \
 ```
 
 此層僅收集人工疑點資料；全場範圍確認、凍結參考庫、外觀提案與重新辨識匹配仍未實作。
+
+### 多格外觀離線診斷
+
+入口：<http://127.0.0.1:8504/reid-appearance/>，亦已加入工作台。五組新核對全部已保存：
+四組同一顆、一組不確定。修訂 `25d81dd4` 記錄第5組藍框①來源f1713是發射頭端；
+僅排除該端點作為陀螺外觀來源，不將整條原生軌跡改類別，也不把不確定改成不同顆。
+
+新工具用原始未畫線BGR影格，依原生觀測取端點前後最多8張裁切；不補缺格、不重新跑
+偵測器。色彩直方圖與灰階梯度距離分開記錄，並保留模糊測量、重疊物件及品質拒絕。
+第4組已確認同顆但色彩距離較大，不能只看顏色接線。裁切可見性、可信X/B參考及全回合
+scope仍未驗證；這五組沒有不同顆對照，不設定匹配閾值或宣稱準確率。全部`applied=false`。
+參數在 `config/reid_appearance.yaml`，只用於離線取樣與描述子，不是已校準的裁判設定。
+
+重播目前資料（輸出必須是新的目錄）：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/analyze_reid_appearance.py \
+  --manifest runs/reid-review-20261026/site-ready/manifest.json \
+  --labels runs/reid-review-20261026/submissions/reid-25d81dd400d7521a2d172db7bfbd9c5df5ddbda8016e47372d332700873b705a.json \
+  --endpoint-annotations runs/reid-appearance-20261026/diagnostics-final/endpoint-annotations.json \
+  --config config/reid_appearance.yaml \
+  --out runs/reid-appearance-20261026/next-diagnostics
+```
+
+JSON凍結來源／設定／人工修訂／程式與crop雜湊；CLI輸出完整離線工具wall time，頁面另標
+取樣特徵時間的範圍。這不是整套裁判時間，不沿用舊核心速度PASS到新模組。
 
 ### 軌跡接續現況
 

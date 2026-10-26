@@ -1,0 +1,8 @@
+# Offline diagnostic extraction only. These are not calibrated matching gates.
+purpose: offline_diagnostic
+window_s: 0.25
+max_samples: 8
+min_crop_side_px: 8
+max_outside_fraction: 0.1
+color_bins: [8, 4, 4]
+gradient_bins: 8
