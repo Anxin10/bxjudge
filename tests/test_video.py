@@ -370,6 +370,36 @@ def test_nested_prefetch_processing_failure_preserves_original_error():
     assert closed.is_set()
 
 
+def test_three_stage_prefetch_keeps_upstream_error_when_a_middle_stage_is_busy():
+    # Detection -> alignment -> tracking: the decode error cancels the shared
+    # event while alignment still holds frame 0. Closing alignment afterwards
+    # must still surface the decode error, not a generic cancellation.
+    from bxjudge.video import VideoDecodeError, prefetched
+
+    cancelled = Event()
+    error = VideoDecodeError("decode failed")
+
+    def source():
+        yield 0, np.zeros((2, 2, 3), np.uint8)
+        raise error
+
+    def detected():
+        with prefetched(source(), cancelled=cancelled) as raw:
+            yield from raw
+
+    def aligned():
+        with prefetched(detected(), cancelled=cancelled) as ready:
+            for value in ready:
+                assert cancelled.wait(2)
+                yield value
+
+    with pytest.raises(VideoDecodeError) as caught, prefetched(
+        aligned(), cancelled=cancelled
+    ) as frames:
+        list(frames)
+    assert caught.value is error
+
+
 def test_nested_prefetch_normal_break_does_not_raise_its_own_cancellation():
     from bxjudge.video import prefetched
 

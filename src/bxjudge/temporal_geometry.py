@@ -44,6 +44,7 @@ _KEYS = {
     "ellipse_min_axis_fraction",
     "ellipse_max_axis_fraction",
     "ellipse_track_max_axis_fraction",
+    "ellipse_min_battle_area_enclosed",
     "canny_low",
     "canny_high",
 }
@@ -81,6 +82,7 @@ def load_temporal_policy(path=DEFAULT_TEMPORAL_CONFIG):
                 "feature_quality",
                 "step_shift_frac",
                 "ellipse_support",
+                "ellipse_min_battle_area_enclosed",
             )
         )
         or p["reanchor_s"] > p["max_chain_s"]
@@ -121,6 +123,18 @@ def _ellipse_residual(e, p):
     q = (p - centre) @ rotation
     r = np.linalg.norm(q / np.array(axes) * 2, axis=1)
     return abs(r - 1) * min(axes) / 2
+
+
+def _enclosed_fraction(e, p, band):
+    """Share of ``p`` inside ellipse ``e`` or at most ``band`` px outside it.
+
+    Outside distance uses the semi-major axis, an upper bound on the true
+    distance, so an elongated ellipse cannot pass points far beyond its ends."""
+    centre, axes, angle = e
+    a = math.radians(angle)
+    rotation = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+    r = np.linalg.norm((p - centre) @ rotation / np.array(axes) * 2, axis=1)
+    return float(np.mean((r - 1) * max(axes) / 2 <= band))
 
 
 class TemporalRimTracker:
@@ -217,6 +231,16 @@ class TemporalRimTracker:
                     <= self.cfg["ellipse_band_px"] * self.resize[0, 0]
                 )
                 if near.sum() < self.follow["min_inliers"]:
+                    continue
+                # A stadium rim surrounds the battle floor. An arc inside it (for
+                # example a lid reflection) is not the rim, however well it fits.
+                floor = np.float64(self.c.battle_area) @ self.resize[:2, :2].T
+                if (
+                    _enclosed_fraction(
+                        fit, floor, self.cfg["ellipse_band_px"] * self.resize[0, 0]
+                    )
+                    < self.cfg["ellipse_min_battle_area_enclosed"]
+                ):
                     continue
                 inliers = (
                     _ellipse_residual(fit, points[near])

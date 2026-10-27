@@ -27,3 +27,6 @@ ellipse_min_axis_fraction: 0.3
 ellipse_max_axis_fraction: 1.2
 # Looser upper bound for per-frame tracking fits (bootstrap uses ellipse_max_axis_fraction).
 ellipse_track_max_axis_fraction: 2.0
+# Fraction of battle_area vertices the reference rim ellipse must enclose (or pass
+# within ellipse_band_px of); a curve inside the floor cannot be the rim.
+ellipse_min_battle_area_enclosed: 0.9

@@ -233,3 +233,25 @@ def test_motion_occlusion_still_exports_the_motion_mask():
     assert obj.observe(1, bright, []) is None
     assert obj.last_diagnostic["reason"] == "temporal_motion_occlusion"
     assert np.count_nonzero(obj.foreground_mask) > 0
+
+
+def test_an_arc_inside_the_battle_floor_is_not_accepted_as_the_rim():
+    # On 201734 the old bootstrap fitted a lid reflection in the middle of
+    # the floor. A rim must surround the battle area it bounds.
+    ref, c = stadium_scene(size=(640, 360))
+    c.battle_area = [(5, 5), (635, 5), (635, 355), (5, 355)]
+    obj = TemporalRimTracker(
+        c, ref, 30, load_video_policy()["stadium_follow"], load_temporal_policy()
+    )
+    assert obj.reference_ellipse is None
+
+
+def test_enclosure_does_not_pass_points_far_beyond_an_elongated_ellipse():
+    from bxjudge.temporal_geometry import _enclosed_fraction
+
+    t = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    floor = np.column_stack([290 * np.cos(t), 66 * np.sin(t)]) + 300
+    ellipse = ((300.0, 300.0), (500.0, 120.0), 0.0)
+    # Ends lie 40 px outside; only points near the minor axis are within 14 px.
+    assert _enclosed_fraction(ellipse, floor, 14.0) < 0.9
+    assert _enclosed_fraction(ellipse, floor * 0 + 300, 14.0) == 1.0

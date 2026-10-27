@@ -252,15 +252,21 @@ def judge_video(
 
             frame_detections = {}
 
-            def aligned():
+            def detected():
                 # Raw motion always uses untouched source pixels. Its producer can
-                # prepare the next frame while this worker aligns the current one.
+                # prepare the next frame while this worker detects the current one.
                 with prefetched(measured(), cancelled=cancelled) as raw_frames:
                     for f, image in raw_frames:
-                        observed = detecting(image, f)
-                        geometry.set_foreground(observed)
+                        frame_detections[f] = detecting(image, f)
+                        yield f, image
+
+            def aligned():
+                # Detection runs one stage ahead: the foreground mask still uses
+                # the current frame's boxes while the next frame is detected.
+                with prefetched(detected(), cancelled=cancelled) as detected_frames:
+                    for f, image in detected_frames:
+                        geometry.set_foreground(frame_detections[f])
                         geometry.update(f, image)
-                        frame_detections[f] = observed
                         yield f, image
 
             def detecting(image, f):

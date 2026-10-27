@@ -259,9 +259,15 @@ def prefetched(
     worker.start()
     frames = consume()
     completed = False
+    closed_downstream = False
     try:
         yield frames
         completed = True
+    except GeneratorExit:
+        # A later stage may stop on the shared event this source's own failure
+        # raised, closing this stage before it could forward that failure.
+        closed_downstream = True
+        raise
     finally:
         stopped.set()
         cancelled_here = not cancelled.is_set() and not exhausted
@@ -274,3 +280,9 @@ def prefetched(
             # Do not mistake our own cleanup for a source/close failure.
             if not (cancelled_here and isinstance(failure, _PrefetchCancelled)):
                 raise failure
+        if (
+            closed_downstream
+            and failure is not None
+            and not isinstance(failure, _PrefetchCancelled)
+        ):
+            raise failure
