@@ -106,6 +106,10 @@ class StadiumFollower:
         self.edge = _edge_map(gray.astype(np.float32))
         self.keypoints, self.descriptors = self.orb.detectAndCompute(gray, self.mask)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self.last_diagnostic = {"reason": "not_attempted"}
+
+    def _reject(self, reason):
+        self.last_diagnostic["reason"] = reason
 
     def _gray(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
@@ -114,12 +118,14 @@ class StadiumFollower:
     def align(self, frame: np.ndarray) -> Alignment | None:
         if (frame.shape[1], frame.shape[0]) != self.size:
             raise ValueError("stadium-follow frame size differs from calibration")
+        self.last_diagnostic = {"reason": None}
         if self.descriptors is None:
-            return None
+            return self._reject("reference_features_missing")
         gray = self._gray(frame)
         keypoints, descriptors = self.orb.detectAndCompute(gray, self.search_mask)
+        self.last_diagnostic["frame_features"] = len(keypoints)
         if descriptors is None or len(descriptors) < 2:
-            return None
+            return self._reject("frame_features_missing")
         candidates = [
             pair[0]
             for pair in self.matcher.knnMatch(self.descriptors, descriptors, k=2)
@@ -131,8 +137,9 @@ class StadiumFollower:
         for match in sorted(candidates, key=lambda m: m.distance):
             unique.setdefault(match.trainIdx, match)
         matches = list(unique.values())
+        self.last_diagnostic["distinct_matches"] = len(matches)
         if len(matches) < self.cfg["min_inliers"]:
-            return None
+            return self._reject("distinct_matches_insufficient")
         src = np.float32([self.keypoints[m.queryIdx].pt for m in matches])
         dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
         matrix, inliers = cv2.estimateAffinePartial2D(
@@ -142,7 +149,7 @@ class StadiumFollower:
             ransacReprojThreshold=self.cfg["ransac_reprojection_px"],
         )
         if matrix is None or inliers is None or not np.isfinite(matrix).all():
-            return None
+            return self._reject("affine_seed_invalid")
         current_edge = _edge_map(gray.astype(np.float32))
         # Same fixed reference, input-domain rim mask. Refine mild camera tilt as well
         # as translation/rotation; no previous-frame transform or unchecked fallback.
@@ -162,9 +169,9 @@ class StadiumFollower:
             )
             matrix = cv2.invertAffineTransform(inverse).astype(np.float64)
         except cv2.error:
-            return None
+            return self._reject("ecc_nonconvergent")
         if not np.isfinite(matrix).all() or np.linalg.det(matrix[:, :2]) <= 0:
-            return None
+            return self._reject("affine_refinement_invalid")
         # Validate the final warp, including both directional scales (not just area).
         u, singular, vt = np.linalg.svd(matrix[:, :2])
         rotation_matrix = u @ vt
@@ -174,23 +181,46 @@ class StadiumFollower:
         scale = math.sqrt(float(np.linalg.det(matrix[:, :2])))
         w, h = self.work_size
         shift = float(np.linalg.norm(matrix @ self.centre - self.centre[:2])) / w
+        self.last_diagnostic.update(
+            {
+                "shift_frac": shift,
+                "rotation_deg": rotation,
+                "min_scale": float(singular.min()),
+                "max_scale": float(singular.max()),
+            }
+        )
         if (
             shift > self.cfg["max_shift_frac"]
             or abs(rotation) > self.cfg["max_rotation_deg"]
             or singular.min() < self.cfg["min_scale"]
             or singular.max() > self.cfg["max_scale"]
         ):
-            return None
+            self.last_diagnostic["limits"] = {
+                k: self.cfg[k]
+                for k in (
+                    "max_shift_frac",
+                    "max_rotation_deg",
+                    "min_scale",
+                    "max_scale",
+                )
+            }
+            return self._reject("transform_out_of_bounds")
         predicted = src @ matrix[:, :2].T + matrix[:, 2]
         keep = (
             np.linalg.norm(predicted - dst, axis=1)
             <= self.cfg["ransac_reprojection_px"]
         )
+        self.last_diagnostic.update(
+            {
+                "final_inliers": int(keep.sum()),
+                "final_inlier_fraction": float(keep.mean()),
+            }
+        )
         if (
             keep.sum() < self.cfg["min_inliers"]
             or keep.mean() < self.cfg["min_inlier_fraction"]
         ):
-            return None
+            return self._reject("final_inliers_insufficient")
         aligned = cv2.warpAffine(
             current_edge,
             matrix,
@@ -198,8 +228,9 @@ class StadiumFollower:
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
         )
         score = _edge_ncc(self.edge, aligned, self.mask > 0)
+        self.last_diagnostic["edge_score"] = score
         if score < self.cfg["min_edge_score"]:
-            return None
+            return self._reject("edge_score_below_minimum")
         supported = 0
         for y in (slice(0, h // 2), slice(h // 2, h)):
             for x in (slice(0, w // 2), slice(w // 2, w)):
@@ -208,8 +239,9 @@ class StadiumFollower:
                     >= self.cfg["min_region_score"]
                 ):
                     supported += 1
+        self.last_diagnostic["supported_quadrants"] = supported
         if supported < self.cfg["min_quadrants"]:
-            return None
+            return self._reject("regional_support_insufficient")
         # Both image axes have their own exact resize factor (rounding may differ).
         resize = np.diag([w / self.size[0], h / self.size[1], 1.0])
         homography = np.linalg.inv(resize) @ np.vstack([matrix, [0, 0, 1]]) @ resize

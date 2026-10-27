@@ -162,6 +162,9 @@ def pipeline_setup(monkeypatch, tmp_path, tracks):
 
     def update(self, frame, image):
         self.samples[frame] = GeometrySample(frame, eye, 0, "tracking")
+        self.diagnostics[frame] = {
+            "tracking": {"reason": None}, "relocation": None, "reason": None,
+        }
         return self.samples[frame]
 
     monkeypatch.setattr(DynamicCalibration, "update", update)

@@ -191,6 +191,11 @@ def test_missing_geometry_after_pocket_onset_cannot_create_terminal_entry(
             "tracking" if frame <= 20 else "lost",
         )
         self.samples[frame] = sample
+        self.diagnostics[frame] = {
+            "tracking": {"reason": None if frame <= 20 else "synthetic_geometry_missing"},
+            "relocation": None,
+            "reason": None if frame <= 20 else "synthetic_geometry_missing",
+        }
         return sample
 
     monkeypatch.setattr(DynamicCalibration, "update", update)
@@ -258,6 +263,9 @@ def test_relocation_before_launch_still_requires_candidate_review(
             )
         sample = GeometrySample(frame, eye, 1 if frame >= 10 else 0, "tracking")
         self.samples[frame] = sample
+        self.diagnostics[frame] = {
+            "tracking": {"reason": None}, "relocation": None, "reason": None,
+        }
         return sample
 
     monkeypatch.setattr(DynamicCalibration, "update", update)

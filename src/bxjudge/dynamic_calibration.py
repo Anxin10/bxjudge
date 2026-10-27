@@ -117,6 +117,7 @@ class DynamicCalibration:
             }
         ]
         self.samples = {}
+        self.diagnostics = {}
 
     def _compose(self, a):
         h = np.array(a.homography) @ self.anchor_h
@@ -153,6 +154,13 @@ class DynamicCalibration:
         self.previous = frame
         local = self.anchor.align(image)
         a = None if local is None else self._compose(local)
+        diagnostic = {
+            "tracking": dict(self.anchor.last_diagnostic),
+            "relocation": None,
+            "reason": self.anchor.last_diagnostic["reason"],
+        }
+        if local is not None and a is None:
+            diagnostic["reason"] = "global_transform_out_of_bounds"
         status = "tracking"
         if a is not None:
             self.pending.clear()
@@ -160,6 +168,7 @@ class DynamicCalibration:
             if self.lost and self.good_run < self.policy["resume_frames"]:
                 a = None
                 status = "confirming"
+                diagnostic["reason"] = "recovery_confirmation_pending"
             else:
                 self.lost = False
                 self.rejected_at = None
@@ -174,6 +183,7 @@ class DynamicCalibration:
             ) / self.fps >= self.policy["retry_s"]:
                 self.last_retry = frame
                 candidate = self.relocator.align(image)
+                diagnostic["relocation"] = dict(self.relocator.last_diagnostic)
                 if candidate is None:
                     self.pending.clear()
                 else:
@@ -191,6 +201,7 @@ class DynamicCalibration:
                             self.pending.clear()
                     self.pending.append((frame, candidate))
                     status = "candidate"
+                    diagnostic["reason"] = "relocation_confirmation_pending"
                     if len(self.pending) >= self.policy["confirmations"]:
                         # This frame alone starts the segment. Earlier failed frames stay unknown.
                         moved = warp_calibration(
@@ -216,8 +227,10 @@ class DynamicCalibration:
                         self.good_run = 0
                         a = candidate
                         status = "relocated"
+                        diagnostic["reason"] = None
         sample = GeometrySample(frame, a, len(self.segments) - 1, status)
         self.samples[frame] = sample
+        self.diagnostics[frame] = diagnostic
         return sample
 
     def record(self):
@@ -227,7 +240,14 @@ class DynamicCalibration:
             "coordinate_mapping": "reference_to_source",
             "policy": self.policy,
             "segments": self.segments,
-            "samples": [asdict(s) for s in self.samples.values()],
+            "samples": [
+                asdict(s)
+                | {
+                    "rejection_reason": self.diagnostics[s.frame]["reason"],
+                    "diagnostics": self.diagnostics[s.frame],
+                }
+                for s in self.samples.values()
+            ],
         }
 
 

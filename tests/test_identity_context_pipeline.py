@@ -37,6 +37,10 @@ def test_observed_launcher_context_does_not_require_stadium_geometry(
     def unknown_geometry(self, frame, image):
         sample = GeometrySample(frame, None, 0, "lost")
         self.samples[frame] = sample
+        self.diagnostics[frame] = {
+            "tracking": {"reason": "synthetic_geometry_missing"},
+            "relocation": None, "reason": "synthetic_geometry_missing",
+        }
         return sample
 
     monkeypatch.setattr(DynamicCalibration, "update", unknown_geometry)
