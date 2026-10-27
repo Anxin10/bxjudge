@@ -1,0 +1,4 @@
+# Reporting gates only; never alter registration or referee thresholds.
+target_coverage: 0.9
+worst_clips: 10
+failure_probes_per_clip: 3
