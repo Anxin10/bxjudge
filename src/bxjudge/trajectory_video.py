@@ -117,7 +117,7 @@ def two_bey_display_points(points,source_fps):
                     raise ValueError('duplicate two-bey observation at source frame')
                 for frame in range(previous.frame+1,p.frame):
                     a=(frame-previous.frame)/(p.frame-previous.frame)
-                    output.append(Observation(p.side,p.track_id,'bey',frame,previous.t+(p.t-previous.t)*a,
+                    output.append(Observation(p.side if p.side==previous.side else '',p.track_id,'bey',frame,previous.t+(p.t-previous.t)*a,
                         previous.x+(p.x-previous.x)*a,previous.y+(p.y-previous.y)*a,'interpolated'))
             output.append(p)
             previous=p
@@ -248,7 +248,7 @@ def animation_frames(
             if tid not in physical_colors:
                 physical_colors[tid]=next(c for c in plot.SIDE_COLORS.values() if c not in used)
                 used.append(physical_colors[tid])
-        physical_entries=[(f'{next((p.side for p in points if p.track_id==tid and p.side), "Top ?")} #{tid}',physical_colors[tid]) for tid in ids]
+        physical_entries=[(f'{next((p.side for p in points if p.track_id==tid and p.side), "Top ?") if all(p.side for p in points if p.track_id==tid) else "Top ?"} #{tid}',physical_colors[tid]) for tid in ids]
     start, end = _bounds(row, points)
     scale = min(1.0, cfg["max_long_edge"] / max(coordinate_size))
     size = tuple(max(1, round(v * scale)) for v in coordinate_size)

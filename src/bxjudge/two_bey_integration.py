@@ -133,6 +133,8 @@ def reconstruct_round_tracks(
             "raw_input_bey_observations": sum(map(len, by_frame.values())),
             "members": {str(k): v for k, v in members.items()},
             "observations": observations,
+            "identity_unknown_since": {str(id_offset + eid): frame
+                for eid, frame in tracker.identity_unknown_since.items() if eid in entities},
             "unassigned": unassigned,
             "interpolation_used_for_judging": False,
         },

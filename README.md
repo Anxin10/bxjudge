@@ -3,6 +3,17 @@
 Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X match videos）。
 所有程式都在 WSL2 Ubuntu 內執行；影片不上傳到任何雲端服務。
 
+## 碰撞合併後的身分失效
+
+兩顆近期實測陀螺的預測中心同落在一個合併框時，X／B 身分從該格失效，不能因原生
+ByteTrack ID或位置接得上就恢復。時間與框邊距在 `two_bey_tracking.yaml`；沒有足夠的
+獨立速度／外觀證據就維持 unknown。完整原框與匿名空間軌跡仍保留，判定入口不再消費
+失效後的側別觀測，CSV亦清空該段side。新紀錄用 `physical_initial_sides` 加
+`physical_identity_unknown_since` 表達初始歸屬與有效期限。
+
+真實210958 f2796–2840 fixture含71筆原觀測：兩側從f2808失效，分開後26筆全unknown，
+不再沿用已知換反的玩家身分。這是防止錯判的修正，沒有把unknown硬改成真值X。
+
 ## 第一批人工勝負真值（W4）
 
 從 <http://127.0.0.1:8504/batch-outcomes/truth-slice/> 開始，沿用既有覆核頁

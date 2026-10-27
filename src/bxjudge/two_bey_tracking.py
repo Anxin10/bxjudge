@@ -31,6 +31,8 @@ def load_policy(path):
         "appearance_update_alpha",
         "missing_velocity_decay",
         "min_frame_border_px",
+        "merge_observation_max_gap_s",
+        "merge_center_margin_ratio",
     }
     if (
         not isinstance(p, dict)
@@ -52,6 +54,7 @@ def load_policy(path):
             "appearance_gate",
             "appearance_update_alpha",
             "missing_velocity_decay",
+            "merge_center_margin_ratio",
         )
     ):
         raise ValueError("invalid bounded matching gate")
@@ -109,6 +112,7 @@ class TwoBeyTracker:
         self.previous = -1
         self.diagonal = math.hypot(*frame_size)
         self.native_owners = {}
+        self.identity_unknown_since = {}
 
     @property
     def entity_count(self):
@@ -129,6 +133,7 @@ class TwoBeyTracker:
             "appearance": appearance,
             "native_id": d["native_id"],
             "last_box": list(d["box"]),
+            "last_observed_frame": self.previous,
         }
         self.slots.append(slot)
         self.native_owners[d["native_id"]] = slot["entity_id"]
@@ -213,6 +218,21 @@ class TwoBeyTracker:
                 dtype=np.float64,
             )
             predicted.append(s["kalman"].predict()[:2, 0])
+        # A single observed box covering both recently observed predictions is
+        # ambiguous. Native ByteTrack IDs cannot carry player ownership through
+        # this merge: retaining their spatial slots does not re-anchor X/B.
+        if len(self.slots) == 2 and len(kept) == 1:
+            box = kept[0][0]["box"]
+            margin = self.policy["merge_center_margin_ratio"] * math.hypot(
+                box[2] - box[0], box[3] - box[1])
+            if all(
+                (frame - slot["last_observed_frame"]) / self.fps <= self.policy["merge_observation_max_gap_s"]
+                and box[0] - margin <= point[0] <= box[2] + margin
+                and box[1] - margin <= point[1] <= box[3] + margin
+                for slot, point in zip(self.slots, predicted, strict=True)
+            ):
+                for slot in self.slots:
+                    self.identity_unknown_since.setdefault(slot["entity_id"], frame)
         self.previous = frame
         assigned = {}
         if self.slots:
@@ -274,6 +294,7 @@ class TwoBeyTracker:
             s["kalman"].correct(center(d["box"]).reshape(2, 1))
             s["native_id"] = d["native_id"]
             s["last_box"] = list(d["box"])
+            s["last_observed_frame"] = frame
             self.native_owners[d["native_id"]] = s["entity_id"]
             if appearance is not None and not any(
                 iou(d["box"], other["box"]) >= self.policy["duplicate_iou"]
@@ -293,6 +314,7 @@ class TwoBeyTracker:
                     "box": list(d["box"]),
                     "entity_id": s["entity_id"],
                     "frame": frame,
+                    "identity_valid": s["entity_id"] not in self.identity_unknown_since,
                 }
             )
         for j, (d, a) in enumerate(kept):
@@ -323,6 +345,7 @@ class TwoBeyTracker:
                         "box": list(d["box"]),
                         "entity_id": s["entity_id"],
                         "frame": frame,
+                        "identity_valid": s["entity_id"] not in self.identity_unknown_since,
                     }
                 )
             else:

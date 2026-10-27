@@ -324,7 +324,11 @@ def judge_video(
                         observation['frame'], tuple(observation['box']), observation['score']
                     ) in phase_keys
                 physical_rounds[number]=physical
-                adjudication_rounds[number]=[Track(t.track_id,t.cls,[d for d in t.dets if (d.frame,tuple(d.box),d.score) in phase_keys]) for t in physical.tracks]
+                adjudication_rounds[number]=[Track(t.track_id,t.cls,[d for d in t.dets
+                    if (d.frame,tuple(d.box),d.score) in phase_keys
+                    and (str(t.track_id) not in physical.record['identity_unknown_since']
+                         or d.frame < physical.record['identity_unknown_since'][str(t.track_id)])])
+                    for t in physical.tracks]
                 for track in physical.tracks:
                     raw_by_id[track.track_id]=track
                     known={anchors.sides[tid] for tid in physical.members[track.track_id] if tid in anchors.sides}
@@ -333,7 +337,8 @@ def judge_video(
             record['two_bey_tracking']={'policy':two_policy,'rounds':{str(n):p.record for n,p in physical_rounds.items()},
                 'raw_source_tracks':[asdict(t) for t in native_tracks], 'association_source':'native_tracks',
                 'adjudication_filter':'observed_phase_prepared_points_only'}
-            record['identity']['physical_sides']={str(t.track_id):side_hints.get(t.track_id) for p in physical_rounds.values() for t in p.tracks}
+            record['identity']['physical_initial_sides']={str(t.track_id):side_hints.get(t.track_id) for p in physical_rounds.values() for t in p.tracks}
+            record['identity']['physical_identity_unknown_since']={k:v for p in physical_rounds.values() for k,v in p.record['identity_unknown_since'].items()}
             geometry_evidence=save_geometry(out_dir,info.path.name,record)
         if geometry is not None:
             tracks = normalize_tracks(raw_tracks, geometry.samples)
@@ -473,6 +478,15 @@ def judge_video(
                 )
                 if number in physical_rounds:
                     dynamic_notes.append('two_bey_tracking_requires_review')
+                    unknown_since = physical_rounds[number].record['identity_unknown_since']
+                    if unknown_since:
+                        first_unknown = min(unknown_since.values())
+                        if is_after_finish(finish, None, first_unknown, th):
+                            dynamic_notes.append('after_finish:identity_after_merge_unknown')
+                        else:
+                            dynamic_notes.append('identity_after_merge_unknown')
+                            finish = type(finish)(None, None, None, 0.,
+                                [*finish.reasons, 'identity_after_merge_unknown'])
                     if physical_rounds[number].record['observed_entities']<2:
                         dynamic_notes.append('two_bey_singleton_segment')
                     if physical_rounds[number].record['unassigned']:
@@ -596,6 +610,8 @@ def judge_video(
                     "finish": finish.frame,
                 },
                 judgment_tracks=selected if geometry is not None else None,
+                unknown_side_since={int(k):v for k,v in physical_rounds[number].record['identity_unknown_since'].items()}
+                    if number in physical_rounds else None,
                 unassigned=[
                     Track(
                         t.track_id,

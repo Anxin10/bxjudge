@@ -548,6 +548,7 @@ def write_trajectory(
     *,
     unassigned: list[Track] | None = None,
     judgment_tracks: list[Track] | None = None,
+    unknown_side_since: dict[int, int] | None = None,
 ) -> tuple[Path, Path]:
     png_p = trajectory_png(out_dir, r.video, r.round)
     csv_p = png_p.with_suffix(".csv")
@@ -563,6 +564,10 @@ def write_trajectory(
         *bey.items(),
         *(("", t) for t in [*parts, *(unassigned or [])]),
     ]:
+        def side_at(frame, side=side, track=track):
+            first_unknown = (unknown_side_since or {}).get(track.track_id)
+            return "" if first_unknown is not None and frame >= first_unknown else side
+
         centers = track.centers()
         observations = {d.frame: d for d in track.dets}
         for f in range(track.first_frame(), track.last_frame() + 1):
@@ -576,7 +581,7 @@ def write_trajectory(
                 {
                     "frame": f,
                     "t": f / fps,
-                    "side": side,
+                    "side": side_at(f),
                     "track_id": track.track_id,
                     "cls": track.cls,
                     "x": x,
@@ -594,7 +599,7 @@ def write_trajectory(
                         image,
                         tuple(np.rint(centers[f - 1]).astype(int)),
                         tuple(np.rint(p).astype(int)),
-                        color,
+                        plot.SIDE_COLORS.get(side_at(f), plot.UNKNOWN_COLOR),
                         2,
                     )
             # These are the first/last real observations of THIS track fragment,
@@ -602,9 +607,11 @@ def write_trajectory(
             first, last = min(centers), max(centers)
             start = tuple(np.rint(centers[first]).astype(int))
             end = tuple(np.rint(centers[last]).astype(int))
-            plot.endpoint(image, start, side, track.track_id, first)
-            plot.endpoint(image, end, side, track.track_id, last, end=True)
+            plot.endpoint(image, start, side_at(first), track.track_id, first)
+            plot.endpoint(image, end, side_at(last), track.track_id, last, end=True)
             for event, frame in events.items() if side else []:
+                if frame is not None and not side_at(frame):
+                    continue
                 if event.startswith("landing_") and event != f"landing_{side}":
                     continue
                 if frame in centers:
