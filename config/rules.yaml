@@ -17,7 +17,11 @@
 # Known limitation: the generic bey_part detector class cannot tell the v12 Barrel Griffon
 # detached barrel (which is NOT a burst) from other parts, so a burst judged from that
 # barrel alone is wrong; such matches need human review.
-rules_version: "takara-tomy-bx-regulation-v12-2026-03"
+# USER OVERRIDE confirmed 2026-10-27: throughout the bout, a confirmed exit through
+# a non-scoring area before a scoring finish causes replay. It is not limited to
+# the launch. Later cleanup/exit cannot undo an already decided finish. An apparent
+# lid crossing, lost detection or unknown geometry alone does not establish an exit.
+rules_version: "takara-tomy-bx-regulation-v12-2026-03+bxjudge-user-non-scoring-exit-2026-10-27"
 win_points: 4                      # first side to reach this many points wins the match
 finish_points: {spin: 1, burst: 2, over: 2, xtreme: 3}
 launch_check:                      # per-failure action: redo | ignore
@@ -27,5 +31,7 @@ launch_check:                      # per-failure action: redo | ignore
   # none | opponent_1pt_on_2nd_miss (official v12: a side's 2nd miss in the same battle
   # gives the opponent 1 point and clears both tallies; simultaneous 2nd misses are void)
   repeat_miss_penalty: none
+battle_check:
+  non_scoring_exit: redo           # applies throughout the bout; no launch-miss increment
 draw:
   action: redo                     # only "redo" is supported

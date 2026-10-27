@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -188,7 +190,7 @@ def test_finish_without_winner_is_redo_not_crash(rules):
 
 def test_group_matches_resets_misses_per_match(rules):
     rules.launch_check["repeat_miss_penalty"] = "opponent_1pt_on_2nd_miss"
-    miss_x = dict(touch={"X": "yes"})
+    miss_x = {"touch": {"X": "yes"}}
     rs = [
         rr("spin", "B", **miss_x, round=1),
         rr("xtreme", "X", round=2),
@@ -244,7 +246,7 @@ def test_group_matches_empty(rules):
 
 
 def test_default_rules_values(rules):
-    assert rules.rules_version == "takara-tomy-bx-regulation-v12-2026-03"
+    assert rules.rules_version == "takara-tomy-bx-regulation-v12-2026-03+bxjudge-user-non-scoring-exit-2026-10-27"
     assert rules.win_points == 4
     assert rules.finish_points == {"spin": 1, "burst": 2, "over": 2, "xtreme": 3}
     assert rules.launch_check == {
@@ -254,10 +256,11 @@ def test_default_rules_values(rules):
         "repeat_miss_penalty": "none",
     }
     assert rules.draw == {"action": "redo"}
+    assert rules.battle_check == {"non_scoring_exit": "redo"}
 
 
 def _write(tmp_path, mutate):
-    data = yaml.safe_load(open("config/rules.yaml", encoding="utf-8"))
+    data = yaml.safe_load(Path("config/rules.yaml").read_text(encoding="utf-8"))
     mutate(data)
     p = tmp_path / "r.yaml"
     p.write_text(yaml.safe_dump(data), encoding="utf-8")

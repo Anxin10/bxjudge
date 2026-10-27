@@ -39,6 +39,7 @@ class Rules:
     win_points: int
     finish_points: dict[str, int]
     launch_check: dict[str, str]  # mutable on purpose: tests / tuning tweak it in place
+    battle_check: dict[str, str]
     draw: dict[str, str]
 
 
@@ -48,7 +49,7 @@ def _is_int(v) -> bool:
 
 def _check_keys(path, where: str, raw, expected) -> None:
     if not isinstance(raw, dict):
-        raise ValueError(f"{path}: {where} must be a mapping, got {raw!r}")
+        raise TypeError(f"{path}: {where} must be a mapping, got {raw!r}")
     unknown = sorted(set(raw) - set(expected), key=str)
     missing = sorted(set(expected) - set(raw))
     if unknown or missing:
@@ -61,10 +62,10 @@ def load_rules(path: str | Path = "config/rules.yaml") -> Rules:
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     _check_keys(path, "top level", raw, ("rules_version", "win_points", "finish_points",
-                                          "launch_check", "draw"))
+                                          "launch_check", "battle_check", "draw"))
 
     if not isinstance(raw["rules_version"], str):
-        raise ValueError(f"{path}: rules_version must be a string, got {raw['rules_version']!r}")
+        raise TypeError(f"{path}: rules_version must be a string, got {raw['rules_version']!r}")
 
     win = raw["win_points"]
     if not _is_int(win) or win < 1:
@@ -86,6 +87,10 @@ def load_rules(path: str | Path = "config/rules.yaml") -> Rules:
             f"got {lc['repeat_miss_penalty']!r}"
         )
 
+    _check_keys(path, "battle_check", raw["battle_check"], ("non_scoring_exit",))
+    if raw["battle_check"]["non_scoring_exit"] != "redo":
+        raise ValueError(f"{path}: battle_check.non_scoring_exit must be redo")
+
     _check_keys(path, "draw", raw["draw"], ("action",))
     if raw["draw"]["action"] not in _DRAW_ACTIONS:
         raise ValueError(
@@ -97,6 +102,7 @@ def load_rules(path: str | Path = "config/rules.yaml") -> Rules:
         win_points=win,
         finish_points=dict(raw["finish_points"]),
         launch_check=dict(lc),
+        battle_check=dict(raw["battle_check"]),
         draw=dict(raw["draw"]),
     )
 
@@ -120,10 +126,39 @@ def _other(side: Side) -> Side:
     return "B" if side == "X" else "X"
 
 
+def non_scoring_exit_reason(
+    side: Side | None, frame_interval: tuple[int, int], finish_frame: int | None
+) -> str:
+    """Order a confirmed physical exit against a decisive event in source frames.
+
+    A lid crossing, lost detection or hidden geometry is not a confirmed exit.
+    Overlapping timing remains review-required; a later exit cannot undo a finish.
+    """
+    if side not in (*SIDES, None):
+        raise ValueError("non-scoring exit side must be X, B or unknown")
+    if (
+        not isinstance(frame_interval, (tuple, list))
+        or len(frame_interval) != 2
+        or any(type(f) is not int or f < 0 for f in frame_interval)
+        or frame_interval[0] > frame_interval[1]
+        or (finish_frame is not None and (type(finish_frame) is not int or finish_frame < 0))
+    ):
+        raise ValueError("non-scoring exit needs an ordered source-frame interval")
+    who = side if side is not None else "unknown"
+    reason = f"non_scoring_exit@{who}"
+    if finish_frame is None or frame_interval[1] < finish_frame:
+        return reason
+    if frame_interval[0] > finish_frame:
+        return f"after_finish:{reason}"
+    return f"non_scoring_exit_timing_unknown@{who}"
+
+
 def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> RoundOutcome:
     """Decide one round. Mutates ``misses`` (per-match launch-miss counter per side).
 
-    Order: launch failures -> redo (+ optional repeat-miss penalty); no finish -> draw
+    Order: launch failures -> redo (+ optional repeat-miss penalty); a confirmed
+    non-scoring exit before a finish -> replay without a launch-miss increment;
+    no finish -> draw
     action; otherwise score ``finish_points`` for ``r.winner``. ``r.launch is None``
     means "no launch failure". ``touch == "unknown"`` / ``air_collision == "maybe"`` never
     trigger a redo.
@@ -168,6 +203,13 @@ def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> Round
                     [*reasons, f"repeat_miss_penalty_{penalised[0]}"],
                 )
         return RoundOutcome("redo", None, 0, reasons)
+
+    exits = list(dict.fromkeys(
+        note for note in r.review_reasons
+        if note in {f"non_scoring_exit@{side}" for side in (*SIDES, "unknown")}
+    ))
+    if exits and rules.battle_check["non_scoring_exit"] == "redo":
+        return RoundOutcome("redo", None, 0, exits)
 
     if r.finish is None:
         return RoundOutcome(rules.draw["action"], None, 0, ["draw"])
