@@ -319,6 +319,10 @@ def judge_video(
             phase_keys={(d.frame,tuple(d.box),d.score) for t in raw_tracks if t.cls=='bey' for d in t.dets}
             for number,(start,end) in enumerate(rounds,1):
                 physical=reconstruct_round_tracks(native_tracks,start,end,info.fps,c.frame_size,appearances,two_policy,offset+number*2)
+                for observation in physical.record['unassigned']:
+                    observation['adjudication_eligible'] = (
+                        observation['frame'], tuple(observation['box']), observation['score']
+                    ) in phase_keys
                 physical_rounds[number]=physical
                 adjudication_rounds[number]=[Track(t.track_id,t.cls,[d for d in t.dets if (d.frame,tuple(d.box),d.score) in phase_keys]) for t in physical.tracks]
                 for track in physical.tracks:
@@ -473,7 +477,7 @@ def judge_video(
                         dynamic_notes.append('two_bey_singleton_segment')
                     if physical_rounds[number].record['unassigned']:
                         dynamic_notes.append('two_bey_unassigned_observations')
-                        if any(d['reason']!='duplicate_box' for d in physical_rounds[number].record['unassigned']):
+                        if any(d['adjudication_eligible'] and d['reason']!='duplicate_box' for d in physical_rounds[number].record['unassigned']):
                             dynamic_notes.append('two_bey_unassigned_identity_unknown')
                             finish=type(finish)(None,None,None,0.,[*finish.reasons,'two_bey_unassigned_identity_unknown'])
                 if any(len(phase.members.get(tid, [])) > 1 for tid in active_ids):

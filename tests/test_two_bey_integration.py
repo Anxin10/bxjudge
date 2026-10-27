@@ -1,6 +1,8 @@
 import copy
 from pathlib import Path
 
+import pytest
+
 from bxjudge.two_bey_integration import reconstruct_round_tracks
 from bxjudge.two_bey_tracking import load_policy
 from bxjudge.types import Detection, Track
@@ -234,6 +236,13 @@ def test_unassigned_unknown_native_observations_still_block_a_winner(
     [r] = invoke_two_pipeline(source, tmp_path, rules, th)
     assert r.finish is None and r.winner is None
     assert "two_bey_unassigned_identity_unknown" in r.review_reasons
+    import json
+
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_bytes())
+    assert all(
+        d["adjudication_eligible"]
+        for d in data["two_bey_tracking"]["rounds"]["1"]["unassigned"]
+    )
 
 
 def test_original_pre_phase_tracks_survive_excluded_held_processing(
@@ -321,3 +330,49 @@ def test_held_prefix_is_preserved_for_tracking_but_not_sent_as_free_motion(
         and t.center_at(phase_release)[0] < 500
     )
     assert x.first_frame() == phase_release
+
+
+@pytest.mark.parametrize("stays_held", [True, False])
+def test_phase_excluded_held_observations_do_not_veto_later_finish(
+    tmp_path, monkeypatch, th, rules, stays_held
+):
+    import json
+
+    from bxjudge import pipeline
+    from bxjudge.finish import FinishResult
+    from tests.helpers import make_track
+
+    tracks = [
+        make_track(tid, "bey", {f: (x, 360) for f in range(35, 75)})
+        for tid, x in [(1, 350), (2, 900)]
+    ] + [
+        make_track(
+            4,
+            "bey",
+            {f: (700, 300 if stays_held or f < 55 else 400) for f in range(35, 75)},
+        ),
+        make_track(5, "launcher", {f: (700, 300) for f in range(35, 75)}),
+    ]
+    source = pipeline_setup(monkeypatch, tmp_path, tracks)
+    monkeypatch.setattr(
+        pipeline, "detect_finish", lambda *a: FinishResult("over", "B", 70, 0.95, [])
+    )
+    [r] = invoke_two_pipeline(source, tmp_path, rules, th)
+    assert (r.finish, r.winner) == (("over", "X") if stays_held else (None, None))
+    assert r.needs_review
+    assert "two_bey_tracking_requires_review" in r.review_reasons
+    assert ("two_bey_unassigned_identity_unknown" in r.review_reasons) is not stays_held
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_bytes())
+    assert data["phase"]["excluded_held"] == ([4] if stays_held else [])
+    record = data["two_bey_tracking"]["rounds"]["1"]
+    assert len(record["unassigned"]) == 40
+    assert all(
+        d["native_id"] == 4
+        and d["adjudication_eligible"] is (not stays_held and d["frame"] >= 55)
+        for d in record["unassigned"]
+    )
+    assert (
+        record["raw_input_bey_observations"]
+        == (len(record["observations"]) + len(record["unassigned"]))
+        == 120
+    )

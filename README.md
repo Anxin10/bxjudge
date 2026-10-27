@@ -24,6 +24,14 @@ Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X mat
 `identity-context-real-audit.json` 與 `identity-context-pilot/manifest.json`、`audit.json`。
 下方 `/two-bey/` 播放內容仍是先前兩支開發片的版本。
 
+未指派框另記錄 `adjudication_eligible`，與實測軌跡使用相同發射階段條件；已排除的
+掛載期框完整保留，不再單獨清除終結候選。仍符合裁判條件的身分不明觀測繼續否決勝方，
+兩實體模式仍強制覆核。40 片保存觀測中，9 段含 189 筆被排除的未指派框；每段仍有其他
+有效但未解釋的觀測，沒有因這項修正取得新勝方。這項比對只計算證據資格，沒有重新判事件。
+修正後再完整重跑 201622、201712 兩片，3 個候選仍無勝方，66/66 既有身分點吻合；
+所有原始觀測、40 片封存輸出及原片／政策／人工資料 SHA 核對通過。全套 1409 passed／4 xfailed。
+證據另存 `phase-eligibility-pilot/`，沒有覆寫原四片或40片結果。
+
 ## 兩顆陀螺的連續軌跡
 
 最新播放入口：<http://127.0.0.1:8504/two-bey/>，也在統一工作台導覽。這次影片直接來自
