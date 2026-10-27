@@ -111,6 +111,7 @@ def reconstruct(results, row, video):
         calibration,
         required_frames=max(2, math.ceil(record["phase_policy"]["held_s"] * fps)),
         body_margin_px=record["phase_policy"]["body_margin_px"],
+        fps=fps,
     )
     return {
         "source": source,
@@ -417,6 +418,7 @@ def main():
         "src/bxjudge/vlm.py",
         "src/bxjudge/video.py",
         "src/bxjudge/identity.py",
+        "config/identity.yaml",
         "src/bxjudge/launch_phase.py",
         "src/bxjudge/dynamic_calibration.py",
         "src/bxjudge/calibration_store.py",

@@ -914,3 +914,12 @@ uv run --no-sync bxjudge run ~/bx/videos/20261001 --calib calib \
 
 
 2026-10-26最新驗證：將既有raw-motion和動態對位分成兩個有界CPU階段，並與單GPU偵測重疊；原演算法、迭代及門檻皆不變。兩支開發原片重新以fresh CLI、`--no-vlm`跑完整流程：129.97／153.85秒、78.85／99.57秒，batch含模型載入213.19秒／253.43秒，正式speed_ratio=0.845，**僅本次核心速度PASS**。三回合仍全部需覆核，裁判準確率和含VLM時間未驗證。與直接上版判決、軌跡、raw-motion證據及7611格接受狀態相同；浮點矩陣非逐位元相同。1288測試通過、4既有xfail，仍沿用原分支；[完整範圍與未完成項目](docs/optimization-status-2026-10-26.md)。既有out請以 `--rejudge` 重新分析才有新計時。
+
+
+### 初始發射方證據與短暫漏偵
+
+`config/identity.yaml` 定義來源時間的 `context_wait_s` 與重複發射器框的
+`body_duplicate_overlap_min`。只在初始位置尚未知、沒有已觀測自由運動證據時，
+等待短暫缺失的發射器；逾時、已自由運動或互相矛盾的訊號不會在後來拾取時取得身分。
+重複本體框須逐對重疊，跨越兩位玩家的寬框保留未知。
+初始錨定只代表發射方；碰撞合框後的 `identity_unknown_since` 仍會切斷側別證據。

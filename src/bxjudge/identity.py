@@ -6,10 +6,86 @@ pairs supply side evidence; missing registration never supplies a transform.
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
+import yaml
+
+from .config import config_loader
 from .geometry import boxes_touch, point_in_polygon
 from .launch_check import _launch_side
 from .types import Calibration, Side, Track
+
+DEFAULT_IDENTITY_CONFIG = Path(__file__).resolve().parents[2] / "config/identity.yaml"
+
+
+@config_loader
+def load_identity_policy(path=DEFAULT_IDENTITY_CONFIG):
+    value = yaml.safe_load(Path(path).read_text())
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"context_wait_s", "body_duplicate_overlap_min"}
+        or any(
+            type(v) not in (int, float) or not math.isfinite(v) or v <= 0
+            for v in value.values()
+        )
+        or value["body_duplicate_overlap_min"] > 1
+    ):
+        raise ValueError("invalid identity context policy")
+    return value
+
+
+def _body_pair(observed, overlap_min):
+    groups = [
+        {"ids": [tid], "box": list(box), "originals": [box]} for tid, box in observed
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for i, first in enumerate(groups):
+            for j in range(i + 1, len(groups)):
+                second = groups[j]
+                a, b = first["box"], second["box"]
+                intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+                    0, min(a[3], b[3]) - max(a[1], b[1])
+                )
+                small = min(
+                    (a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])
+                )
+                if small > 0 and intersection / small >= overlap_min:
+                    # Duplicate components must agree pairwise. A broad box
+                    # spanning disjoint players is ambiguous, never a bridge.
+                    for x in first["originals"]:
+                        for y in second["originals"]:
+                            area = max(0, min(x[2], y[2]) - max(x[0], y[0])) * max(
+                                0, min(x[3], y[3]) - max(x[1], y[1])
+                            )
+                            minimum = min(
+                                (x[2] - x[0]) * (x[3] - x[1]),
+                                (y[2] - y[0]) * (y[3] - y[1]),
+                            )
+                            if minimum <= 0 or area / minimum < overlap_min:
+                                return {}
+                    first["originals"] += second["originals"]
+                    first["ids"] += second["ids"]
+                    first["box"] = [
+                        min(a[0], b[0]),
+                        min(a[1], b[1]),
+                        max(a[2], b[2]),
+                        max(a[3], b[3]),
+                    ]
+                    groups.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    if len(groups) != 2:
+        return {}
+    left, right = sorted(groups, key=lambda g: g["box"][0] + g["box"][2])
+    if left["box"][2] > right["box"][0]:
+        return {}
+    return {
+        tid: side for group, side in ((left, "X"), (right, "B")) for tid in group["ids"]
+    }
 
 
 @dataclass
@@ -34,7 +110,12 @@ def anchor_sides(
     *,
     required_frames: int,
     body_margin_px: float,
+    fps: float,
+    config: Path = DEFAULT_IDENTITY_CONFIG,
 ) -> IdentityAnchors:
+    policy = load_identity_policy(config)
+    if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("identity needs positive source FPS")
     if type(required_frames) is not int or required_frames < 2:
         raise ValueError("identity anchor needs at least two observed frames")
     if not math.isfinite(body_margin_px) or body_margin_px < 0:
@@ -55,21 +136,20 @@ def anchor_sides(
             continue
         run = []
         prefix_side = None
+        waiting_for_body = False
         for d in sorted(track.dets, key=lambda d: d.frame):
+            if (
+                waiting_for_body
+                and (d.frame - track.first_frame()) / fps > policy["context_wait_s"]
+            ):
+                break
             observed = bodies.get(d.frame, [])
             measured = {
                 tid: _launch_side(reference[tid, d.frame][1], c)
                 for tid, _ in observed
                 if (tid, d.frame) in reference
             }
-            paired = {}
-            if len(observed) == 2:
-                left, right = sorted(
-                    observed, key=lambda item: (item[1][0] + item[1][2]) / 2
-                )
-                # Overlapping duplicate body boxes do not establish two players.
-                if left[1][2] <= right[1][0]:
-                    paired = {left[0]: "X", right[0]: "B"}
+            paired = _body_pair(observed, policy["body_duplicate_overlap_min"])
             conflict = any(
                 side is not None and tid in paired and paired[tid] != side
                 for tid, side in measured.items()
@@ -95,8 +175,32 @@ def anchor_sides(
                 if boxes_touch(d.box, box, margin=body_margin_px)
             ]
             if not nearby:
-                # An observed free prefix cannot become a later pickup anchor.
-                break
+                registered = reference.get((track.track_id, d.frame))
+                observed_free = registered is not None and not (
+                    point_in_polygon(registered[1], c.launch_left)
+                    or point_in_polygon(registered[1], c.launch_right)
+                )
+                below_bodies = (
+                    bool(observed)
+                    and d.box[1] > max(box[3] for _, box in observed) + body_margin_px
+                )
+                if (
+                    not observed
+                    or below_bodies
+                    or observed_free
+                    or paired
+                    or prefix_side is not None
+                    or any(side is not None for side in measured.values())
+                    or (d.frame - track.first_frame()) / fps > policy["context_wait_s"]
+                ):
+                    # Missing one launcher is not evidence of free motion; a
+                    # measured free prefix or expired unknown window still is
+                    # forbidden from acquiring an anchor at later pickup.
+                    break
+                run = []
+                waiting_for_body = True
+                continue
+            waiting_for_body = False
             registered = reference.get((track.track_id, d.frame))
             point = registered[1] if registered is not None else None
             if point is not None and not (

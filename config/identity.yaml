@@ -1,0 +1,4 @@
+# Unknown initial context is not observed free motion. Wait only for this short
+# source-time prefix when no nearby launcher was detected; never infer a side.
+context_wait_s: 0.75
+body_duplicate_overlap_min: 0.8

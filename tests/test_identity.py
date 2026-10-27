@@ -13,6 +13,7 @@ def anchors(tracks, *, c=None, frames=4):
         c or make_calibration(),
         required_frames=frames,
         body_margin_px=load_launch_policy()["body_margin_px"],
+        fps=30,
     )
 
 
@@ -104,12 +105,22 @@ def test_anchor_validation_rejects_invalid_evidence_budgets():
     for count in (0, 1, True, 2.5):
         with pytest.raises(ValueError):
             anchor_sides(
-                [], [], make_calibration(), required_frames=count, body_margin_px=12
+                [],
+                [],
+                make_calibration(),
+                required_frames=count,
+                fps=30,
+                body_margin_px=12,
             )
     for margin in (-1, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             anchor_sides(
-                [], [], make_calibration(), required_frames=2, body_margin_px=margin
+                [],
+                [],
+                make_calibration(),
+                required_frames=2,
+                fps=30,
+                body_margin_px=margin,
             )
 
 
@@ -130,7 +141,12 @@ def test_missing_geometry_prefix_cannot_be_replaced_by_later_pickup_anchor():
         make_track(2, "launcher", {f: (200, 40) for f in range(14)}, size=60),
     ]
     result = anchor_sides(
-        raw, [bey, body], make_calibration(), required_frames=4, body_margin_px=12
+        raw,
+        [bey, body],
+        make_calibration(),
+        required_frames=4,
+        fps=30,
+        body_margin_px=12,
     )
     assert result.sides == {}
 
@@ -150,7 +166,12 @@ def test_internal_missing_geometry_is_not_relabelled_as_a_detector_gap():
         normalized[1],
     ]
     result = anchor_sides(
-        raw, normalized, make_calibration(), required_frames=4, body_margin_px=12
+        raw,
+        normalized,
+        make_calibration(),
+        required_frames=4,
+        fps=30,
+        body_margin_px=12,
     )
     assert result.sides == {}
 
@@ -167,7 +188,7 @@ def test_overlapping_body_duplicates_without_geometry_do_not_imply_two_players()
     ]
     assert (
         anchor_sides(
-            tracks, [], make_calibration(), required_frames=4, body_margin_px=12
+            tracks, [], make_calibration(), required_frames=4, fps=30, body_margin_px=12
         ).sides
         == {}
     )
@@ -182,7 +203,7 @@ def test_one_body_without_registered_position_has_no_guessed_screen_side():
     ]
     assert (
         anchor_sides(
-            tracks, [], make_calibration(), required_frames=4, body_margin_px=12
+            tracks, [], make_calibration(), required_frames=4, fps=30, body_margin_px=12
         ).sides
         == {}
     )
@@ -203,6 +224,8 @@ def test_conflicting_registered_regions_and_source_pair_remain_unknown():
         launch_right=rect(500, 0, 600, 120),
     )
     assert (
-        anchor_sides(tracks, tracks, c, required_frames=4, body_margin_px=12).sides
+        anchor_sides(
+            tracks, tracks, c, required_frames=4, fps=30, body_margin_px=12
+        ).sides
         == {}
     )
