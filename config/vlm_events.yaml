@@ -1,0 +1,6 @@
+# Actor-event study: local model only, source coordinates and geometry stay separate.
+overview_frames: 5
+window_frames: 5
+max_windows: 2
+num_ctx: 32768
+think: true

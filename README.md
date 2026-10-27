@@ -15,6 +15,22 @@ Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X mat
 掉偵或校準失效不能當作已離場。新的事件提取仍待整合，這項變更先完成規則與時序接口，
 沒有把原始模型列或已保存人工答案改寫成重賽。
 
+## 本地事件交叉核查
+
+`scripts/judge_actor_events.py` 讓模型只讀中立物件 ID 與原片事件，再核對兩端實際觀測、
+有效校準及區域轉換。X／B 來自本地發射上下文；只有同格實測兩顆分開的盤內陀螺，
+且模型也看到完整自由陀螺時，才可提出另一方的條件式身分。原框、失敗回應與未定位回合皆保留。
+
+```bash
+PYTHONPATH=src:. .venv/bin/python scripts/judge_actor_events.py \
+  --results runs/batch-outcomes-20261027/core --out runs/actor-events-new
+```
+
+取樣與模型上下文設定在 `config/vlm_events.yaml`。輸出須為新資料夾，不改原結果；
+只使用設定的本地模型，不在失敗時換模型。較早非得分離場的假設會先於後續得分，
+先後重疊不推勝方；投影到盤外仍可能只是騰空，**不是已確認物理離場**。
+中心進口亦未證明全身入袋、持續與未返回；所有事件與條件式勝負仍待覆核，不自動計分。
+
 ## 本地 VLM 的勝負候選（2026-10-27）
 
 入口：<http://127.0.0.1:8504/batch-outcomes/local-vlm/>。這是本機模型直接讀原片抽格的
