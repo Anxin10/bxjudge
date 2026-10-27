@@ -280,10 +280,9 @@ def judge_video(
         if geometry is not None:
             phase_policy = load_launch_policy()
             anchors = anchor_sides(
-                normalize_tracks(tracks, geometry.samples), c,
+                tracks, normalize_tracks(tracks, geometry.samples), c,
                 required_frames=max(2, math.ceil(phase_policy["held_s"] * info.fps)),
                 body_margin_px=phase_policy["body_margin_px"],
-                source_frames={t.track_id: [d.frame for d in t.dets] for t in tracks},
             )
             phase = prepare_launch_tracks(
                 tracks, info.fps, phase_policy, side_hints=anchors.sides
