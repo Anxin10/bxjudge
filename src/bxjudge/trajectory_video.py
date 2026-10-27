@@ -329,14 +329,14 @@ def animation_frames(
             background = cv2.resize(background, size, interpolation=cv2.INTER_AREA)
             if recorded_geometry is None:
                 sample = follower.update(index, background)
-                alignment = sample.alignment
+                alignment = None if sample.status == "bridged" else sample.alignment
                 status = sample.status
             else:
                 frame_number = _frame_number(current, source_fps)
                 sample = recorded_geometry["samples"].get(frame_number)
                 alignment = (
                     None
-                    if sample is None or sample["alignment"] is None
+                    if sample is None or sample["alignment"] is None or sample["status"] == "bridged"
                     else autocalib.Alignment(
                         **{
                             **sample["alignment"],

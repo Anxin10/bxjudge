@@ -150,7 +150,7 @@ def test_evidence_frame_uses_recorded_dynamic_geometry_and_hides_unknown(
     record = {
         "reference_size": [640, 360],
         "samples": {
-            0: {"frame": 0, "alignment": a},
+            0: {"frame": 0, "alignment": a, "status": "tracking"},
             1: {"frame": 1, "alignment": None},
         },
     }
@@ -165,8 +165,9 @@ def test_evidence_frame_uses_recorded_dynamic_geometry_and_hides_unknown(
     assert tuple(rgb[16, 250]) == (128, 128, 128)
 
 
+@pytest.mark.parametrize("gap_kind", ["lost", "bridged"])
 def test_missing_geometry_after_pocket_onset_cannot_create_terminal_entry(
-    tmp_path, monkeypatch, th, rules
+    tmp_path, monkeypatch, th, rules, gap_kind
 ):
     from bxjudge.autocalib import Alignment
     from bxjudge.dynamic_calibration import DynamicCalibration, GeometrySample
@@ -186,9 +187,9 @@ def test_missing_geometry_after_pocket_onset_cannot_create_terminal_entry(
     def update(self, frame, image):
         sample = GeometrySample(
             frame,
-            eye if frame <= 20 else None,
+            eye if frame <= 20 or gap_kind == "bridged" else None,
             0,
-            "tracking" if frame <= 20 else "lost",
+            "tracking" if frame <= 20 else gap_kind,
         )
         self.samples[frame] = sample
         self.diagnostics[frame] = {

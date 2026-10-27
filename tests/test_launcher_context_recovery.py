@@ -76,7 +76,8 @@ def test_real_210958_launch_bodies_anchor_x_and_b_before_the_confirmed_swap():
     ]
     samples = {
         s["frame"]: SimpleNamespace(
-            alignment=SimpleNamespace(**s["alignment"]) if s["alignment"] else None
+            status=s["status"],
+            alignment=SimpleNamespace(**s["alignment"]) if s["alignment"] else None,
         )
         for s in fixture["samples"]
     }

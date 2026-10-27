@@ -32,7 +32,7 @@ def measure_windows(samples, windows):
             statuses["sample_absent"] += 1
         else:
             statuses[sample["status"]] += 1
-            if sample["alignment"] is not None:
+            if sample["alignment"] is not None and sample["status"] != "bridged":
                 valid += 1
                 continue
             reason = sample.get("rejection_reason") or {

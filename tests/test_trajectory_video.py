@@ -606,6 +606,7 @@ def test_playback_zones_follow_current_frame_and_hide_on_failure(scene):
     green = (80, 200, 80)
     # Horizontal stadium rim y=35 translates to y=31. It must not remain at y=35.
     assert tuple(frames[0][35, 250]) == green
+    # Current template evidence is independently verified, without waiting.
     assert tuple(frames[1][31, 250]) == green
     assert tuple(frames[1][35, 250]) != green
     assert not np.any(np.all(frames[2][:360] == green, axis=2))

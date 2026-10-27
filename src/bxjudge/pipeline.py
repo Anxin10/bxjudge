@@ -50,7 +50,7 @@ from .finish import (
     spin_activity,
     stop_frame,
 )
-from .identity import anchor_sides, inherited_sides
+from .identity import anchor_sides, inherited_sides, load_identity_policy
 from .launch_check import analyze_launch
 from .launch_phase import load_launch_policy, prepare_launch_tracks
 from .manifest import (
@@ -76,6 +76,7 @@ from .output import (
 from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import iter_stadium_displacement
+from .temporal_geometry import load_temporal_policy
 from .track import track_frames
 from .trajectory_video import load_video_policy
 from .two_bey_integration import appearance_descriptor, reconstruct_round_tracks
@@ -249,12 +250,17 @@ def judge_video(
                     yield f, image
                 prefix.clear()
 
+            frame_detections = {}
+
             def aligned():
                 # Raw motion always uses untouched source pixels. Its producer can
                 # prepare the next frame while this worker aligns the current one.
                 with prefetched(measured(), cancelled=cancelled) as raw_frames:
                     for f, image in raw_frames:
+                        observed = detecting(image, f)
+                        geometry.set_foreground(observed)
                         geometry.update(f, image)
+                        frame_detections[f] = observed
                         yield f, image
 
             def detecting(image, f):
@@ -271,7 +277,9 @@ def judge_video(
             prepared = aligned() if geometry is not None else measured()
             with prefetched(prepared, cancelled=cancelled) as prepared_frames:
                 tracks = track_frames(
-                    prepared_frames, detecting, info.fps, config=detection_config
+                    prepared_frames,
+                    (lambda image, f: frame_detections.pop(f)) if geometry is not None else detecting,
+                    info.fps, config=detection_config
                 )
         phase = None
         native_tracks=list(tracks)
@@ -444,7 +452,7 @@ def judge_video(
             dynamic_notes = []
             if geometry is not None:
                 if any(
-                    geometry.samples[f].alignment is None for f in range(start, end + 1)
+                    geometry.samples[f].alignment is None or geometry.samples[f].status == "bridged" for f in range(start, end + 1)
                 ):
                     dynamic_notes.append("calibration_geometry_missing")
                     # An unknown image cannot be treated as the top leaving the arena.
@@ -865,6 +873,10 @@ def run_batch(
             "recovery": load_dynamic_policy(dynamic_config),
             "follow": load_video_policy()["stadium_follow"],
             "phase": load_launch_policy(),
+            "identity": load_identity_policy(),
+            "temporal": load_temporal_policy(),
+            "implementation_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                for name in ("identity.py", "dynamic_calibration.py", "temporal_geometry.py", "stadium_follow.py")},
         }
         if two_bey_config is not None:
             dynamic_signature['two_bey_tracking']={

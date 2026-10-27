@@ -1,0 +1,29 @@
+# Source-time and source-pixel bounds; no threshold is inferred from a missing key.
+reanchor_s: 0.5
+max_chain_s: 1.0
+bridge_s: 0.2
+consistency_px: 4.0
+foreground_margin_px: 8.0
+motion_threshold: 35
+motion_dilate_px: 3
+min_visible_fraction: 0.6
+lk_window: 21
+lk_levels: 3
+lk_iterations: 20
+lk_epsilon: 0.01
+forward_backward_px: 1.0
+feature_quality: 0.01
+feature_spacing_px: 5.0
+step_shift_frac: 0.02
+ellipse_band_px: 14.0
+ellipse_error_px: 5.0
+ellipse_inlier_px: 2.0
+ellipse_support: 0.3
+ellipse_iterations: 64
+ellipse_points: 600
+canny_low: 60
+canny_high: 160
+ellipse_min_axis_fraction: 0.3
+ellipse_max_axis_fraction: 1.2
+# Looser upper bound for per-frame tracking fits (bootstrap uses ellipse_max_axis_fraction).
+ellipse_track_max_axis_fraction: 2.0

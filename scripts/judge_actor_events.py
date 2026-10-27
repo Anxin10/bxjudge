@@ -72,6 +72,7 @@ def reconstruct(results, row, video):
     )
     samples = {
         f: SimpleNamespace(
+            status=s["status"],
             alignment=SimpleNamespace(**s["alignment"])
             if s["alignment"] is not None
             else None

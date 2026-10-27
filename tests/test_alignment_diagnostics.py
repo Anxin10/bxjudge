@@ -56,7 +56,8 @@ def test_each_source_frame_keeps_gate_and_confirmation_separate():
     assert values[1]["diagnostics"]["tracking"]["reason"] == "frame_features_missing"
     assert values[2]["rejection_reason"] == "recovery_confirmation_pending"
     assert values[2]["diagnostics"]["tracking"]["reason"] is None
-    assert values[2]["alignment"] is None
+    assert values[2]["status"] == "bridged"
+    assert values[2]["diagnostics"]["bridge_reason"] == "bounded_bridge_not_judging_evidence"
     assert values[4]["rejection_reason"] is None
     assert values[4]["alignment"] is not None
     assert all(s["diagnostics"]["relocation"] is None for s in values)

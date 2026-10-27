@@ -89,7 +89,7 @@ def test_event_run_keeps_original_rows_and_invalid_response_without_fallback(
         "calibration": calibration,
         "record": {"two_bey_tracking": {"rounds": {"1": physical}}},
         "samples": {
-            f: SimpleNamespace(alignment=SimpleNamespace(homography=np.eye(3)))
+            f: SimpleNamespace(status="tracking",alignment=SimpleNamespace(homography=np.eye(3)))
             for f in range(1, 9)
         },
         "eligible": {

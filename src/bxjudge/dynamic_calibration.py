@@ -17,6 +17,7 @@ from .autocalib import (
 )
 from .config import config_loader
 from .stadium_follow import StadiumFollower
+from .temporal_geometry import TemporalRimTracker, _points, load_temporal_policy
 from .types import Calibration, Detection, Track
 
 DEFAULT_DYNAMIC_CONFIG = (
@@ -69,7 +70,8 @@ class DynamicCalibration:
     """Small-motion tracking and stable re-localization against the original snapshot.
 
     A new anchor needs several spaced, consistent independently validated registrations.
-    No rejected frame or confirmation prefix gains geometry retroactively.
+    Relocation never backfills its rejected confirmation prefix. Source-observed
+    flow chains gain geometry only after template closure; bridges stay ineligible.
     """
 
     def __init__(self, c: Calibration, reference, fps, follow_policy, policy):
@@ -118,6 +120,11 @@ class DynamicCalibration:
         ]
         self.samples = {}
         self.diagnostics = {}
+        self.temporal = TemporalRimTracker(
+            c, reference, fps, follow_policy, load_temporal_policy()
+        )
+        self.foreground_boxes = []
+        self.last_verified = None
 
     def _compose(self, a):
         h = np.array(a.homography) @ self.anchor_h
@@ -146,12 +153,101 @@ class DynamicCalibration:
             perspective,
         )
 
+    def set_foreground(self, detections):
+        self.foreground_boxes = [d.box for d in detections]
+
+    def _temporal_sample(self, frame, a, segment):
+        temporal = self.temporal
+        if a is None:
+            return a, None
+        matrix = np.array(a.homography)
+        confirmed = temporal.confirm(frame, matrix, segment)
+        if temporal.last_diagnostic["reason"] == "temporal_template_disagreement":
+            return None, "temporal_template_disagreement"
+        for f in confirmed:
+            if (
+                f == frame
+                or f not in self.samples
+                or self.samples[f].alignment is not None
+            ):
+                continue
+            candidate = temporal.alignment(temporal.pending[f], a.score)
+            # Same global bounds as direct registration, never unlimited chain drift.
+            original = self.anchor_h
+            self.anchor_h = np.eye(3)
+            candidate = self._compose(candidate)
+            self.anchor_h = original
+            if candidate is not None:
+                self.samples[f] = GeometrySample(
+                    f, candidate, segment, "temporal_verified"
+                )
+                self.diagnostics[f]["reason"] = None
+                self.diagnostics[f]["closure_frame"] = frame
+                self.diagnostics[f]["closure_error_px"] = temporal.last_diagnostic[
+                    "closure_error_px"
+                ]
+        if self.last_verified is not None:
+            before = self.samples[self.last_verified]
+            gap = frame - before.frame - 1
+            if (
+                gap > 0
+                and (gap + 1) / self.fps <= temporal.cfg["bridge_s"]
+                and before.segment == segment
+            ):
+                h0 = np.array(before.alignment.homography)
+                delta = np.linalg.norm(
+                    _points(matrix, self.c.stadium) - _points(h0, self.c.stadium),
+                    axis=1,
+                ).max()
+                if (
+                    delta / (gap + 1) / self.c.frame_size[0]
+                    <= temporal.cfg["step_shift_frac"]
+                ):
+                    for f in range(before.frame + 1, frame):
+                        # An explicit chain/template contradiction stays a plain rejection.
+                        if (
+                            f in self.samples
+                            and self.samples[f].alignment is None
+                            and self.diagnostics[f].get("reason")
+                            != "temporal_template_disagreement"
+                        ):
+                            t = (f - before.frame) / (frame - before.frame)
+                            interpolated = (1 - t) * h0 + t * matrix
+                            self.samples[f] = GeometrySample(
+                                f,
+                                temporal.alignment(
+                                    interpolated, min(before.alignment.score, a.score)
+                                ),
+                                segment,
+                                "bridged",
+                            )
+                            self.diagnostics[f]["bridge_reason"] = (
+                                "bounded_bridge_not_judging_evidence"
+                            )
+                            self.diagnostics[f]["bridge_endpoints"] = [
+                                before.frame,
+                                frame,
+                            ]
+        self.last_verified = frame
+        if (
+            temporal.h is None
+            or temporal.segment != segment
+            or (frame - temporal.anchor_frame) / self.fps >= temporal.cfg["reanchor_s"]
+        ):
+            temporal.anchor(frame, matrix, segment)
+        return a, None
+
     def update(self, frame, image):
         if type(frame) is not int or frame < 0 or frame <= self.previous:
             raise ValueError("source frames must increase")
         if (image.shape[1], image.shape[0]) != self.c.frame_size:
             raise ValueError("geometry frame size mismatch")
         self.previous = frame
+        proposal = self.temporal.observe(frame, image, self.foreground_boxes)
+        for follower in (self.anchor, self.relocator):
+            follower.set_foreground_mask(
+                self.temporal.foreground_mask, self.temporal.cfg["min_visible_fraction"]
+            )
         local = self.anchor.align(image)
         a = None if local is None else self._compose(local)
         diagnostic = {
@@ -228,6 +324,13 @@ class DynamicCalibration:
                         a = candidate
                         status = "relocated"
                         diagnostic["reason"] = None
+        a, temporal_reason = self._temporal_sample(frame, a, len(self.segments) - 1)
+        diagnostic["temporal"] = dict(self.temporal.last_diagnostic)
+        if temporal_reason is not None:
+            diagnostic["reason"] = temporal_reason
+            status = "lost"
+        if a is None and proposal is not None and temporal_reason is None:
+            status = "temporal_pending"
         sample = GeometrySample(frame, a, len(self.segments) - 1, status)
         self.samples[frame] = sample
         self.diagnostics[frame] = diagnostic
@@ -239,6 +342,7 @@ class DynamicCalibration:
             "reference_size": list(self.c.frame_size),
             "coordinate_mapping": "reference_to_source",
             "policy": self.policy,
+            "temporal_policy": self.temporal.cfg,
             "segments": self.segments,
             "samples": [
                 asdict(s)
@@ -262,7 +366,7 @@ def normalize_tracks(tracks, samples):
         dets = []
         for d in t.dets:
             sample = samples.get(d.frame)
-            if sample is None or sample.alignment is None:
+            if sample is None or sample.alignment is None or sample.status == "bridged":
                 continue
             inverse = np.linalg.inv(np.array(sample.alignment.homography))
             x0, y0, x1, y1 = d.box
@@ -356,7 +460,7 @@ def read_geometry(out_dir, row, source_sha):
 
 def recorded_calibration(c, record, frame, size):
     sample = record["samples"].get(frame)
-    if sample is None or sample["alignment"] is None:
+    if sample is None or sample["alignment"] is None or sample["status"] == "bridged":
         return None
     original = record["reference_size"]
     sf = np.diag([size[0] / original[0], size[1] / original[1], 1.0])

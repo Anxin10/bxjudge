@@ -107,6 +107,14 @@ class StadiumFollower:
         self.keypoints, self.descriptors = self.orb.detectAndCompute(gray, self.mask)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.last_diagnostic = {"reason": "not_attempted"}
+        self.exclusions = None
+        self.minimum_visible = None
+
+    def set_foreground_mask(self, mask, minimum_visible):
+        self.exclusions = cv2.resize(
+            mask, self.work_size, interpolation=cv2.INTER_NEAREST
+        )
+        self.minimum_visible = minimum_visible
 
     def _reject(self, reason):
         self.last_diagnostic["reason"] = reason
@@ -122,7 +130,10 @@ class StadiumFollower:
         if self.descriptors is None:
             return self._reject("reference_features_missing")
         gray = self._gray(frame)
-        keypoints, descriptors = self.orb.detectAndCompute(gray, self.search_mask)
+        search = self.search_mask.copy()
+        if self.exclusions is not None:
+            search[self.exclusions > 0] = 0
+        keypoints, descriptors = self.orb.detectAndCompute(gray, search)
         self.last_diagnostic["frame_features"] = len(keypoints)
         if descriptors is None or len(descriptors) < 2:
             return self._reject("frame_features_missing")
@@ -151,6 +162,21 @@ class StadiumFollower:
         if matrix is None or inliers is None or not np.isfinite(matrix).all():
             return self._reject("affine_seed_invalid")
         current_edge = _edge_map(gray.astype(np.float32))
+        visible = self.mask.copy()
+        if self.exclusions is not None:
+            hidden = cv2.warpAffine(
+                self.exclusions,
+                matrix,
+                self.work_size,
+                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                borderValue=255,
+            )
+            visible[hidden > 0] = 0
+            if (
+                np.count_nonzero(visible) / max(1, np.count_nonzero(self.mask))
+                < self.minimum_visible
+            ):
+                return self._reject("foreground_occlusion")
         # Same fixed reference, input-domain rim mask. Refine mild camera tilt as well
         # as translation/rotation; no previous-frame transform or unchecked fallback.
         try:
@@ -164,7 +190,7 @@ class StadiumFollower:
                     self.cfg["ecc_iterations"],
                     self.cfg["ecc_epsilon"],
                 ),
-                self.mask,
+                visible,
                 5,
             )
             matrix = cv2.invertAffineTransform(inverse).astype(np.float64)
@@ -227,7 +253,22 @@ class StadiumFollower:
             self.work_size,
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
         )
-        score = _edge_ncc(self.edge, aligned, self.mask > 0)
+        if self.exclusions is not None:
+            hidden = cv2.warpAffine(
+                self.exclusions,
+                matrix,
+                self.work_size,
+                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                borderValue=255,
+            )
+            visible = self.mask.copy()
+            visible[hidden > 0] = 0
+            if (
+                np.count_nonzero(visible) / max(1, np.count_nonzero(self.mask))
+                < self.minimum_visible
+            ):
+                return self._reject("foreground_occlusion")
+        score = _edge_ncc(self.edge, aligned, visible > 0)
         self.last_diagnostic["edge_score"] = score
         if score < self.cfg["min_edge_score"]:
             return self._reject("edge_score_below_minimum")
@@ -235,7 +276,7 @@ class StadiumFollower:
         for y in (slice(0, h // 2), slice(h // 2, h)):
             for x in (slice(0, w // 2), slice(w // 2, w)):
                 if (
-                    _edge_ncc(self.edge[y, x], aligned[y, x], self.mask[y, x] > 0)
+                    _edge_ncc(self.edge[y, x], aligned[y, x], visible[y, x] > 0)
                     >= self.cfg["min_region_score"]
                 ):
                     supported += 1
