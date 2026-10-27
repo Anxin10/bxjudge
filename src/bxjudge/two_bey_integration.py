@@ -108,7 +108,7 @@ def reconstruct_round_tracks(
     ]
     members = {
         id_offset + eid: sorted(
-            tid for tid, owner in tracker.native_owners.items() if owner == eid
+            tid for tid, owner in tracker.native_anchor_owner.items() if owner == eid
         )
         for eid in entities
     }
@@ -135,6 +135,12 @@ def reconstruct_round_tracks(
             "observations": observations,
             "identity_unknown_since": {str(id_offset + eid): frame
                 for eid, frame in tracker.identity_unknown_since.items() if eid in entities},
+            "identity_unknown_intervals": {str(id_offset + eid): spans
+                for eid, spans in tracker.identity_unknown_intervals.items() if eid in entities},
+            "identity_merge_episodes": tracker.merge_episodes
+                + ([{"merge_frame": tracker.pending_merge["start"], "split_frame": None,
+                     "decision": "unknown", "reason": "no_split_observed"}]
+                   if tracker.pending_merge is not None else []),
             "unassigned": unassigned,
             "interpolation_used_for_judging": False,
         },

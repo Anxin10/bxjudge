@@ -80,6 +80,7 @@ from .temporal_geometry import load_temporal_policy
 from .track import track_frames
 from .trajectory_video import load_video_policy
 from .two_bey_integration import appearance_descriptor, reconstruct_round_tracks
+from .two_bey_tracking import identity_unknown_at
 from .two_bey_tracking import load_policy as load_two_bey_policy
 from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames, prefetched
@@ -341,8 +342,7 @@ def judge_video(
                 physical_rounds[number]=physical
                 adjudication_rounds[number]=[Track(t.track_id,t.cls,[d for d in t.dets
                     if (d.frame,tuple(d.box),d.score) in phase_keys
-                    and (str(t.track_id) not in physical.record['identity_unknown_since']
-                         or d.frame < physical.record['identity_unknown_since'][str(t.track_id)])])
+                    and not identity_unknown_at(physical.record, t.track_id, d.frame)])
                     for t in physical.tracks]
                 for track in physical.tracks:
                     raw_by_id[track.track_id]=track
@@ -354,6 +354,7 @@ def judge_video(
                 'adjudication_filter':'observed_phase_prepared_points_only'}
             record['identity']['physical_initial_sides']={str(t.track_id):side_hints.get(t.track_id) for p in physical_rounds.values() for t in p.tracks}
             record['identity']['physical_identity_unknown_since']={k:v for p in physical_rounds.values() for k,v in p.record['identity_unknown_since'].items()}
+            record['identity']['physical_identity_unknown_intervals']={k:v for p in physical_rounds.values() for k,v in p.record['identity_unknown_intervals'].items()}
             geometry_evidence=save_geometry(out_dir,info.path.name,record)
         if geometry is not None:
             tracks = normalize_tracks(raw_tracks, geometry.samples)
@@ -494,6 +495,8 @@ def judge_video(
                 if number in physical_rounds:
                     dynamic_notes.append('two_bey_tracking_requires_review')
                     unknown_since = physical_rounds[number].record['identity_unknown_since']
+                    if any(e['decision'] == 'recovered' for e in physical_rounds[number].record['identity_merge_episodes']):
+                        dynamic_notes.append('identity_recovered_after_merge')
                     if unknown_since:
                         first_unknown = min(unknown_since.values())
                         if is_after_finish(finish, None, first_unknown, th):
@@ -626,6 +629,8 @@ def judge_video(
                 },
                 judgment_tracks=selected if geometry is not None else None,
                 unknown_side_since={int(k):v for k,v in physical_rounds[number].record['identity_unknown_since'].items()}
+                    if number in physical_rounds else None,
+                unknown_side_intervals={int(k):v for k,v in physical_rounds[number].record['identity_unknown_intervals'].items()}
                     if number in physical_rounds else None,
                 unassigned=[
                     Track(

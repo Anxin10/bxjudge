@@ -549,6 +549,7 @@ def write_trajectory(
     unassigned: list[Track] | None = None,
     judgment_tracks: list[Track] | None = None,
     unknown_side_since: dict[int, int] | None = None,
+    unknown_side_intervals: dict[int, list[list[int]]] | None = None,
 ) -> tuple[Path, Path]:
     png_p = trajectory_png(out_dir, r.video, r.round)
     csv_p = png_p.with_suffix(".csv")
@@ -566,7 +567,10 @@ def write_trajectory(
     ]:
         def side_at(frame, side=side, track=track):
             first_unknown = (unknown_side_since or {}).get(track.track_id)
-            return "" if first_unknown is not None and frame >= first_unknown else side
+            if first_unknown is not None and frame >= first_unknown:
+                return ""
+            spans = (unknown_side_intervals or {}).get(track.track_id, [])
+            return "" if any(a <= frame <= b for a, b in spans) else side
 
         centers = track.centers()
         observations = {d.frame: d for d in track.dets}

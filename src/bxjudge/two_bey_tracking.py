@@ -33,6 +33,10 @@ def load_policy(path):
         "min_frame_border_px",
         "merge_observation_max_gap_s",
         "merge_center_margin_ratio",
+        "reanchor_motion_max_gap_s",
+        "reanchor_motion_margin",
+        "reanchor_appearance_min_separation",
+        "reanchor_appearance_margin",
     }
     if (
         not isinstance(p, dict)
@@ -55,6 +59,8 @@ def load_policy(path):
             "appearance_update_alpha",
             "missing_velocity_decay",
             "merge_center_margin_ratio",
+            "reanchor_appearance_min_separation",
+            "reanchor_appearance_margin",
         )
     ):
         raise ValueError("invalid bounded matching gate")
@@ -94,6 +100,25 @@ def _appearance(value):
     return a / a.sum()
 
 
+def identity_unknown_at(record, track_id, frame):
+    """True when a physical round record leaves ``track_id``'s player unknown at ``frame``."""
+    key = str(track_id)
+    since = record["identity_unknown_since"].get(key)
+    if since is not None and frame >= since:
+        return True
+    return any(
+        start <= frame <= end
+        for start, end in record["identity_unknown_intervals"].get(key, [])
+    )
+
+
+def _vote(margin, required):
+    # Positive margin favours keeping slot order; None means no opinion.
+    if margin is None or abs(margin) <= required:
+        return None
+    return "identity" if margin > 0 else "exchange"
+
+
 class TwoBeyTracker:
     """Bounded one-to-one assignment, distinct from detector and referee evidence."""
 
@@ -112,13 +137,21 @@ class TwoBeyTracker:
         self.previous = -1
         self.diagonal = math.hypot(*frame_size)
         self.native_owners = {}
+        # First owner of each native ID: player anchors are keyed by native IDs
+        # seen before any merge, so a later re-anchor must not move them.
+        self.native_anchor_owner = {}
+        # Open (unresolved) unknown spans; a recovered span moves to the closed
+        # intervals and the entity becomes valid again from the split frame.
         self.identity_unknown_since = {}
+        self.identity_unknown_intervals = {}
+        self.merge_episodes = []
+        self.pending_merge = None
 
     @property
     def entity_count(self):
         return len(self.slots)
 
-    def _create(self, d, appearance):
+    def _create(self, d, appearance, isolated):
         k = cv2.KalmanFilter(4, 2, 0, cv2.CV_64F)
         k.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float64)
         k.processNoiseCov = np.eye(4) * self.policy["kalman_process_noise"]
@@ -131,13 +164,104 @@ class TwoBeyTracker:
             "entity_id": len(self.slots) + 1,
             "kalman": k,
             "appearance": appearance,
+            # Re-anchoring evidence: only crops that overlap no other box.
+            "clean_appearance": appearance.copy()
+            if isolated and appearance is not None
+            else None,
             "native_id": d["native_id"],
             "last_box": list(d["box"]),
             "last_observed_frame": self.previous,
         }
         self.slots.append(slot)
-        self.native_owners[d["native_id"]] = slot["entity_id"]
+        self._own(d["native_id"], slot["entity_id"])
         return slot
+
+    def _own(self, native_id, entity_id):
+        self.native_owners[native_id] = entity_id
+        self.native_anchor_owner.setdefault(native_id, entity_id)
+
+    def _reanchor(self, frame, kept, predicted):
+        """Decide slot -> observation from pre-merge motion and appearance only."""
+        m = self.pending_merge
+        boxes = [d["box"] for d, _ in kept]
+        centres = [center(b) for b in boxes]
+        motion = None
+        gap = max(frame - s["last_observed_frame"] for s in m["slots"]) / self.fps
+        if gap <= self.policy["reanchor_motion_max_gap_s"]:
+            p = [
+                s["position"] + s["velocity"] * (frame - s["last_observed_frame"])
+                for s in m["slots"]
+            ]
+
+            def cost(a, b):
+                return np.linalg.norm(p[0] - centres[a]) + np.linalg.norm(
+                    p[1] - centres[b]
+                )
+
+            scale = np.mean([math.hypot(b[2] - b[0], b[3] - b[1]) for b in boxes])
+            motion = float((cost(1, 0) - cost(0, 1)) / scale)
+        appearance = None
+        a = [s["appearance"] for s in m["slots"]]
+        o = [x for _, x in kept]
+
+        def bh(x, y):
+            return float(cv2.compareHist(x, y, cv2.HISTCMP_BHATTACHARYYA))
+
+        # Indistinguishable tops (same model) cannot vote either way.
+        if (
+            all(v is not None for v in (*a, *o))
+            and bh(a[0], a[1]) >= self.policy["reanchor_appearance_min_separation"]
+        ):
+            appearance = (bh(a[0], o[1]) + bh(a[1], o[0])) - (
+                bh(a[0], o[0]) + bh(a[1], o[1])
+            )
+        votes = {
+            "motion": _vote(motion, self.policy["reanchor_motion_margin"]),
+            "appearance": _vote(appearance, self.policy["reanchor_appearance_margin"]),
+        }
+        cast = {v for v in votes.values() if v is not None}
+        # Votes are relative to these orders: "identity" maps slot i to
+        # observation i, "exchange" maps slot i to the other observation.
+        episode = {
+            "merge_frame": m["start"],
+            "split_frame": frame,
+            "slot_entities": [s["entity_id"] for s in m["slots"]],
+            "slot_native_ids": [s["native_id"] for s in m["slots"]],
+            "observation_native_ids": [d["native_id"] for d, _ in kept],
+            "motion_margin": motion,
+            "appearance_margin": appearance,
+            "votes": votes,
+        }
+        if len(cast) != 1:
+            episode.update(
+                decision="unknown",
+                reason="conflicting_cues" if cast else "no_cue_past_margin",
+            )
+            return episode, None
+        mapping = [0, 1] if cast == {"identity"} else [1, 0]
+        # A relative margin cannot vouch for observations that normal tracking
+        # would reject for either top.
+        if any(
+            np.linalg.norm(predicted[i] - centres[j]) / self.diagonal
+            > self.policy["position_gate_ratio"]
+            or (
+                a[i] is not None
+                and o[j] is not None
+                and bh(a[i], o[j]) > self.policy["appearance_gate"]
+            )
+            for i, j in enumerate(mapping)
+        ):
+            episode.update(decision="unknown", reason="split_outside_gates")
+            return episode, None
+        episode.update(
+            decision="recovered",
+            identity_recovered_by=sorted(k for k, v in votes.items() if v),
+            native_ids_swapped=any(
+                kept[j][0]["native_id"] != s["native_id"]
+                for s, j in zip(m["slots"], mapping, strict=True)
+            ),
+        )
+        return episode, mapping
 
     def update(self, frame, detections):
         if type(frame) is not int or frame < 0 or frame <= self.previous:
@@ -211,6 +335,20 @@ class TwoBeyTracker:
             else:
                 kept.append((d, a))
         dt = 1 if self.previous < 0 else frame - self.previous
+        # Pre-merge motion: predict() overwrites statePost, so read it first.
+        before = [
+            {
+                "entity_id": s["entity_id"],
+                "native_id": s["native_id"],
+                "position": center(s["last_box"]),
+                "velocity": s["kalman"].statePost[2:, 0].copy(),
+                "last_observed_frame": s["last_observed_frame"],
+                "appearance": None
+                if s["clean_appearance"] is None
+                else s["clean_appearance"].copy(),
+            }
+            for s in self.slots
+        ]
         predicted = []
         for s in self.slots:
             s["kalman"].transitionMatrix = np.array(
@@ -231,11 +369,39 @@ class TwoBeyTracker:
                 and box[1] - margin <= point[1] <= box[3] + margin
                 for slot, point in zip(self.slots, predicted, strict=True)
             ):
+                # Only two known identities can be re-anchored after the split;
+                # an identity already lost stays lost.
+                if self.pending_merge is None and not self.identity_unknown_since:
+                    self.pending_merge = {"start": frame, "slots": before}
                 for slot in self.slots:
                     self.identity_unknown_since.setdefault(slot["entity_id"], frame)
         self.previous = frame
         assigned = {}
-        if self.slots:
+        forced = None
+        # Decide at the first frame with two disjoint boxes: overlapping crops
+        # mix both tops and cannot carry either one's appearance.
+        if (
+            self.pending_merge is not None
+            and len(self.slots) == 2
+            and len(kept) == 2
+            and iou(kept[0][0]["box"], kept[1][0]["box"]) == 0
+        ):
+            episode, forced = self._reanchor(frame, kept, predicted)
+            self.merge_episodes.append(episode)
+            if forced is not None:
+                start = self.pending_merge["start"]
+                for s, snapshot in zip(self.slots, self.pending_merge["slots"], strict=True):
+                    # The merged box may have fed one slot's appearance.
+                    if snapshot["appearance"] is not None:
+                        s["appearance"] = snapshot["appearance"].copy()
+                    del self.identity_unknown_since[s["entity_id"]]
+                    self.identity_unknown_intervals.setdefault(
+                        s["entity_id"], []
+                    ).append([start, frame - 1])
+            self.pending_merge = None
+        if forced is not None:
+            assigned = dict(enumerate(forced))
+        elif self.slots:
             costs = np.full(
                 (len(self.slots), len(kept) + len(self.slots)),
                 self.policy["unmatched_cost"],
@@ -295,7 +461,7 @@ class TwoBeyTracker:
             s["native_id"] = d["native_id"]
             s["last_box"] = list(d["box"])
             s["last_observed_frame"] = frame
-            self.native_owners[d["native_id"]] = s["entity_id"]
+            self._own(d["native_id"], s["entity_id"])
             if appearance is not None and not any(
                 iou(d["box"], other["box"]) >= self.policy["duplicate_iou"]
                 and self.native_owners.get(other["native_id"])
@@ -308,6 +474,19 @@ class TwoBeyTracker:
                 else:
                     alpha = self.policy["appearance_update_alpha"]
                     s["appearance"] = (1 - alpha) * s["appearance"] + alpha * appearance
+            if (
+                appearance is not None
+                and self.pending_merge is None
+                and s["entity_id"] not in self.identity_unknown_since
+                and all(iou(d["box"], other["box"]) == 0 for other, _ in kept if other is not d)
+            ):
+                clean = s["clean_appearance"]
+                alpha = self.policy["appearance_update_alpha"]
+                s["clean_appearance"] = (
+                    appearance.copy()
+                    if clean is None
+                    else (1 - alpha) * clean + alpha * appearance
+                )
             observed.append(
                 {
                     **d,
@@ -338,7 +517,11 @@ class TwoBeyTracker:
                     for s in self.slots
                 )
             ):
-                s = self._create(d, a)
+                s = self._create(
+                    d,
+                    a,
+                    all(iou(d["box"], other["box"]) == 0 for other, _ in kept if other is not d),
+                )
                 observed.append(
                     {
                         **d,
@@ -362,9 +545,7 @@ class TwoBeyTracker:
                 and d["native_id"] not in self.native_owners
                 and any(r["native_id"] == d["duplicate_of"] for r in observed)
             ):
-                self.native_owners[d["native_id"]] = self.native_owners[
-                    d["duplicate_of"]
-                ]
+                self._own(d["native_id"], self.native_owners[d["duplicate_of"]])
         return {
             "observed": sorted(observed, key=lambda r: r["entity_id"]),
             "unassigned": rejected,

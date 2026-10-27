@@ -17,3 +17,9 @@ missing_velocity_decay: 0.8
 min_frame_border_px: 1.0
 merge_observation_max_gap_s: 0.15
 merge_center_margin_ratio: 0.15
+# Post-merge re-anchoring (task 5). Each cue votes only past its margin; a
+# conflict, or no vote at all, leaves both identities unknown.
+reanchor_motion_max_gap_s: 0.2
+reanchor_motion_margin: 0.5
+reanchor_appearance_min_separation: 0.3
+reanchor_appearance_margin: 0.15
