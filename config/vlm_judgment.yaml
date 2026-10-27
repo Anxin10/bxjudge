@@ -1,0 +1,4 @@
+# Evidence sampling only. This does not relax core adjudication gates.
+overview_frames: 9
+launch_frames: 3
+refinement_frames: 8
