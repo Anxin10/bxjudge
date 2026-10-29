@@ -27,7 +27,7 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
     monkeypatch.setattr(
         pipeline,
         "iter_stadium_displacement",
-        lambda frames, *a: ((f, img, 5.0) for f, img in frames),
+        lambda frames, *a, **k: ((f, img, 5.0) for f, img in frames),
     )
     tracks = [
         make_track(1, "bey", {f: (250 + 12, 220 - 8) for f in range(35, 75)}),
@@ -300,7 +300,7 @@ def test_raw_motion_preparation_overlaps_dynamic_alignment(tmp_path, monkeypatch
     monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
     monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
 
-    def raw(frames, *args):
+    def raw(frames, *args, **kwargs):
         for f, image in frames:
             raw_threads.add(get_ident())
             if f == 1:
@@ -330,3 +330,48 @@ def test_raw_motion_preparation_overlaps_dynamic_alignment(tmp_path, monkeypatch
     assert raw_threads and geometry_threads and raw_threads.isdisjoint(geometry_threads)
     record = json.loads(next((tmp_path / "out/geometry").glob("*.json")).read_text())
     assert [s["frame"] for s in record["samples"]] == list(range(40))
+
+
+# Codex task-7 speed re-review (2026-10-29): the raw-motion stage closes its
+# measurement generator, so an error raised on close is forwarded, never dropped
+# as an ignored finalizer exception.
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_raw_motion_stage_closes_its_measurement_explicitly(tmp_path, monkeypatch, th, rules):
+    import gc
+
+    ref, c = stadium_scene(size=(640, 360))
+    c.ref_frame = str(tmp_path / "reference.png")
+    assert cv2.imwrite(c.ref_frame, ref)
+    monkeypatch.setattr(
+        pipeline, "iter_frames", lambda *a, **k: iter((f, ref) for f in range(40))
+    )
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
+    closed = []
+
+    def raw(frames, *args, **kwargs):
+        try:
+            for f, image in frames:
+                yield f, image, 0.0
+        except GeneratorExit:
+            closed.append(True)
+            raise RuntimeError("decode failed") from None
+
+    def detector(image, f):
+        if f == 3:
+            raise ValueError("detector stopped")
+        return []
+
+    monkeypatch.setattr(pipeline, "iter_stadium_displacement", raw)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"synthetic source identity")
+    # The detector failure is the primary error; the close error rides as its cause
+    # chain inside prefetched, never as an ignored finalizer exception.
+    with pytest.raises(ValueError, match="detector stopped"):
+        pipeline.judge_video(
+            info(source), tmp_path, detector, rules, th,
+            out_dir=tmp_path / "out", autocalib=shipped_autocalib(),
+            dynamic_config=DEFAULT_DYNAMIC_CONFIG,
+        )
+    gc.collect()
+    assert closed == [True]

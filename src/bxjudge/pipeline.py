@@ -75,7 +75,7 @@ from .output import (
 )
 from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
-from .stadium_motion import iter_stadium_displacement
+from .stadium_motion import RAW_MOTION_WORKERS, iter_stadium_displacement
 from .temporal_geometry import load_temporal_policy
 from .track import track_frames
 from .trajectory_video import load_video_policy
@@ -244,11 +244,17 @@ def judge_video(
             appearances={}
 
             def measured():
-                for f, image, displacement in iter_stadium_displacement(
-                    chain(prefix, frames), c, ref
-                ):
-                    disp[f] = displacement
-                    yield f, image
+                displacements = iter_stadium_displacement(
+                    chain(prefix, frames), c, ref, workers=RAW_MOTION_WORKERS
+                )
+                # Close explicitly: an error the measurement raises on close then
+                # reaches prefetched instead of being dropped at finalization.
+                try:
+                    for f, image, displacement in displacements:
+                        disp[f] = displacement
+                        yield f, image
+                finally:
+                    displacements.close()
                 prefix.clear()
 
             frame_detections = {}

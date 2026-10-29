@@ -60,7 +60,8 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None, snap_kind="manual", snap_s
                         lambda frame, *a: _snapshot(c, kind=snap_kind, score=snap_score))
     monkeypatch.setattr(pipeline, "write_preview", lambda out_dir, snap: None)
 
-    def measured(frames, scaled, ref):
+    def measured(frames, scaled, ref, *, workers):
+        assert workers == 2  # RAW_MOTION_WORKERS
         assert scaled.frame_size == (1280, 720)
         assert scaled.battle_area == [(240, 120), (1040, 120), (1040, 560), (240, 560)]
         assert ref is frame  # the video's own first-second frame, not the 640x360 snapshot PNG
@@ -1350,10 +1351,10 @@ def _displacement_spy(monkeypatch):
     series = []
     real = pipeline.iter_stadium_displacement
 
-    def spy(frames, c, ref):
+    def spy(frames, c, ref, **kwargs):
         s = {}
         series.append(s)
-        for f, image, d in real(frames, c, ref):
+        for f, image, d in real(frames, c, ref, **kwargs):
             s[f] = d
             yield f, image, d
 
