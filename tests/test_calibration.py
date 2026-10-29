@@ -112,3 +112,16 @@ def test_brightness_gain_offset_keeps_similarity_high(tmp_path, gain, offset):
     c = cal_with(img, tmp_path)
     bright = np.clip(img.astype(np.float32) * gain + offset, 0, 255).astype(np.uint8)
     assert calibration_similarity(bright, c) > 0.9
+
+
+def test_edge_map_is_reproducible_whatever_ran_before():
+    # OpenCV's IPP magnitude gave a different last bit for the same input depending on the
+    # magnitude calls before it, so one first-second frame got a different auto snapshot
+    # (homography, id) and stadium edge map depending on what the batch had run earlier.
+    rng = np.random.default_rng(3)
+    gray = (rng.random((360, 640)) * 255).astype(np.float32)
+    before = calibration._edge_map(gray)
+    for shape in [(90, 160), (45, 80), (720, 1280), (7, 13), (180, 320), (360, 640)]:
+        other = rng.random(shape).astype(np.float32)
+        cv2.magnitude(other, other)
+        np.testing.assert_array_equal(calibration._edge_map(gray), before)

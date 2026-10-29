@@ -67,6 +67,36 @@ def test_second_video_at_same_position_reuses_the_auto_snapshot(tmp_path):
     assert a.kind == "auto" and a.id == b.id
 
 
+def test_a_reused_auto_snapshot_records_that_its_reference_is_another_videos_frame(tmp_path):
+    # Spec 6.3 grouping: a video at an existing auto snapshot's camera position is judged
+    # with that snapshot (aligned on the first such video's frame), so its zones depend on
+    # which videos the results folder judged before it. The record says so per video.
+    from bxjudge.output import record_video_calibration
+
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    first = stadium_scene(shift=(45, 20))[0]
+    other = stadium_scene(shift=(46, 21))[0]  # same camera position, a different frame
+    a = select_snapshot(first, calib, out, th(), load_autocalib_config())
+    b = select_snapshot(other, calib, out, th(), load_autocalib_config())
+    again = select_snapshot(first, calib, out, th(), load_autocalib_config())
+    assert a.id == b.id == again.id
+    assert a.reference == again.reference == "own_frame" and a.reference_similarity is None
+    assert b.reference == "shared" and 0.0 < b.reference_similarity <= 1.0
+    record_video_calibration(out, "b.mp4", b)
+    record_video_calibration(out, "a.mp4", again)
+    videos = json.loads((out / "videos.json").read_text(encoding="utf-8"))
+    assert videos["b.mp4"]["calibration"]["reference"] == "shared"
+    assert videos["b.mp4"]["calibration"]["reference_similarity"] == b.reference_similarity
+    assert videos["a.mp4"]["calibration"]["reference"] == "own_frame"
+    assert videos["a.mp4"]["calibration"]["reference_similarity"] is None
+
+
+def test_manual_snapshot_records_the_template_as_its_reference(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    s = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config())
+    assert s.kind == "manual" and s.reference == "template" and s.reference_similarity is None
+
+
 def test_different_position_gets_a_distinct_auto_snapshot(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())

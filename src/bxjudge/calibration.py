@@ -81,11 +81,15 @@ def _gray_small(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 
 
 def _edge_map(gray: np.ndarray) -> np.ndarray:
-    """Lightly blurred gradient magnitude (insensitive to brightness gain/offset)."""
+    """Lightly blurred gradient magnitude (insensitive to brightness gain/offset).
+
+    The magnitude is IEEE float32 arithmetic, not ``cv2.magnitude``: OpenCV's IPP path gave
+    the same input a different last bit depending on earlier calls, which moved an auto
+    snapshot (and its id) with whatever the batch had run before."""
     blurred = cv2.GaussianBlur(gray, (0, 0), RIM_BLUR_SIGMA)
     gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
-    return cv2.magnitude(gx, gy)
+    return np.sqrt(gx * gx + gy * gy)
 
 
 def calibration_similarity(frame: np.ndarray, c: Calibration) -> float:

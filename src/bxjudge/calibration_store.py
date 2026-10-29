@@ -73,6 +73,13 @@ class Snapshot:
     homography: tuple | None  # auto: 3x3 template px -> frame px
     # auto: sorted manual snapshot ids of all readable calib/ templates at creation (F-2)
     template_set: tuple[str, ...] | None = None
+    # Per selected video, not part of the identity (None when loaded by id): "template"
+    # (manual), "own_frame" (auto, its reference image is this video's frame) or "shared"
+    # (auto, reused from another video at this camera position, spec 6.3, so the zones depend
+    # on which videos the results folder judged first); "shared" also records this video's
+    # similarity to that reference image.
+    reference: str | None = None
+    reference_similarity: float | None = None
 
 
 def _cal_dir(out_dir: Path) -> Path:
@@ -340,8 +347,9 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
         if sim >= th.calibration_min_similarity and sim > best_sim:
             best_manual, best_sim = t, sim
     if best_manual is not None:
-        return save_snapshot(out_dir, "manual", best_manual.cal, best_manual.img, score=best_sim,
+        snap = save_snapshot(out_dir, "manual", best_manual.cal, best_manual.img, score=best_sim,
                              source_path=best_manual.path, autocalib=cfg)
+        return replace(snap, reference="template")
 
     best_auto: Snapshot | None = None
     best_sim = -1.0
@@ -359,7 +367,10 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
         elif s.template_set == template_set and sim > best_sim:
             best_auto, best_sim = s, sim
     if best_auto is not None:
-        return best_auto
+        ref = cv2.imread(best_auto.calibration.ref_frame, cv2.IMREAD_COLOR)
+        if ref is not None and np.array_equal(ref, frame):
+            return replace(best_auto, reference="own_frame")
+        return replace(best_auto, reference="shared", reference_similarity=float(best_sim))
 
     best_t = None
     best_al = None
@@ -380,7 +391,7 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
                          template_id=template.id, homography=best_al.homography,
                          template_set=template_set, autocalib=cfg)
     # A vetoed id is a known snapshot, so save_snapshot wrote nothing new for it.
-    return None if snap.id in vetoed else snap
+    return None if snap.id in vetoed else replace(snap, reference="own_frame")
 
 
 # --------------------------------------------------------------------------- vetoes (spec 6.5)
