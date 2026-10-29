@@ -456,11 +456,22 @@ def judge_video(
                 else:
                     stops[side] = None
             finish = detect_finish(bey, parts, stops, c, th, info.fps)
+            # Voids judge evidence only up to the settled candidate result (R55);
+            # an earlier void must not change what a later check counts.
+            candidate = finish
+
+            def relevant(frame, candidate=candidate):
+                return not is_after_finish(candidate, None, frame, th)
+
             dynamic_notes = []
             if geometry is not None:
-                if any(
-                    geometry.samples[f].alignment is None or geometry.samples[f].status == "bridged" for f in range(start, end + 1)
-                ):
+                missing = [
+                    f for f in range(start, end + 1)
+                    if geometry.samples[f].alignment is None or geometry.samples[f].status == "bridged"
+                ]
+                if missing and not any(map(relevant, missing)):
+                    dynamic_notes.append(AFTER_FINISH_PREFIX + "calibration_geometry_missing")
+                elif missing:
                     dynamic_notes.append("calibration_geometry_missing")
                     # An unknown image cannot be treated as the top leaving the arena.
                     finish = type(finish)(
@@ -499,7 +510,7 @@ def judge_video(
                         dynamic_notes.append('identity_recovered_after_merge')
                     if unknown_since:
                         first_unknown = min(unknown_since.values())
-                        if is_after_finish(finish, None, first_unknown, th):
+                        if not relevant(first_unknown):
                             dynamic_notes.append('after_finish:identity_after_merge_unknown')
                         else:
                             dynamic_notes.append('identity_after_merge_unknown')
@@ -509,11 +520,20 @@ def judge_video(
                         dynamic_notes.append('two_bey_singleton_segment')
                     if physical_rounds[number].record['unassigned']:
                         dynamic_notes.append('two_bey_unassigned_observations')
-                        if any(d['adjudication_eligible'] and d['reason']!='duplicate_box' for d in physical_rounds[number].record['unassigned']):
+                        eligible = [d['frame'] for d in physical_rounds[number].record['unassigned']
+                                    if d['adjudication_eligible'] and d['reason'] != 'duplicate_box']
+                        if eligible and not any(map(relevant, eligible)):
+                            dynamic_notes.append(AFTER_FINISH_PREFIX + 'two_bey_unassigned_identity_unknown')
+                        elif eligible:
                             dynamic_notes.append('two_bey_unassigned_identity_unknown')
                             finish=type(finish)(None,None,None,0.,[*finish.reasons,'two_bey_unassigned_identity_unknown'])
                 if any(len(phase.members.get(tid, [])) > 1 for tid in active_ids):
                     dynamic_notes.append("identity_join_requires_review")
+                if candidate.finish is not None and finish.finish is None:
+                    # Audit trail: what a void withheld, never a published result.
+                    dynamic_notes.append(
+                        f"finish_candidate_voided:{candidate.finish}:{candidate.loser}:{candidate.frame}"
+                    )
             # A stop arising only after the result is settled is a note (R55).
             stop_reasons = [
                 (

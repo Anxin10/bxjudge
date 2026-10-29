@@ -142,6 +142,7 @@ def reconstruct_round_tracks(
                      "decision": "unknown", "reason": "no_split_observed"}]
                    if tracker.pending_merge is not None else []),
             "unassigned": unassigned,
+            "reacquisitions": tracker.reacquisitions,
             "interpolation_used_for_judging": False,
         },
     )

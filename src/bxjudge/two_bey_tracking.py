@@ -37,6 +37,10 @@ def load_policy(path):
         "reanchor_motion_margin",
         "reanchor_appearance_min_separation",
         "reanchor_appearance_margin",
+        "duplicate_containment",
+        "reacquire_min_gap_s",
+        "reacquire_confirm_frames",
+        "reacquire_min_score",
     }
     if (
         not isinstance(p, dict)
@@ -47,6 +51,8 @@ def load_policy(path):
         raise ValueError("two-bey policy must explicitly configure exactly two targets")
     if type(p['pair_confirmation_frames']) is not int or p['pair_confirmation_frames']<2:
         raise ValueError('two-bey pair requires at least two actual source frames')
+    if type(p["reacquire_confirm_frames"]) is not int:
+        raise ValueError("re-acquisition needs a whole number of source frames")
     for k in keys - {"max_targets", "appearance_bins"}:
         if type(p[k]) not in (int, float) or not math.isfinite(p[k]) or p[k] <= 0:
             raise ValueError("invalid two-bey policy value")
@@ -61,6 +67,8 @@ def load_policy(path):
             "merge_center_margin_ratio",
             "reanchor_appearance_min_separation",
             "reanchor_appearance_margin",
+            "duplicate_containment",
+            "reacquire_min_score",
         )
     ):
         raise ValueError("invalid bounded matching gate")
@@ -83,6 +91,14 @@ def iou(a, b):
     )
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - overlap
     return overlap / union
+
+
+def containment(a, b):
+    """Fraction of box ``a``'s own area inside box ``b`` (asymmetric)."""
+    overlap = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0, min(a[3], b[3]) - max(a[1], b[1])
+    )
+    return overlap / ((a[2] - a[0]) * (a[3] - a[1]))
 
 
 def _appearance(value):
@@ -146,6 +162,9 @@ class TwoBeyTracker:
         self.identity_unknown_intervals = {}
         self.merge_episodes = []
         self.pending_merge = None
+        # Elimination re-acquisition: (native_id, slot, last frame, consecutive frames).
+        self.reacquire_streak = None
+        self.reacquisitions = []
 
     @property
     def entity_count(self):
@@ -176,9 +195,62 @@ class TwoBeyTracker:
         self._own(d["native_id"], slot["entity_id"])
         return slot
 
+    def _eliminate(self, frame, kept, assigned, predicted):
+        """Assign a persistent sole leftover to the only stale slot (two tops per round).
+
+        Mutates ``assigned``; returns the slot index whose appearance restarts, or None.
+        """
+        p = self.policy
+        candidate = None
+        if len(self.slots) == 2 and self.pending_merge is None and len(assigned) == 1:
+            [(seen, j_seen)] = assigned.items()
+            k = 1 - seen
+            leftovers = [j for j in range(len(kept)) if j != j_seen]
+            if (
+                frame - self.slots[k]["last_observed_frame"] >= round(p["reacquire_min_gap_s"] * self.fps)
+                and len(leftovers) == 1
+            ):
+                j = leftovers[0]
+                d = kept[j][0]
+                owner = self.native_owners.get(d["native_id"])
+                if (
+                    d["score"] >= p["reacquire_min_score"]
+                    and iou(d["box"], kept[j_seen][0]["box"]) == 0
+                    and owner in (None, self.slots[k]["entity_id"])
+                    and float(np.linalg.norm(predicted[k] - center(d["box"]))) / self.diagonal
+                    <= p["position_gate_ratio"]
+                ):
+                    candidate = (k, j, d["native_id"])
+        if candidate is None:
+            self.reacquire_streak = None
+            return None
+        k, j, native = candidate
+        streak = self.reacquire_streak
+        count = streak[3] + 1 if (
+            streak is not None and streak[:2] == (native, k) and frame == streak[2] + 1
+        ) else 1
+        self.reacquire_streak = (native, k, frame, count)
+        if count < p["reacquire_confirm_frames"]:
+            return None
+        self.reacquire_streak = None
+        # Two tops per round locate the slot, never its player: a stale or
+        # contradicting template is no identity evidence either way.
+        self.identity_unknown_since.setdefault(self.slots[k]["entity_id"], frame)
+        self.reacquisitions.append({
+            "frame": frame,
+            "entity_id": self.slots[k]["entity_id"],
+            "native_id": native,
+            "unobserved_frames": frame - self.slots[k]["last_observed_frame"],
+        })
+        assigned[k] = j
+        return k
+
     def _own(self, native_id, entity_id):
         self.native_owners[native_id] = entity_id
-        self.native_anchor_owner.setdefault(native_id, entity_id)
+        # Anchor membership gives the whole physical track its player; a native
+        # joining while the player is unknown is spatial evidence only.
+        if entity_id not in self.identity_unknown_since:
+            self.native_anchor_owner.setdefault(native_id, entity_id)
 
     def _reanchor(self, frame, kept, predicted):
         """Decide slot -> observation from pre-merge motion and appearance only."""
@@ -447,6 +519,7 @@ class TwoBeyTracker:
                 for i, j in zip(ii, jj, strict=True)
                 if j < len(kept) and costs[i, j] < self.policy["unmatched_cost"]
             }
+        reseed = self._eliminate(frame, kept, assigned, predicted)
         used = set(assigned.values())
         for i, s in enumerate(self.slots):
             if i not in assigned:
@@ -462,6 +535,10 @@ class TwoBeyTracker:
             s["last_box"] = list(d["box"])
             s["last_observed_frame"] = frame
             self._own(d["native_id"], s["entity_id"])
+            if i == reseed and appearance is not None:
+                # The stale tracking template locked this top out; restart only it.
+                # clean_appearance keeps the contradicting identity evidence.
+                s["appearance"] = appearance.copy()
             if appearance is not None and not any(
                 iou(d["box"], other["box"]) >= self.policy["duplicate_iou"]
                 and self.native_owners.get(other["native_id"])
@@ -532,16 +609,41 @@ class TwoBeyTracker:
                     }
                 )
             else:
+                # Mostly inside exactly one observed top and touching no other:
+                # a box reaching into both tops stays an ambiguous observation, and
+                # so does a native the other top owns.
+                inside = next(
+                    (
+                        o for o in observed
+                        if len(observed) == 2
+                        and self.native_owners.get(d["native_id"]) in (None, o["entity_id"])
+                        and containment(d["box"], o["box"]) >= self.policy["duplicate_containment"]
+                        and all(
+                            containment(d["box"], other["box"]) == 0
+                            for other in observed if other is not o
+                        )
+                    ),
+                    None,
+                )
                 rejected.append(
                     {
                         **d,
                         "frame": frame,
                         "reason": "unassigned_two_target_capacity_or_gate",
                     }
+                    if inside is None
+                    else {
+                        **d,
+                        "frame": frame,
+                        "reason": "duplicate_box",
+                        "duplicate_of": inside["native_id"],
+                        "duplicate_kind": "contained",
+                    }
                 )
         for d in rejected:
             if (
                 d["reason"] == "duplicate_box"
+                and d.get("duplicate_kind") != "contained"
                 and d["native_id"] not in self.native_owners
                 and any(r["native_id"] == d["duplicate_of"] for r in observed)
             ):
