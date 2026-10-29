@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 from .config import config_loader
-from .geometry import boxes_touch, point_in_polygon
+from .geometry import boxes_touch, point_in_polygon, polygon_mask
 from .launch_check import _launch_side
 from .types import Calibration, Side, Track
 
@@ -120,6 +120,9 @@ def anchor_sides(
         raise ValueError("identity anchor needs at least two observed frames")
     if not math.isfinite(body_margin_px) or body_margin_px < 0:
         raise ValueError("identity body margin must be nonnegative finite")
+    launch_mask = polygon_mask(c.launch_left, c.frame_size) | polygon_mask(
+        c.launch_right, c.frame_size
+    )
     reference = {
         (t.track_id, d.frame): (d.box, t.center_at(d.frame))
         for t in reference_tracks
@@ -200,13 +203,40 @@ def anchor_sides(
                 run = []
                 waiting_for_body = True
                 continue
-            waiting_for_body = False
             registered = reference.get((track.track_id, d.frame))
             point = registered[1] if registered is not None else None
             if point is not None and not (
                 point_in_polygon(point, c.launch_left)
                 or point_in_polygon(point, c.launch_right)
             ):
+                # A clipped box's centre cannot establish a free-flight prefix.
+                # Wait only while a real nearby launcher is observed but its
+                # role is unknown; later ownership still needs the full run.
+                x0, y0, x1, y1 = d.box
+                clipped = (
+                    x0 <= 0 or y0 <= 0 or x1 >= c.frame_size[0] or y1 >= c.frame_size[1]
+                )
+                bx0, by0, bx1, by1 = registered[0]
+                left, top = max(0, math.floor(bx0)), max(0, math.floor(by0))
+                right = min(c.frame_size[0], math.ceil(bx1))
+                bottom = min(c.frame_size[1], math.ceil(by1))
+                overlaps_launch = (
+                    left < right
+                    and top < bottom
+                    and bool(launch_mask[top:bottom, left:right].any())
+                )
+                if (
+                    clipped
+                    and overlaps_launch
+                    and not conflict
+                    and prefix_side is None
+                    and all(side is None for _, side in nearby)
+                    and (d.frame - track.first_frame()) / fps
+                    <= policy["context_wait_s"]
+                ):
+                    run = []
+                    waiting_for_body = True
+                    continue
                 break
             context = {side for _, side in nearby}
             if None in context:
@@ -214,6 +244,7 @@ def anchor_sides(
                 continue
             if len(context) != 1:
                 break
+            waiting_for_body = False
             side = next(iter(context))
             top_region = _launch_side(point, c) if point is not None else None
             if (top_region is not None and top_region != side) or (
