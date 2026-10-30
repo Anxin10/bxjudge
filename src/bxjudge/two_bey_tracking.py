@@ -233,15 +233,6 @@ class TwoBeyTracker:
         if count < p["reacquire_confirm_frames"]:
             return None
         self.reacquire_streak = None
-        # Two tops per round locate the slot, never its player: a stale or
-        # contradicting template is no identity evidence either way.
-        self.identity_unknown_since.setdefault(self.slots[k]["entity_id"], frame)
-        self.reacquisitions.append({
-            "frame": frame,
-            "entity_id": self.slots[k]["entity_id"],
-            "native_id": native,
-            "unobserved_frames": frame - self.slots[k]["last_observed_frame"],
-        })
         assigned[k] = j
         return k
 
@@ -530,6 +521,18 @@ class TwoBeyTracker:
         for i, j in assigned.items():
             d, appearance = kept[j]
             s = self.slots[i]
+            gap = frame - s["last_observed_frame"]
+            if forced is None and gap >= round(self.policy["reacquire_min_gap_s"] * self.fps):
+                # Ordinary gates and two-top elimination establish space only.
+                # A stale template or reused native ID cannot restore the player;
+                # only the explicit, validated post-merge re-anchor can do that.
+                self.identity_unknown_since.setdefault(s["entity_id"], frame)
+                self.reacquisitions.append({
+                    "frame": frame,
+                    "entity_id": s["entity_id"],
+                    "native_id": d["native_id"],
+                    "unobserved_frames": gap,
+                })
             s["kalman"].correct(center(d["box"]).reshape(2, 1))
             s["native_id"] = d["native_id"]
             s["last_box"] = list(d["box"])

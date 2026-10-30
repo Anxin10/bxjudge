@@ -26,8 +26,9 @@ reanchor_appearance_margin: 0.15
 # Association repairs (task 7). A box at least this fraction inside an observed
 # top's box, while both tops are observed, is a second box of that top.
 duplicate_containment: 0.8
-# A slot unobserved this long, with the other slot observed, takes the sole
-# disjoint leftover once it persists this many consecutive frames (two tops).
+# Ordinary matching after this loss duration leaves the player unknown too.
+# With the other slot observed, the sole disjoint leftover can also restore
+# spatial tracking after consecutive confirmation (never player identity).
 reacquire_min_gap_s: 1.0
 reacquire_confirm_frames: 5
 reacquire_min_score: 0.5
