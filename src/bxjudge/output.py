@@ -411,11 +411,9 @@ def record_video_attempt(
 
 def record_video_calibration(out_dir: Path, video: str, snap: Snapshot | None) -> None:
     """Record in ``videos.json[video]["calibration"]`` the snapshot the video was judged with
-    (``{"id", "kind", "name", "score", "template_id", "reference", "reference_similarity"}``;
-    ``score`` is this video's similarity for a manual snapshot, the alignment score for an auto
-    one; ``reference`` says whether an auto snapshot was aligned on this video's own frame or
-    shared from another video at its camera position, see ``Snapshot.reference``) or ``None``
-    (spec section 6.4). Call after ``record_video_timing``, which replaces the entry."""
+    (``{"id", "kind", "name", "score", "template_id"}``; ``score`` is this video's similarity
+    for a manual snapshot, the alignment score for an auto one) or ``None`` (spec section 6.4).
+    Call after ``record_video_timing``, which replaces the entry."""
     path = Path(out_dir) / "videos.json"
     rows = _read_json(path, {})
     rows.setdefault(video, {})["calibration"] = None if snap is None else {
@@ -424,8 +422,6 @@ def record_video_calibration(out_dir: Path, video: str, snap: Snapshot | None) -
         "name": snap.calibration.name,
         "score": float(snap.score),
         "template_id": snap.template_id,
-        "reference": snap.reference,
-        "reference_similarity": snap.reference_similarity,
     }
     _write_json(path, rows)
 

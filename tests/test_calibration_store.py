@@ -60,41 +60,25 @@ def test_shifted_frame_gets_auto_snapshot_with_its_own_reference(tmp_path):
     assert tpl.kind == "manual" and tpl.calibration.name == "scene"
 
 
-def test_second_video_at_same_position_reuses_the_auto_snapshot(tmp_path):
+def test_same_frame_gets_the_same_auto_snapshot(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
     b = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
     assert a.kind == "auto" and a.id == b.id
 
 
-def test_a_reused_auto_snapshot_records_that_its_reference_is_another_videos_frame(tmp_path):
-    # Spec 6.3 grouping: a video at an existing auto snapshot's camera position is judged
-    # with that snapshot (aligned on the first such video's frame), so its zones depend on
-    # which videos the results folder judged before it. The record says so per video.
-    from bxjudge.output import record_video_calibration
-
+def test_auto_snapshot_does_not_depend_on_videos_judged_before(tmp_path):
+    # Every video is aligned on its own first-second frame: a video at the camera position of
+    # an earlier video gets the snapshot it would get alone, whatever else is in the batch.
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     first = stadium_scene(shift=(45, 20))[0]
     other = stadium_scene(shift=(46, 21))[0]  # same camera position, a different frame
+    alone = select_snapshot(other, calib, tmp_path / "alone", th(), load_autocalib_config())
     a = select_snapshot(first, calib, out, th(), load_autocalib_config())
     b = select_snapshot(other, calib, out, th(), load_autocalib_config())
-    again = select_snapshot(first, calib, out, th(), load_autocalib_config())
-    assert a.id == b.id == again.id
-    assert a.reference == again.reference == "own_frame" and a.reference_similarity is None
-    assert b.reference == "shared" and 0.0 < b.reference_similarity <= 1.0
-    record_video_calibration(out, "b.mp4", b)
-    record_video_calibration(out, "a.mp4", again)
-    videos = json.loads((out / "videos.json").read_text(encoding="utf-8"))
-    assert videos["b.mp4"]["calibration"]["reference"] == "shared"
-    assert videos["b.mp4"]["calibration"]["reference_similarity"] == b.reference_similarity
-    assert videos["a.mp4"]["calibration"]["reference"] == "own_frame"
-    assert videos["a.mp4"]["calibration"]["reference_similarity"] is None
-
-
-def test_manual_snapshot_records_the_template_as_its_reference(tmp_path):
-    calib, out = make_calib_dir(tmp_path, stadium_scene())
-    s = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config())
-    assert s.kind == "manual" and s.reference == "template" and s.reference_similarity is None
+    assert a.kind == b.kind == alone.kind == "auto"
+    assert b.id == alone.id != a.id
+    assert np.array_equal(cv2.imread(b.calibration.ref_frame), other)
 
 
 def test_different_position_gets_a_distinct_auto_snapshot(tmp_path):
@@ -273,10 +257,12 @@ def test_added_better_template_replaces_an_existing_auto_snapshot(tmp_path):
     assert second.kind == "auto" and second.id != first.id
     assert second.template_id == b_id and second.calibration.name == "auto-B_new"
     assert second.score > first.score
-    # unchanged template set: the new auto snapshot is reused (grouping still works)
+    # unchanged template set: the same frame gets the same snapshot again
     assert select_snapshot(frame, calib, out, th(), cfg).id == second.id
+    # a neighbouring video is aligned on its own frame, with the same better template
     neighbour = stadium_scene(shift=(46, 21))[0]
-    assert select_snapshot(neighbour, calib, out, th(), cfg).id == second.id
+    own = select_snapshot(neighbour, calib, out, th(), cfg)
+    assert own.id != second.id and own.template_id == b_id
 
 
 def test_removing_an_unrelated_template_forces_a_fresh_alignment(tmp_path):
@@ -301,10 +287,14 @@ def test_adding_a_template_keeps_a_vetoed_group_barred_for_its_template(tmp_path
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     frame = stadium_scene(shift=(45, 20))[0]
     a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
-    veto_calibration(out, a.id, autocalib=shipped_autocalib())
+    veto_calibration(out, a.id, autocalib=shipped_autocalib(), video="clip.mp4")
     add_manual_calibration(calib, stadium_scene(rotation_deg=30.0), name="other")  # cannot align
     assert select_snapshot(frame, calib, out, th(), load_autocalib_config(),
-                           vetoed_ids(out)) is None
+                           vetoed_ids(out), video="clip.mp4") is None
+    # Barring follows the explicit video scope, never a neighbour's (spec 6.3).
+    other = stadium_scene(shift=(46, 21))[0]
+    assert select_snapshot(other, calib, out, th(), load_autocalib_config(),
+                           vetoed_ids(out), video="neighbour.mp4").kind == "auto"
 
 
 # ---- vetoes (Task 4, ruling T4-1) ------------------------------------------------------
@@ -319,10 +309,12 @@ def test_veto_file_records_time_and_note_and_unveto_restores(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
     assert vetoed_ids(out) == set()
-    veto_calibration(out, a.id, note="rim off by 10 px", autocalib=shipped_autocalib())
+    veto_calibration(out, a.id, note="rim off by 10 px", autocalib=shipped_autocalib(),
+                     video="clip.mp4")
     assert vetoed_ids(out) == {a.id}
     entry = json.loads((out / "calibration_vetoes.json").read_text())[a.id]
     assert entry["note"] == "rim off by 10 px" and entry["at"]
+    assert entry["videos"] == ["clip.mp4"]
     unveto_calibration(out, a.id, autocalib=shipped_autocalib())
     assert vetoed_ids(out) == set()
     unveto_calibration(out, a.id, autocalib=shipped_autocalib())  # idempotent
@@ -339,35 +331,40 @@ def test_veto_applies_to_auto_snapshots_only(tmp_path):
     assert not (out / "calibration_vetoes.json").exists()
 
 
-def test_vetoed_auto_snapshot_is_never_reused(tmp_path):
+def test_veto_of_one_video_leaves_a_neighbouring_video_alone(tmp_path):
+    # A veto is about one video's snapshot: another video at the same camera position keeps
+    # the snapshot of its own frame (its predictions stay in the evaluation population).
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    veto_calibration(out, a.id, autocalib=shipped_autocalib(), video="clip.mp4")
     other = stadium_scene(shift=(46, 21))[0]  # same camera position, a different video frame
-    assert select_snapshot(other, calib, out, th(), load_autocalib_config()).id == a.id
-    # Its own fresh alignment would be a different snapshot (its own reference frame) ...
-    fresh = select_snapshot(other, calib, tmp_path / "fresh", th(), load_autocalib_config())
-    assert fresh.kind == "auto" and fresh.id != a.id
-    # ... but a vetoed group is not re-aligned automatically from another of its videos.
-    assert select_snapshot(other, calib, out, th(), load_autocalib_config(), {a.id}) is None
-    assert len(list((out / "calibrations").glob("*.json"))) == 2  # template + a, nothing new
+    alone = select_snapshot(other, calib, tmp_path / "alone", th(), load_autocalib_config())
+    vetoed = select_snapshot(other, calib, out, th(), load_autocalib_config(), {a.id},
+                            video="neighbour.mp4")
+    assert alone.kind == "auto" and alone.id != a.id and vetoed.id == alone.id
 
 
 def test_fresh_alignment_equal_to_a_vetoed_id_returns_none(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     frame = stadium_scene(shift=(45, 20))[0]
     a = select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    veto_calibration(out, a.id, autocalib=shipped_autocalib(), video="clip.mp4")
     assert select_snapshot(frame, calib, tmp_path / "again", th(), load_autocalib_config()).id == a.id
-    assert select_snapshot(frame, calib, out, th(), load_autocalib_config(), {a.id}) is None
+    assert select_snapshot(frame, calib, out, th(), load_autocalib_config(), {a.id},
+                           video="clip.mp4") is None
 
 
 def test_veto_leaves_other_positions_and_manual_selection_alone(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     a = select_snapshot(stadium_scene(shift=(45, 20))[0], calib, out, th(), load_autocalib_config())
+    veto_calibration(out, a.id, autocalib=shipped_autocalib(), video="clip.mp4")
     far = stadium_scene(shift=(-50, 25))[0]
     b = select_snapshot(far, calib, out, th(), load_autocalib_config())
     assert b.kind == "auto" and b.id != a.id
-    assert select_snapshot(far, calib, out, th(), load_autocalib_config(), {a.id}).id == b.id
-    manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config(), {a.id})
+    assert select_snapshot(far, calib, out, th(), load_autocalib_config(), {a.id},
+                           video="far.mp4").id == b.id
+    manual = select_snapshot(stadium_scene()[0], calib, out, th(), load_autocalib_config(), {a.id},
+                             video="clip.mp4")
     assert manual.kind == "manual"
 
 

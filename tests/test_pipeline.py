@@ -57,7 +57,7 @@ def calibrated(monkeypatch, tmp_path, *, tracks=None, snap_kind="manual", snap_s
 
     monkeypatch.setattr(pipeline, "iter_frames", frames)
     monkeypatch.setattr(pipeline, "select_snapshot",
-                        lambda frame, *a: _snapshot(c, kind=snap_kind, score=snap_score))
+                        lambda frame, *a, video: _snapshot(c, kind=snap_kind, score=snap_score))
     monkeypatch.setattr(pipeline, "write_preview", lambda out_dir, snap: None)
 
     def measured(frames, scaled, ref, *, workers):
@@ -91,7 +91,7 @@ def test_recalibrate_closes_single_decode(monkeypatch, tmp_path, th, rules):
             closed.append(True)
 
     monkeypatch.setattr(pipeline, "iter_frames", frames)
-    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: None)
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a, video: None)
     [r] = pipeline.judge_video(info(), Path("calib"), lambda *a: [], rules, th, **_kw(tmp_path))
     assert r.review_reasons == ["recalibrate"] and r.needs_review
     assert closed == [True]
@@ -1373,7 +1373,7 @@ def _assert_own_reference(series, th, rows=None):
         assert all(window[str(f)] > th.shake_px for f in _SHAKE)
 
 
-def test_reused_auto_snapshot_measures_shake_against_the_videos_own_frame(
+def test_neighbouring_auto_snapshot_measures_shake_against_the_videos_own_frame(
     tmp_path, rules, monkeypatch
 ):
     from tests.helpers import add_manual_calibration, stadium_scene, write_scene_video
@@ -1381,14 +1381,14 @@ def test_reused_auto_snapshot_measures_shake_against_the_videos_own_frame(
     videos, calib, out = tmp_path / "videos", tmp_path / "calib", tmp_path / "out"
     videos.mkdir()
     write_scene_video(videos / "a.mp4", stadium_scene(shift=(45, 20))[0])
-    # b: the camera is 4 px away from a's frame, which becomes the group reference
+    # b: the camera is 4 px away from a's frame; b is aligned on its own frame (spec 6.3)
     write_scene_video(videos / "b.mp4", stadium_scene(shift=(49, 20))[0], shake=_SHAKE)
     add_manual_calibration(calib, stadium_scene())
     series = _displacement_spy(monkeypatch)
     _run(videos, calib, out, rules)
     recorded = json.loads((out / "videos.json").read_text())
     assert recorded["a.mp4"]["calibration"]["kind"] == "auto"
-    assert recorded["b.mp4"]["calibration"]["id"] == recorded["a.mp4"]["calibration"]["id"]
+    assert recorded["b.mp4"]["calibration"]["id"] != recorded["a.mp4"]["calibration"]["id"]
     rows = [r for r in json.loads((out / "rounds.json").read_text()) if r["video"] == "b.mp4"]
     _assert_own_reference(series[1], _cpu_th(), rows)
 
@@ -1426,10 +1426,10 @@ def test_manual_match_with_moved_camera_measures_shake_against_the_videos_own_fr
 
 
 def _veto_setup(tmp_path, rules):
-    """clip.mp4 and clip2.mp4 at the same moved camera position, judged (one auto group, one
-    real round each); clip.mp4 round 1 confirmed and clip2.mp4 round 1 (made unflagged) in the
-    audit sample;
-    then that group vetoed. Returns (videos, calib, out, snapshot id)."""
+    """clip.mp4 and clip2.mp4 at the same moved camera position, judged (each with its own
+    auto snapshot, spec 6.3; one real round each); clip.mp4 round 1 confirmed and clip2.mp4
+    round 1 (made unflagged) in the audit sample;
+    then both snapshots vetoed. Returns (videos, calib, out, {video: snapshot id})."""
     from bxjudge.calibration_store import veto_calibration
     from bxjudge.output import read_rounds, save_rounds
     from tests.helpers import stadium_scene, write_scene_video
@@ -1438,8 +1438,8 @@ def _veto_setup(tmp_path, rules):
     write_scene_video(videos / "clip2.mp4", stadium_scene(shift=(46, 21))[0], seconds=3.0, fps=30)
     _run(videos, calib, out, rules)
     v = json.loads((out / "videos.json").read_text())
-    sid = v["clip.mp4"]["calibration"]["id"]
-    assert v["clip2.mp4"]["calibration"]["id"] == sid  # one group
+    ids = {name: v[name]["calibration"]["id"] for name in ("clip.mp4", "clip2.mp4")}
+    assert ids["clip.mp4"] != ids["clip2.mp4"]  # each video is aligned on its own frame
     _confirm_reviewed(out, "clip.mp4", 1, rules)
     rows = read_rounds(out)
     for r in rows:
@@ -1449,8 +1449,9 @@ def _veto_setup(tmp_path, rules):
             r["audit_sample"] = True
     save_rounds(rows, out, rules)
     _freeze_audit(out)
-    veto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
-    return videos, calib, out, sid
+    for sid in ids.values():
+        veto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
+    return videos, calib, out, ids
 
 
 def _eval(out):
@@ -1462,51 +1463,106 @@ def _eval(out):
 
 
 def test_rerun_after_a_veto_keeps_the_rows_and_the_evaluation_population(tmp_path, rules):
-    from tests.helpers import (
-        FakeDetector,
-        read_matches,
-        stadium_scene,
-        write_scene_video,
-    )
+    from tests.helpers import FakeDetector, read_matches
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     assert [(r["video"], r["round"]) for m in read_matches(out) for r in m["rounds"]] == [
         ("clip.mp4", 1)]  # reviewed rows still score; the unreviewed vetoed one does not
     before_rows = (out / "rounds.json").read_bytes()
     before = _eval(out)
     assert before.n_rounds == 2 and before.n_vetoed_rounds == 2
-    # A new video at the vetoed position joins the group as recalibrate (no detector).
-    write_scene_video(videos / "clip3.mp4", stadium_scene(shift=(45, 21))[0], seconds=3.0, fps=30)
+    # (A new video at the same camera position is aligned on its own frame and judged
+    # normally, spec 6.3: a veto covers only its own snapshot.)
     for _ in range(2):  # a second plain run changes nothing either
         detector = FakeDetector()
         _run(videos, calib, out, rules, detector=detector)
         assert detector.frames == []
         rows = json.loads((out / "rounds.json").read_text())
-        assert [r for r in rows if r["video"] != "clip3.mp4"] == json.loads(before_rows)
-        assert [r["review_reasons"] for r in rows if r["video"] == "clip3.mp4"] == [["recalibrate"]]
+        assert rows == json.loads(before_rows)
         after = _eval(out)
         assert (after.n_rounds, after.review_ratio, after.n_vetoed_rounds) == (
             before.n_rounds, before.review_ratio, before.n_vetoed_rounds)
-        assert after.n_recalibrate_videos == 1 and after.n_vetoed_videos == 2
-        assert after.n_pending_videos == 3
+        assert after.n_recalibrate_videos == 0 and after.n_vetoed_videos == 2
+        assert after.n_pending_videos == before.n_pending_videos
         v = json.loads((out / "videos.json").read_text())
-        assert v["clip.mp4"]["calibration"]["id"] == v["clip2.mp4"]["calibration"]["id"] == sid
+        assert {name: v[name]["calibration"]["id"] for name in ids} == ids
         assert next(r for r in rows if r["video"] == "clip2.mp4")["audit_sample"] is True
 
+
+
+def test_veto_of_one_video_keeps_a_neighbouring_videos_rows(tmp_path, rules):
+    """Spec 6.3 (every video aligned on its own frame): vetoing clip.mp4's snapshot never
+    re-judges clip2.mp4 at the same camera position, so its predictions stay (spec 6.6b)."""
+    from bxjudge.calibration_store import veto_calibration
+    from tests.helpers import FakeDetector, stadium_scene, write_scene_video
+
+    videos, calib, out = _clip_setup(tmp_path)
+    write_scene_video(videos / "clip2.mp4", stadium_scene(shift=(46, 21))[0], seconds=3.0, fps=30)
+    _run(videos, calib, out, rules)
+    v = json.loads((out / "videos.json").read_text())
+    veto_calibration(out, v["clip.mp4"]["calibration"]["id"], rules=rules,
+                     autocalib=shipped_autocalib())
+    before = [r for r in json.loads((out / "rounds.json").read_text()) if r["video"] == "clip2.mp4"]
+    assert before and not any(is_not_a_round(r["review_reasons"]) for r in before)
+    detector = FakeDetector()
+    _run(videos, calib, out, rules, detector=detector)
+    assert detector.frames == []
+    after = [r for r in json.loads((out / "rounds.json").read_text()) if r["video"] == "clip2.mp4"]
+    assert after == before
+    assert json.loads((out / "videos.json").read_text())["clip2.mp4"]["calibration"] == (
+        v["clip2.mp4"]["calibration"])
+
+
+@pytest.mark.parametrize("rejudge", [False, True])
+def test_veto_history_survives_source_replacement_and_a_new_selected_snapshot(
+    tmp_path, rules, rejudge
+):
+    from bxjudge.calibration_store import load_snapshot, veto_calibration
+    from tests.helpers import stadium_scene, write_scene_video
+    from tests.test_calibration_store import _noisy_template_and_better_one
+
+    calib, out, frame, add_b = _noisy_template_and_better_one(tmp_path)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    path = videos / "clip.mp4"
+    write_scene_video(path, frame, seconds=3, fps=30)
+    _run(videos, calib, out, rules)
+
+    def selected():
+        sid = json.loads((out / "videos.json").read_text())["clip.mp4"]["calibration"]["id"]
+        return load_snapshot(out, sid, autocalib=shipped_autocalib())
+
+    a = selected()
+    veto_calibration(out, a.id, autocalib=shipped_autocalib(), rules=rules)
+    assert json.loads((out / "calibration_vetoes.json").read_text())[a.id]["videos"] == ["clip.mp4"]
+    add_b()
+    _run(videos, calib, out, rules)
+    b = selected()
+    assert b.template_id != a.template_id
+    # B itself is not vetoed: changed source bypasses the cached/vetoed preselection.
+    write_scene_video(path, stadium_scene(shift=(49, 20))[0], seconds=3, fps=30)
+    _run(videos, calib, out, rules)
+    replacement = selected()
+    assert replacement.id != b.id and replacement.template_id == b.template_id
+    veto_calibration(out, replacement.id, autocalib=shipped_autocalib(), rules=rules)
+    before = (out / "rounds.json").read_bytes()
+    _run(videos, calib, out, rules, rejudge=rejudge)
+    assert selected().id == replacement.id
+    assert (out / "rounds.json").read_bytes() == before
 
 def test_manual_calibration_after_a_veto_reanalyses_the_group(tmp_path, rules):
     from tests.helpers import add_manual_calibration, stadium_scene
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
     _run(videos, calib, out, rules)
     v = json.loads((out / "videos.json").read_text())
     new = v["clip2.mp4"]["calibration"]
-    assert new["kind"] == "manual" and new["id"] != sid
+    assert new["kind"] == "manual" and new["id"] not in ids.values()
     rows = {(r["video"], r["round"]): r for r in json.loads((out / "rounds.json").read_text())}
     assert rows[("clip2.mp4", 1)]["calibration_id"] == new["id"]  # unreviewed row replaced
     kept = rows[("clip.mp4", 1)]
-    assert kept["reviewed"] is True and kept["calibration_id"] == sid  # reviewed row kept
+    assert kept["reviewed"] is True and kept["calibration_id"] == ids["clip.mp4"]  # reviewed row kept
     assert not any(is_not_a_round(r["review_reasons"]) for r in rows.values())
 
 
@@ -1515,11 +1571,12 @@ def test_unveto_then_rerun_keeps_the_rounds(tmp_path, rules, rerun_while_vetoed)
     from bxjudge.calibration_store import unveto_calibration
     from tests.helpers import FakeDetector, read_matches
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     before_rows = json.loads((out / "rounds.json").read_text())
     if rerun_while_vetoed:
         _run(videos, calib, out, rules)
-    unveto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
+    for sid in ids.values():
+        unveto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
     detector = FakeDetector()
     _run(videos, calib, out, rules, detector=detector)
     assert detector.frames == []  # same snapshot as recorded: nothing to redo
@@ -1672,7 +1729,7 @@ def test_transient_failure_of_a_vetoed_group_keeps_its_original_predictions(
     the vetoed rows (unreviewed predictions, audit flag, calibration id) stay untouched."""
     from tests.helpers import add_manual_calibration, stadium_scene
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     before_rows = (out / "rounds.json").read_bytes()
     before_db = (out / "processed_videos.json").read_bytes()
     before = _eval(out)
@@ -1682,12 +1739,12 @@ def test_transient_failure_of_a_vetoed_group_keeps_its_original_predictions(
         _run(videos, calib, out, rules)
     assert (out / "rounds.json").read_bytes() == before_rows
     clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
-    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == ids["clip2.mp4"]
     assert clip2["reviewed"] is False
     assert (out / "processed_videos.json").read_bytes() == before_db
     v = json.loads((out / "videos.json").read_text())
     assert v["clip2.mp4"]["analysis_status"] == "decode_error"
-    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    assert v["clip2.mp4"]["calibration"]["id"] == ids["clip2.mp4"]
     after = _eval(out)
     assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
         before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
@@ -1754,7 +1811,7 @@ def test_rejudge_after_a_veto_without_alternative_keeps_the_rows(tmp_path, rules
     video is still re-analysed."""
     from tests.helpers import stadium_scene, write_scene_video
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
     _run(videos, calib, out, rules)  # plain.mp4 judged with the (non-vetoed) manual
     before_rows = [r for r in json.loads((out / "rounds.json").read_text())
@@ -1766,11 +1823,11 @@ def test_rejudge_after_a_veto_without_alternative_keeps_the_rows(tmp_path, rules
     rows = json.loads((out / "rounds.json").read_text())
     assert [r for r in rows if r["video"] != "plain.mp4"] == before_rows
     clip2 = next(r for r in rows if r["video"] == "clip2.mp4")
-    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == ids["clip2.mp4"]
     assert not any(r["review_reasons"] == ["recalibrate"] for r in rows)
     v = json.loads((out / "videos.json").read_text())
     assert v["clip.mp4"]["analysis_status"] == v["clip2.mp4"]["analysis_status"] == "ok"
-    assert v["clip.mp4"]["calibration"]["id"] == v["clip2.mp4"]["calibration"]["id"] == sid
+    assert {name: v[name]["calibration"]["id"] for name in ids} == ids
     after = _eval(out)
     assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
         before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
@@ -1780,7 +1837,7 @@ def test_rejudge_after_a_veto_without_alternative_keeps_the_rows(tmp_path, rules
 def test_rejudge_after_a_veto_with_an_alternative_reanalyses_the_group(tmp_path, rules):
     from tests.helpers import add_manual_calibration, stadium_scene
 
-    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, _ids = _veto_setup(tmp_path, rules)
     add_manual_calibration(calib, stadium_scene(shift=(45, 20)), name="moved")
     _run(videos, calib, out, rules, rejudge=True)
     v = json.loads((out / "videos.json").read_text())
@@ -1850,7 +1907,7 @@ def test_vetoed_video_keeps_its_rows_after_a_transient_failure_whatever_its_stat
     """Codex fix-3 review / C-X4(a): judge -> veto -> a probe failure keeps the rows with
     decode_error -> decoding recovers -> a rerun (plain or --rejudge) with no non-vetoed
     alternative still keeps the vetoed rows and their audit marks (T4-3 beats the status)."""
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     before_rows = (out / "rounds.json").read_bytes()
     before = _eval(out)
     with monkeypatch.context() as m:
@@ -1863,9 +1920,9 @@ def test_vetoed_video_keeps_its_rows_after_a_transient_failure_whatever_its_stat
     assert spy.videos == set()
     assert (out / "rounds.json").read_bytes() == before_rows
     clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
-    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == ids["clip2.mp4"]
     v = json.loads((out / "videos.json").read_text())
-    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    assert v["clip2.mp4"]["calibration"]["id"] == ids["clip2.mp4"]
     after = _eval(out)
     assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
         before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
@@ -1880,7 +1937,7 @@ def test_vetoed_video_whose_file_looks_changed_keeps_its_rows(
     no alternative: scan reports them as changed, yet the vetoed rows and audit marks stay."""
     import os
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     before_rows = (out / "rounds.json").read_bytes()
     before = _eval(out)
     for name in ("clip.mp4", "clip2.mp4"):
@@ -1891,7 +1948,7 @@ def test_vetoed_video_whose_file_looks_changed_keeps_its_rows(
     assert spy.videos == set()
     assert (out / "rounds.json").read_bytes() == before_rows
     clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
-    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == ids["clip2.mp4"]
     after = _eval(out)
     assert (after.n_rounds, after.n_vetoed_rounds, after.review_ratio) == (
         before.n_rounds, before.n_vetoed_rounds, before.review_ratio)
@@ -1905,7 +1962,7 @@ def test_vetoed_video_whose_selection_fails_keeps_its_rows(tmp_path, rules, monk
     and the video is not reanalysed (judging it could only give recalibrate)."""
     from bxjudge.video import VideoDecodeError
 
-    videos, calib, out, sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, ids = _veto_setup(tmp_path, rules)
     before_rows = (out / "rounds.json").read_bytes()
     before = _eval(out)
     real = pipeline.first_second_frame
@@ -1923,10 +1980,10 @@ def test_vetoed_video_whose_selection_fails_keeps_its_rows(tmp_path, rules, monk
     assert spy.videos == set()
     assert (out / "rounds.json").read_bytes() == before_rows
     clip2 = next(r for r in json.loads(before_rows) if r["video"] == "clip2.mp4")
-    assert clip2["audit_sample"] is True and clip2["calibration_id"] == sid
+    assert clip2["audit_sample"] is True and clip2["calibration_id"] == ids["clip2.mp4"]
     v = json.loads((out / "videos.json").read_text())
     assert v["clip2.mp4"]["analysis_status"] == "decode_error"
-    assert v["clip2.mp4"]["calibration"]["id"] == sid
+    assert v["clip2.mp4"]["calibration"]["id"] == ids["clip2.mp4"]
     [*_, run] = json.loads((out / "runs.json").read_text())
     assert v["clip2.mp4"]["attempt_run_id"] == run["run_id"] and "clip2.mp4" in run["videos"]
     _run(videos, calib, out, rules, rejudge=rejudge)  # selection works again: still kept
@@ -1945,7 +2002,7 @@ def test_veto_kept_video_records_its_current_duration_and_attempt(tmp_path, rule
     hide the old analysis against a 1 s source."""
     from tests.helpers import stadium_scene, write_scene_video
 
-    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, _ids = _veto_setup(tmp_path, rules)
     before_rows = (out / "rounds.json").read_bytes()
     judged = json.loads((out / "videos.json").read_text())["clip2.mp4"]["judged_wall_s"]
     write_scene_video(videos / "clip2.mp4", stadium_scene(shift=(46, 21))[0], seconds=1.0,
@@ -1967,7 +2024,7 @@ def test_veto_kept_videos_do_not_use_up_the_limit(tmp_path, rules, monkeypatch):
     order and a new plain.mp4 must judge plain.mp4; the kept ones still get their attempt."""
     from tests.helpers import stadium_scene, write_scene_video
 
-    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, _ids = _veto_setup(tmp_path, rules)
     before_rows = json.loads((out / "rounds.json").read_text())
     write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
     spy = _JudgeSpy(monkeypatch)
@@ -1993,7 +2050,7 @@ def test_vetoed_video_whose_selection_fails_does_not_use_up_the_limit(
     from bxjudge.video import VideoDecodeError
     from tests.helpers import stadium_scene, write_scene_video
 
-    videos, calib, out, _sid = _veto_setup(tmp_path, rules)
+    videos, calib, out, _ids = _veto_setup(tmp_path, rules)
     before_rows = json.loads((out / "rounds.json").read_text())
     write_scene_video(videos / "plain.mp4", stadium_scene()[0], seconds=3.0, fps=30)
     real = pipeline.first_second_frame

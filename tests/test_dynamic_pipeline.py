@@ -22,7 +22,7 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
     monkeypatch.setattr(
         pipeline, "iter_frames", lambda *a, **k: iter((f, frame) for f in range(80))
     )
-    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a, video: _snapshot(c))
     monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
     monkeypatch.setattr(
         pipeline,
@@ -297,7 +297,7 @@ def test_raw_motion_preparation_overlaps_dynamic_alignment(tmp_path, monkeypatch
     monkeypatch.setattr(
         pipeline, "iter_frames", lambda *a, **k: iter((f, ref) for f in range(40))
     )
-    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a, video: _snapshot(c))
     monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
 
     def raw(frames, *args, **kwargs):
@@ -345,7 +345,7 @@ def test_raw_motion_stage_closes_its_measurement_explicitly(tmp_path, monkeypatc
     monkeypatch.setattr(
         pipeline, "iter_frames", lambda *a, **k: iter((f, ref) for f in range(40))
     )
-    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a: _snapshot(c))
+    monkeypatch.setattr(pipeline, "select_snapshot", lambda *a, video: _snapshot(c))
     monkeypatch.setattr(pipeline, "write_preview", lambda *a: None)
     closed = []
 

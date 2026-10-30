@@ -176,12 +176,12 @@ def judge_video(
     """Analyze one video using playback fps and untouched source frame indices.
 
     Only the first second is buffered to select a calibration snapshot
-    (``select_snapshot``: manual, else reused/new auto, else ``None`` = ``recalibrate``),
+    (``select_snapshot``: manual, else this frame's own auto, else ``None`` = ``recalibrate``),
     unless the caller already selected one on that same frame (``snapshot``, may be ``None``);
     ``vetoed`` snapshot ids are honoured by that selection (ruling T4-1).
     The chosen snapshot (or ``None``) is reported to ``on_snapshot``. Its polygons are scaled to
     the decoded frame size; the stadium-displacement reference is that same first-second frame
-    of this video (ruling T3-1: the snapshot's image serves only selection, grouping, previews);
+    of this video (ruling T3-1: the snapshot's image serves only selection and previews);
     every result carries the snapshot id and its preview is written. Subsequent frames
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
@@ -207,7 +207,8 @@ def judge_video(
                 raise VideoDecodeError(f"{info.path}: no frames decoded")
             first = prefix[-1][1]
             snap = (
-                select_snapshot(first, calib_dir, out_dir, th, autocalib, vetoed)
+                select_snapshot(first, calib_dir, out_dir, th, autocalib, vetoed,
+                                video=info.path.name)
                 if snapshot is _SELECT
                 else snapshot
             )
@@ -1001,7 +1002,9 @@ def run_batch(
         if cached or vetoed_before:
             try:
                 frame = first_second_frame(info, th)
-                snap = select_snapshot(frame, calib_dir, out_dir, th, autocalib, vetoed)
+                snap = select_snapshot(
+                    frame, calib_dir, out_dir, th, autocalib, vetoed, video=info.path.name
+                )
             except Exception as error:
                 if recorded in vetoed and path.name in judged_before:
                     # C-X7(b): a vetoed, previously judged video whose selection failed is
