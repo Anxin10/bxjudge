@@ -80,7 +80,7 @@ def command(args):
             tasks.extend(json.loads(Path(job["out_json"]).read_text(encoding="utf-8")))
         (out / "tasks.json").write_text(json.dumps(tasks, indent=2), encoding="utf-8")
         print(f"Import {out}/tasks.json into Label Studio")
-    else:
+    elif args.label_command == "export":
         from .export import label_studio_to_coco
 
         label_studio_to_coco(
@@ -89,6 +89,11 @@ def command(args):
             args.val_ratio if args.val_ratio is not None else cfg["val_ratio"],
         )
         print(f"COCO dataset saved: {out}")
+    else:
+        from .export import extend_training_dataset
+
+        extend_training_dataset(Path(args.baseline), Path(args.export_json), out)
+        print(f"Training dataset extended; validation unchanged: {out}")
     return 0
 
 
@@ -97,11 +102,12 @@ def add_label(sub):
         "label", help="sample videos, SAM 3.1 prelabel, or export reviewed COCO"
     )
     actions = p.add_subparsers(dest="label_command", required=True)
-    for name in ["sample", "prelabel", "export"]:
+    for name in ["sample", "prelabel", "export", "extend-training"]:
         action = actions.add_parser(name)
         action.add_argument("--config", default="config/labeling.yaml")
         action.add_argument(
-            "--out", help="output directory (default from labeling config)"
+            "--out", required=name == "extend-training",
+            help="new dataset directory (required for extend-training; otherwise from config)"
         )
         action.set_defaults(func=command)
         if name == "sample":
@@ -111,8 +117,11 @@ def add_label(sub):
             action.add_argument(
                 "--samples", help="sample manifest (default output_dir/samples.json)"
             )
-        else:
+        elif name == "export":
             action.add_argument(
                 "export_json", help="completed human Label Studio JSON export"
             )
             action.add_argument("--val-ratio", type=float)
+        else:
+            action.add_argument("baseline", help="existing project COCO dataset; validation stays frozen")
+            action.add_argument("export_json", help="new completed human Label Studio JSON export")

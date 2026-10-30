@@ -722,7 +722,20 @@ Absolute local path 填 `$(realpath data/labeling/images)` 的實際輸出路徑
 uv run bxjudge label export human-export.json --out data/dataset
 ```
 
-輸出目錄必須為空。匯出只接受每張圖恰好一筆已完成、未取消的人工作業；未標、取消或
+後續新增難例、需要固定原驗證集比較模型時，使用另一個新輸出目錄：
+
+```bash
+uv run bxjudge label extend-training data/dataset new-human-export.json --out data/dataset-v2
+```
+
+此命令只接受**既有 train 影片的新影格**與已完成的人工作業；拒絕 val 影片、未分組影片、
+重複來源影格及不一致的影片識別。原 val JSON／圖片與既有 train 標註不變，產生新資料版本，
+不重新切分、不覆寫原資料集。`--out` 必填，且必須是基底資料集以外的新路徑。這個流程只附加
+新影格，不用來改寫既有影格的標註；未人工 Submit 的預標不能拿來擴訓。
+影像先以同一份 bytes 解碼、驗證並保存快照，再從快照匯出，避免原路徑更新後把舊框套到新圖；
+輸出來源紀錄保留對應的 `image_sha256`。
+
+首次 `label export` 的輸出目錄必須為空。匯出只接受每張圖恰好一筆已完成、未取消的人工作業；未標、取消或
 多筆未裁決作業直接報錯，永遠不把 SAM predictions 自動當成訓練真值。旋轉框不支援。
 預設依整支影片的內容識別碼排序切 20% 驗證集，同支影片不跨集合；一支影片時全放 train。
 
