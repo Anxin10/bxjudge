@@ -888,6 +888,158 @@ def test_results_dir_rerun_only_retries_unavailable_and_respects_concurrent_revi
     assert "first" in rows[0]["vlm_note"]
 
 
+@pytest.mark.parametrize('changed', ['calibration', 'geometry', 'judgment', 'note',
+                                    'source_record', 'source_contents', 'failed_attempt'])
+def test_results_dir_discards_notes_when_judgment_changes_during_inference(
+    tmp_path, monkeypatch, rules, th, changed
+):
+    source = tmp_path / 'a.mp4'
+    source.touch()
+    out = _results(tmp_path, rules, source.resolve())
+    monkeypatch.setattr(vlm, '_post', lambda *a, **k: reply('{"answer":"old answer","reason":"r"}'))
+
+    def frames_then_reanalysis(*args, **kwargs):
+        rows = output.read_rounds(out)
+        row = rows[0]
+        if changed == 'calibration':
+            row['calibration_id'] = 'new-calibration'
+        elif changed == 'geometry':
+            row['geometry_evidence'] = {'path': 'geometry/new.json', 'sha256': 'a' * 64,
+                                        'coordinates': 'reference_pixels'}
+        elif changed == 'judgment':
+            row['finish'], row['winner'], row['points'] = 'over', 'B', 2
+        elif changed == 'note':
+            row['vlm_note'] = 'a newer suggestion'
+        elif changed == 'source_contents':
+            source.write_bytes(b'replacement source')
+        else:
+            timing_path = out / 'videos.json'
+            timing = json.loads(timing_path.read_text())
+            if changed == 'source_record':
+                replacement_source = tmp_path / 'replacement.mp4'
+                replacement_source.touch()
+                timing['a.mp4']['source_video'] = str(replacement_source.resolve())
+            else:
+                timing['a.mp4']['analysis_status'] = 'analysis_error'
+                timing['a.mp4']['attempt_run_id'] = 'replacement-attempt'
+            timing_path.write_text(json.dumps(timing))
+        output.save_rounds(rows, out, rules)
+        return [blank()]
+
+    monkeypatch.setattr(vlm, 'event_frames', frames_then_reanalysis)
+    vlm.review_results_dir(out, th=th, rules=rules, videos={'a.mp4'}, autocalib=shipped_autocalib())
+    row = output.read_rounds(out)[0]
+    assert row['vlm_note'] == ('a newer suggestion' if changed == 'note' else None)
+    if changed == 'calibration':
+        assert row['calibration_id'] == 'new-calibration'
+    elif changed == 'geometry':
+        assert row['geometry_evidence']['path'] == 'geometry/new.json'
+    elif changed == 'judgment':
+        assert (row['finish'], row['winner'], row['points']) == ('over', 'B', 2)
+    if changed in {'source_record', 'source_contents', 'failed_attempt'}:
+        assert 'vlm_s' not in json.loads((out / 'videos.json').read_text())['a.mp4']
+
+
+@pytest.mark.parametrize('metadata', ['audit_sample', 'match_start'])
+def test_results_dir_keeps_notes_when_only_review_bookkeeping_changes(
+    tmp_path, monkeypatch, rules, th, metadata
+):
+    source = tmp_path / 'a.mp4'
+    source.touch()
+    out = _results(tmp_path, rules, source.resolve())
+    monkeypatch.setattr(vlm, '_post', lambda *a, **k: reply('{"answer":"fresh answer","reason":"r"}'))
+
+    def frames_then_bookkeeping(*args, **kwargs):
+        rows = output.read_rounds(out)
+        rows[0][metadata] = True
+        output.save_rounds(rows, out, rules)
+        return [blank()]
+
+    monkeypatch.setattr(vlm, 'event_frames', frames_then_bookkeeping)
+    vlm.review_results_dir(out, th=th, rules=rules, videos={'a.mp4'}, autocalib=shipped_autocalib())
+    row = output.read_rounds(out)[0]
+    assert row[metadata] is True and 'fresh answer' in row['vlm_note']
+
+
+def test_unreachable_diagnostic_does_not_attach_to_recalibrated_round(tmp_path, monkeypatch, rules, th):
+    source = tmp_path / 'a.mp4'
+    source.touch()
+    out = _results(tmp_path, rules, source.resolve())
+
+    def unreachable_after_reanalysis(config):
+        rows = output.read_rounds(out)
+        rows[0]['calibration_id'] = 'new-calibration'
+        output.save_rounds(rows, out, rules)
+        return 'offline'
+
+    monkeypatch.setattr(vlm, 'preflight', unreachable_after_reanalysis)
+    vlm.review_results_dir(out, th=th, rules=rules, videos={'a.mp4'}, autocalib=shipped_autocalib())
+    row = output.read_rounds(out)[0]
+    assert row['calibration_id'] == 'new-calibration' and row['vlm_note'] is None
+
+
+def test_veto_during_inference_discards_answer_and_blocks_later_zone_requests(
+    tmp_path, monkeypatch, rules, th
+):
+    from bxjudge.calibration_store import veto_calibration
+
+    source = tmp_path / 'a.mp4'
+    source.touch()
+    out = _results(tmp_path, rules, source.resolve())
+    sid = output.read_rounds(out)[0]['calibration_id']
+    requests, drawn = [], []
+
+    def frames(*args, **kwargs):
+        drawn.append(True)
+        return [blank()]
+
+    def answer_after_veto(host, payload, path='/api/chat', **kwargs):
+        if path == '/api/chat':
+            requests.append(True)
+            if len(requests) == 1:
+                veto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
+        return reply('{"answer":"old answer","reason":"r"}')
+
+    monkeypatch.setattr(vlm, 'event_frames', frames)
+    monkeypatch.setattr(vlm, '_post', answer_after_veto)
+    vlm.review_results_dir(out, th=th, rules=rules, videos={'a.mp4'}, autocalib=shipped_autocalib())
+    rows = output.read_rounds(out)
+    assert rows[0]['vlm_note'] == rows[2]['vlm_note'] == vlm.UNAVAILABLE_PREFIX + vlm.CALIBRATION_VETOED
+    assert len(requests) == len(drawn) == 1
+    assert rows[0]['calibration_id'] == sid and rows[3]['reviewed'] is True
+
+
+def test_veto_lifted_before_persistence_does_not_keep_obsolete_veto_diagnostic(
+    tmp_path, monkeypatch, rules, th
+):
+    from bxjudge.calibration_store import unveto_calibration, veto_calibration
+
+    source = tmp_path / 'a.mp4'
+    source.touch()
+    out = _results(tmp_path, rules, source.resolve())
+    sid = output.read_rounds(out)[0]['calibration_id']
+    rows = output.read_rounds(out)
+    rows[2]['calibration_id'] = _snapshot(out, seed=1).id
+    output.save_rounds(rows, out, rules)
+    before_keys = {(row['video'], row['round']) for row in rows}
+    veto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
+    review = vlm.review_low_confidence
+
+    def review_then_restore(*args, **kwargs):
+        result = review(*args, **kwargs)
+        unveto_calibration(out, sid, rules=rules, autocalib=shipped_autocalib())
+        return result
+
+    monkeypatch.setattr(vlm, 'review_low_confidence', review_then_restore)
+    monkeypatch.setattr(vlm, 'event_frames', lambda *a, **k: [blank()])
+    monkeypatch.setattr(vlm, '_post', lambda *a, **k: reply('{"answer":"fresh answer","reason":"r"}'))
+    vlm.review_results_dir(out, th=th, rules=rules, videos={'a.mp4'}, autocalib=shipped_autocalib())
+    rows = output.read_rounds(out)
+    assert {(row['video'], row['round']) for row in rows} == before_keys
+    by_round = {row['round']: row for row in rows if row['video'] == 'a.mp4'}
+    assert by_round[1]['vlm_note'] is None and 'fresh answer' in by_round[3]['vlm_note']
+
+
 def test_results_dir_validates_endpoint_before_reading_frames(tmp_path, monkeypatch, rules, th):
     source = tmp_path / "a.mp4"
     source.write_bytes(b"")

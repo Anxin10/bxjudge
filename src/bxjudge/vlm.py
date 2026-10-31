@@ -10,6 +10,7 @@ proxies and redirects are disabled. Defaults live in ``config/vlm.yaml`` (R26/R4
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -24,7 +25,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import closing
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 import cv2
@@ -677,20 +678,63 @@ def recorded_source(entry) -> Path | str:
     return path
 
 
-def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules) -> None:
-    """Rewrite ``video``'s COMPLETE fresh round set with notes on still-unreviewed rows (R36)."""
+def _note_basis(r: RoundResult) -> dict:
+    """Freeze the judgment and existing note, independent of review bookkeeping."""
+    return asdict(replace(r, audit_sample=False, match_start=False))
+
+
+def _source_basis(entry) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    return {key: entry.get(key) for key in (
+        'source_video', 'duration_s', 'judgment_sources', 'analysis_status', 'attempt_run_id')}
+
+
+def _source_digest(path: Path) -> str:
+    with path.open('rb') as source:
+        return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+def _persist_notes(out_dir: Path, video: str, asked: dict, rules: Rules, *,
+                   source_basis: dict | None, source_sha256: str | None) -> bool:
+    """Apply notes only to the unchanged judgment/source used by the request.
+
+    False means the video source/attempt changed: its new per-video timing is also left alone.
+    Round changes discard that round's note; actual work on the same video still counts.
+    """
+    timing_path = out_dir / 'videos.json'
+    timing = json.loads(timing_path.read_text(encoding='utf-8')) if timing_path.exists() else {}
+    entry = timing.get(video)
+    if _source_basis(entry) != source_basis:
+        return False
+    if source_sha256 is not None:
+        source = recorded_source(entry)
+        try:
+            if not isinstance(source, Path) or _source_digest(source) != source_sha256:
+                return False
+        except OSError:
+            return False
     rows = json.loads((out_dir / "rounds.json").read_text(encoding="utf-8"))
+    current_vetoes = vetoed_ids(out_dir)
     snapshot = []
+    applied = False
     for row in rows:
         if row["video"] != video:
             continue
         r = row_to_result(row)
         note = asked.get((r.video, r.round))
-        if note is not None and not r.reviewed and note[1] == (r.t_launch, r.t_end):
-            r.vlm_note = note[0]
+        if (note is not None and not r.reviewed and note[1] == _note_basis(r)
+                and (r.calibration_id in current_vetoes
+                     or note[0] != UNAVAILABLE_PREFIX + CALIBRATION_VETOED)):
+            if r.calibration_id in current_vetoes:
+                r.vlm_note = UNAVAILABLE_PREFIX + CALIBRATION_VETOED
+            else:
+                r.vlm_note = note[0]
+            applied = True
         snapshot.append(r)
-    if snapshot:
+    if snapshot and applied:
         write_results(snapshot, out_dir, rules)
+    return True
 
 
 def _row_snapshot(out_dir: Path, r: RoundResult, cache: dict[str, Snapshot],
@@ -764,27 +808,31 @@ def review_results_dir(
                     "rerun `bxjudge vlm`", reason)
         note = f"{UNAVAILABLE_PREFIX}{reason}"
         for video in targets:
-            asked = {(r.video, r.round): (note, (r.t_launch, r.t_end))
+            asked = {(r.video, r.round): (note, _note_basis(r))
                      for r in by_video[video] if needs_vlm(r)}
-            _persist_notes(out_dir, video, asked, rules)
+            _persist_notes(out_dir, video, asked, rules,
+                           source_basis=_source_basis(timing.get(video)), source_sha256=None)
             summary["unavailable"] += len(asked)
         return {**summary, "skipped": "vlm_unreachable", "reason": reason, "models": {}}
     snapshots: dict[str, Snapshot] = {}
-    vetoed = vetoed_ids(out_dir)
     try:
         for video in targets:
             results = by_video[video]
             began = time.perf_counter()
             source = recorded_source(timing.get(video))
+            source_sha256 = None
+            if isinstance(source, Path):
+                try:
+                    source_sha256 = _source_digest(source)
+                except OSError as error:
+                    source = f'source validation failed: {_describe(error)}'
 
             def get_frames(r: RoundResult, source=source) -> list[np.ndarray]:
-                snapshot = _row_snapshot(out_dir, r, snapshots, vetoed, autocalib=autocalib)
+                snapshot = _row_snapshot(out_dir, r, snapshots, vetoed_ids(out_dir), autocalib=autocalib)
                 if isinstance(source, str):
                     raise VlmFramesError(source)
                 options={}
                 if r.geometry_evidence is not None:
-                    import hashlib
-
                     from .dynamic_calibration import read_geometry
                     with source.open('rb') as f:source_sha=hashlib.file_digest(f,'sha256').hexdigest()
                     options['geometry_record']=read_geometry(out_dir,{'geometry_evidence':r.geometry_evidence,'calibration_id':r.calibration_id},source_sha)
@@ -793,15 +841,16 @@ def review_results_dir(
             sent = len(session.requests)
             reviewed = review_low_confidence(results, get_frames, session=session)
             asked = {
-                (r.video, r.round): (r.vlm_note, (r.t_launch, r.t_end))
+                (r.video, r.round): (r.vlm_note, _note_basis(before))
                 for r, before in zip(reviewed, results)
                 if r is not before
             }
-            _persist_notes(out_dir, video, asked, rules)
-            record_vlm_timing(
-                out_dir, video, time.perf_counter() - began, session.requests[sent:],
-                run_id=run_id,
-            )
+            if _persist_notes(out_dir, video, asked, rules,
+                              source_basis=_source_basis(timing.get(video)), source_sha256=source_sha256):
+                record_vlm_timing(
+                    out_dir, video, time.perf_counter() - began, session.requests[sent:],
+                    run_id=run_id,
+                )
             for note, _ in asked.values():
                 summary["asked"] += 1
                 summary["unavailable" if note.startswith(UNAVAILABLE_PREFIX) else "answered"] += 1

@@ -336,6 +336,7 @@ def select_snapshot(frame: np.ndarray, calib_dir: Path, out_dir: Path, th: Thres
     re-create a vetoed video's snapshot from the same template under a new id. Historical
     template barring is video-specific; exact snapshot-id vetoes still affect every video
     referencing that identical id (spec 6.3/6.5)."""
+    validate_output_paths(out_dir, calib_dir)
     templates = _manual_templates(calib_dir)
     template_set = tuple(sorted({t.id for t in templates}))
 

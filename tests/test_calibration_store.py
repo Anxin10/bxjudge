@@ -47,6 +47,25 @@ def test_manual_wins_when_similar(tmp_path):
     assert (out / "calibrations" / f"{s.id}.json").is_file()
 
 
+@pytest.mark.parametrize('target', ['same', 'nested', 'ancestor', 'symlink'])
+def test_select_snapshot_rejects_overlapping_output_before_writing(tmp_path, target):
+    import hashlib
+
+    frame, scene = stadium_scene()
+    calib, _ = make_calib_dir(tmp_path, (frame, scene))
+    out = {'same': calib, 'nested': calib / 'generated', 'ancestor': tmp_path,
+           'symlink': tmp_path / 'alias'}[target]
+    if target == 'symlink':
+        out.symlink_to(calib, target_is_directory=True)
+    before = {p.relative_to(calib): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in calib.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError, match='outside --calib'):
+        select_snapshot(frame, calib, out, th(), load_autocalib_config())
+    after = {p.relative_to(calib): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in calib.rglob('*') if p.is_file()}
+    assert after == before and not (out / 'calibrations').exists()
+
+
 def test_shifted_frame_gets_auto_snapshot_with_its_own_reference(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     frame, truth = stadium_scene(shift=(45, 20))
