@@ -50,6 +50,40 @@ def test_two_input_folders_with_one_name_are_refused(tmp_path):
     assert ev.batch_names([a, tmp_path / "archiveA"]) == ["batch", "archiveA"]
 
 
+def test_batch_names_differing_only_in_case_are_refused(tmp_path):
+    # Codex round 3: Windows paths ignore case, so batch and BATCH share result files.
+    a, b = tmp_path / "archiveA" / "batch", tmp_path / "archiveB" / "BATCH"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        ev.batch_names([a, b])
+
+
+def test_resume_from_another_source_folder_is_refused(tmp_path):
+    # Codex round 3: an earlier run of archiveA/batch must not make archiveB/batch look done.
+    out = tmp_path / "eval"
+    out.mkdir()
+    old = {"batch": "batch", "video": "clip.mp4", "source": str((tmp_path / "archiveA" / "batch").resolve())}
+    (out / "rows.jsonl").write_text(json.dumps(old) + "\n")
+    with pytest.raises(SystemExit):
+        ev.done_rows(out / "rows.jsonl", {"batch": (tmp_path / "archiveB" / "batch").resolve()})
+    same = ev.done_rows(out / "rows.jsonl", {"batch": (tmp_path / "archiveA" / "batch").resolve()})
+    assert same == {("batch", "clip.mp4")}
+
+
+def test_summary_through_a_symlink_is_refused(tmp_path):
+    # Codex round 3: out/summary.json linking into a video folder would overwrite a source.
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "original.json").write_text("{}")
+    out = tmp_path / "eval"
+    out.mkdir()
+    (out / "summary.json").symlink_to(videos / "original.json")
+    with pytest.raises(SystemExit):
+        ev.main(["--out", str(out), "--only-truth", str(videos)])
+    assert (videos / "original.json").read_text() == "{}"
+
+
 def test_writes_through_a_symlinked_result_folder_are_refused(tmp_path):
     # Codex re-review Medium: out/ is safe but out/found links into a video folder.
     videos = tmp_path / "videos"

@@ -55,10 +55,27 @@ def batch_names(folders: list[Path]) -> list[str]:
     """Batch id per input folder (its name); two folders with one name would share result
     files and resume records, so they are refused."""
     names = [f.expanduser().name for f in folders]
-    dup = sorted({n for n in names if names.count(n) > 1})
+    folded = [n.casefold() for n in names]  # Windows paths ignore case
+    dup = sorted({n for n, k in zip(names, folded) if folded.count(k) > 1})
     if dup:
         raise SystemExit(f"input folders share the batch name(s) {dup}; evaluate them separately")
     return names
+
+
+def done_rows(rows_path: Path, sources: dict[str, Path]) -> set[tuple[str, str]]:
+    """(batch, video) pairs already evaluated, for resuming. A recorded row of one of this
+    run's batches that came from another source folder (or names none) is refused: it would
+    make a different video look done and share its result files."""
+    if not rows_path.exists():
+        return set()
+    done = set()
+    for r in map(json.loads, rows_path.read_text().splitlines()):
+        if r["batch"] in sources:
+            if Path(r.get("source", "")) != sources[r["batch"]]:
+                raise SystemExit(f"{rows_path}: batch {r['batch']!r} was evaluated from "
+                                 f"{r.get('source')!r}, not {sources[r['batch']]}; use another --out")
+            done.add((r["batch"], r["video"]))
+    return done
 
 
 def result_path(out: Path, kind: str, batch: str, video: str, suffix: str) -> Path:
@@ -89,7 +106,7 @@ def _one(job: tuple[str, str, str, bool, list[str]]) -> dict:
     protected = [Path(p) for p in protected_s]
     cfg = load_stadium_finder_config()
     model = load_stadium_model()
-    row: dict = {"batch": batch, "video": video_p.name}
+    row: dict = {"batch": batch, "video": video_p.name, "source": str(video_p.parent.resolve())}
     try:
         from bxjudge.manifest import probe
 
@@ -127,6 +144,9 @@ def _one(job: tuple[str, str, str, bool, list[str]]) -> dict:
     if reference:
         ref_dir = out_p / "reference" / batch
         ensure_safe(ref_dir, protected)
+        if ref_dir.exists():  # select_snapshot writes inside: no existing entry may lead out
+            for entry in ref_dir.rglob("*"):
+                ensure_safe(entry, protected)
         row["reference"] = _reference(video_p, ref_dir, found)
     return row
 
@@ -206,18 +226,19 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     out = a.out.expanduser()
     check_output_dir(out, a.folders)
+    guard = protected_dirs(a.folders)
     rows_path = out / "rows.jsonl"
+    summary_path = out / "summary.json"
+    ensure_safe(rows_path, guard)
+    ensure_safe(summary_path, guard)
     if not a.only_truth:
-        for sub in ("found", "preview", "reference"):
-            (out / sub).mkdir(parents=True, exist_ok=True)
-        done = set()
-        if rows_path.exists():  # resumable: videos already evaluated are skipped
-            done = {(r["batch"], r["video"]) for r in map(json.loads, rows_path.read_text().splitlines())}
         names = batch_names(a.folders)
-        protected = [str(p) for p in protected_dirs(a.folders)]
         for sub in ("found", "preview", "reference"):
-            ensure_safe(out / sub, [Path(p) for p in protected])
-        ensure_safe(rows_path, [Path(p) for p in protected])
+            ensure_safe(out / sub, guard)
+            (out / sub).mkdir(parents=True, exist_ok=True)
+        sources = {n: f.expanduser().resolve() for n, f in zip(names, a.folders)}
+        done = done_rows(rows_path, sources)  # resumable: videos already evaluated are skipped
+        protected = [str(p) for p in guard]
         jobs = [(str(v), name, str(out), a.reference, protected)
                 for f, name in zip(map(lambda x: x.expanduser(), a.folders), names)
                 for v in sorted(f.glob("*.mp4")) if (name, v.name) not in done]
@@ -258,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
                             "counts": {s: sum(1 for r in graded if r["status"] == s)
                                        for s in ("PASS", "FAIL", "REJECTED", "FRAME_MISMATCH",
                                                  "AMBIGUOUS")}}
-    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
+    ensure_safe(summary_path, guard)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in summary.items() if k != "truth"}, ensure_ascii=False, indent=1))
     if "truth" in summary:
         print("truth:", summary["truth"]["counts"])
