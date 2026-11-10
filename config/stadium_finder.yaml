@@ -1,0 +1,48 @@
+# Automatic stadium finding from the green rail
+# (spec docs/superpowers/specs/2026-11-11-auto-stadium-design.md).
+# Pixel distances are in "inference px": the frame scaled so its long edge is 1280.
+
+# Manual calibration in calib/ the canonical stadium model is built from (read only).
+model_template: "20261014_202713"
+# Rail points kept in the canonical model.
+model_points: 400
+# Margin added around the template's battle_area when extracting the template rail, as a
+# fraction of the template frame width (keeps green outside the stadium out of the model).
+roi_margin_frac: 0.05
+
+# --- rail colour (OpenCV HSV: hue 0-179, saturation/value 0-255)
+# Hue range searched for the rail; the per-frame peak inside it sets the actual threshold.
+hue_search: [30, 90]
+# Half width of the accepted hue band around the per-frame peak.
+hue_halfwidth: 12
+min_saturation: 60
+min_value: 60
+# Components thicker than this (mean thickness = 2 * area / perimeter, as a fraction of the
+# frame long edge) are solid blobs such as gloves, not rail.
+max_thickness_frac: 0.025
+# Components smaller than this fraction of the frame area are noise.
+min_component_frac: 0.0001
+
+# --- frame choice (seconds of physical source time)
+sample_window_s: 6.0
+sample_step_s: 0.25
+candidate_frames: 5
+
+# --- fitting
+# Width the coarse search runs at (px).
+work_width: 480
+coarse_rotation_step_deg: 5.0
+coarse_scale_min: 0.5
+coarse_scale_max: 1.8
+coarse_scale_steps: 12
+coarse_top_k: 5
+refine_iterations: 30
+# A model rail point within this distance of rail evidence counts as matched (inference px).
+inlier_px: 6.0
+# Minimum share of model rail points matched, and of rail evidence explained by the model.
+min_coverage: 0.5
+min_precision: 0.5
+# Fits from two candidate frames agree when their zones differ by at most this (inference px).
+agreement_px: 8.0
+# A pocket whose in-frame area share is below this gets zone_out_of_frame@<zone>.
+zone_visible_min: 0.8
