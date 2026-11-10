@@ -184,10 +184,19 @@ def interactive_calibrate(frame: np.ndarray, name: str, max_display_width: int =
     ``u`` = undo last point, Esc = abort (raises ``KeyboardInterrupt``).
     The returned calibration has an empty ``ref_frame``; the caller saves the frame."""
     h, w = frame.shape[:2]
+    done = collect_polygons(frame, f"calibrate {name}", ZONES, max_display_width)
+    return Calibration(name=name, frame_size=(w, h), ref_frame="", **done)
+
+
+def collect_polygons(frame: np.ndarray, title: str, zones: list[tuple[str, str, str]] = ZONES,
+                     max_display_width: int = 1280) -> dict[str, Polygon]:
+    """OpenCV window: click the polygons of ``zones`` in order (frame px). Enter = finish
+    polygon, ``u`` = undo last point, Esc = abort (raises ``KeyboardInterrupt``)."""
+    h, w = frame.shape[:2]
     scale = min(1.0, max_display_width / w)
     base = cv2.resize(frame, (round(w * scale), round(h * scale))) if scale < 1.0 else frame.copy()
-    col = PolygonCollector()
-    win = f"calibrate {name}"
+    col = PolygonCollector(zones)
+    win = title
 
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -226,4 +235,4 @@ def interactive_calibrate(frame: np.ndarray, name: str, max_display_width: int =
                 raise KeyboardInterrupt("calibration aborted")
     finally:
         cv2.destroyWindow(win)
-    return Calibration(name=name, frame_size=(w, h), ref_frame="", **col.done)
+    return dict(col.done)

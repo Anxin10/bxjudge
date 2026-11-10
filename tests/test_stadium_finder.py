@@ -366,6 +366,40 @@ def test_zone_visibility_degenerate():
     assert zone_visibility(cal)["over_left"] == 0.0
 
 
+# --------------------------------------------------------------------------- Task 6: truth
+def test_truth_zones_are_the_five_judged_zones():
+    from bxjudge.calibration import PolygonCollector
+    from bxjudge.stadium_finder import TRUTH_ZONES
+
+    assert [z[0] for z in TRUTH_ZONES] == ["stadium", "battle_area", "over_left", "over_right", "xtreme"]
+    col = PolygonCollector(zones=TRUTH_ZONES)
+    for _ in TRUTH_ZONES:
+        for p in [(0, 0), (10, 0), (10, 10)]:
+            col.click(*p)
+        assert col.commit()
+    assert col.finished and set(col.done) == {z[0] for z in TRUTH_ZONES}
+
+
+def test_zone_boundary_errors_identical_is_zero():
+    from bxjudge.stadium_finder import zone_boundary_errors
+
+    cal = synthetic_calibration()
+    truth = {z: getattr(cal, z) for z in ("stadium", "battle_area", "over_left", "over_right", "xtreme")}
+    errs = zone_boundary_errors(cal, truth, cal.frame_size, 1280)
+    assert set(errs) == set(truth) and max(errs.values()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_zone_boundary_errors_shifted_and_rescaled():
+    from bxjudge.stadium_finder import zone_boundary_errors
+
+    cal = synthetic_calibration()  # 1280 x 720 found zones
+    # Truth clicked on the full 1920 x 1080 frame, 10 px (full-res) to the right.
+    truth = {z: [(x * 1.5 + 10, y * 1.5) for x, y in getattr(cal, z)] for z in ("battle_area", "xtreme")}
+    errs = zone_boundary_errors(cal, truth, (1920, 1080), 1280)
+    assert set(errs) == {"battle_area", "xtreme"}
+    assert errs["battle_area"] == pytest.approx(10 * 1280 / 1920, abs=0.3)
+
+
 def test_model_roundtrip(tmp_path):
     cfg = load_stadium_finder_config()
     model = build_stadium_model(synthetic_calibration(), draw_rail(rail_polyline()), cfg)

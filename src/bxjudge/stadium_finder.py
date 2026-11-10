@@ -602,6 +602,29 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
     return None
 
 
+# --------------------------------------------------------------------------- truth
+# User ruling 2026-11-11: manual truth covers the stadium, the battle floor and the three
+# pockets only; launch zones and the lid are generated but not validated.
+TRUTH_ZONES: list[tuple[str, str, str]] = [z for z in ZONES if z[0] in VISIBILITY_ZONES]
+
+
+def zone_boundary_errors(found: Calibration, truth: dict[str, Polygon],
+                         truth_size: tuple[int, int], long_edge: int) -> dict[str, float]:
+    """Per-zone mean boundary distance between ``found`` and manual ``truth`` polygons (given
+    in a ``truth_size`` frame), both scaled so the long edge is ``long_edge`` px. Uses the
+    same correspondence as ``autocalib.mean_boundary_error``."""
+    from bxjudge.autocalib import _boundary_distance
+
+    kf = long_edge / max(found.frame_size)
+    kt = long_edge / max(truth_size)
+    out = {}
+    for name, poly in truth.items():
+        a = [(x * kf, y * kf) for x, y in getattr(found, name)]
+        b = [(x * kt, y * kt) for x, y in poly]
+        out[name] = _boundary_distance(a, b)
+    return out
+
+
 def save_stadium_model(model: StadiumModel, path: Path) -> None:
     doc = {
         "schema": _MODEL_SCHEMA,
