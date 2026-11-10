@@ -25,11 +25,13 @@ W, H = 1280, 720
 
 # --------------------------------------------------------------------------- synthetic scene
 def rail_polyline(n: int = 720) -> np.ndarray:
-    """Model-plane rail: an ellipse whose near (bottom) end has a notch, so it has an up/down."""
-    cx, cy, a, b = 640.0, 360.0, 420.0, 230.0
+    """Model-plane rail: a rounded rectangle (superellipse, like the real rail's straight sides)
+    whose near (bottom) end has a notch, so it has an up/down."""
+    cx, cy, a, b, p = 640.0, 360.0, 420.0, 230.0, 3.0
     t = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
-    x = cx + a * np.cos(t)
-    y = cy + b * np.sin(t)
+    c, s = np.cos(t), np.sin(t)
+    x = cx + a * np.sign(c) * np.abs(c) ** (2 / p)
+    y = cy + b * np.sign(s) * np.abs(s) ** (2 / p)
     d = np.abs(t - math.pi / 2)
     notch = d < 0.35
     y[notch] -= 70.0 * (1.0 - d[notch] / 0.35)
@@ -133,6 +135,13 @@ def test_rail_mask_drops_compact_blobs():
     assert (mask[rail_pixels(pts, thickness=10)] > 0).mean() >= 0.9
 
 
+def test_rail_mask_keeps_thick_close_up_rail():
+    cfg = load_stadium_finder_config()
+    pts = rail_polyline()
+    mask = rail_mask(draw_rail(pts, thickness=40), cfg)
+    assert (mask[rail_pixels(pts, thickness=30)] > 0).mean() >= 0.9
+
+
 def test_rail_mask_empty_on_gray():
     cfg = load_stadium_finder_config()
     img = np.full((H, W, 3), 128, np.uint8)
@@ -191,8 +200,8 @@ def synth_model():
     return cfg, build_stadium_model(synthetic_calibration(), draw_rail(rail_polyline()), cfg)
 
 
-def _frame_for(h, *, cover=None, extra=None):
-    img = draw_rail(apply_h(h, rail_polyline()))
+def _frame_for(h, *, cover=None, extra=None, thickness=14):
+    img = draw_rail(apply_h(h, rail_polyline()), thickness=thickness)
     if cover is not None:
         x0, y0, x1, y1 = cover
         img[y0:y1, x0:x1] = 128
@@ -219,6 +228,23 @@ def test_slight_perspective_is_approximated(synth_model):
     assert fit is not None and zone_error(fit.homography, h) < 6.0
 
 
+def test_strong_perspective_uses_homography(synth_model):
+    # A steeper camera than the template: the near end is magnified differently from the far
+    # end. The rail's straight sides pin this, so the fit must not stay affine.
+    cfg, model = synth_model
+    h = similarity(rot_deg=4, scale=0.8, persp=(0.0, 4e-4))
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 3.0
+
+
+def test_thick_close_up_rail_still_fits(synth_model):
+    # A close camera shows a much thicker rail than the template did.
+    cfg, model = synth_model
+    h = similarity(rot_deg=-3, scale=1.0)
+    fit = fit_stadium(rail_mask(_frame_for(h, thickness=30), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 3.0
+
+
 @pytest.mark.parametrize("rot", [0, 90, 180, 270])
 def test_rotated_and_mirrored_orientation(synth_model, rot):
     cfg, model = synth_model
@@ -241,10 +267,18 @@ def test_mirrored_rail_keeps_left_zones_left(synth_model):
 
 
 def test_partial_rail_still_fits(synth_model):
+    # A hand over part of the far rail: the rest still pins every zone.
     cfg, model = synth_model
     h = similarity(rot_deg=-8, scale=0.9, shift=(-20, 10))
-    fit = fit_stadium(rail_mask(_frame_for(h, cover=(820, 0, 1280, 720)), cfg), model, cfg)
+    fit = fit_stadium(rail_mask(_frame_for(h, cover=(500, 0, 760, 330)), cfg), model, cfg)
     assert fit is not None and zone_error(fit.homography, h) < 4.0
+
+
+def test_large_occlusion_returns_none(synth_model):
+    # With a whole side hidden the hidden zones are not determined: refuse rather than guess.
+    cfg, model = synth_model
+    h = similarity(rot_deg=-8, scale=0.9, shift=(-20, 10))
+    assert fit_stadium(rail_mask(_frame_for(h, cover=(820, 0, 1280, 720)), cfg), model, cfg) is None
 
 
 def test_green_glove_does_not_shift_fit(synth_model):

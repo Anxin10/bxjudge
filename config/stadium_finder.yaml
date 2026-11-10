@@ -17,9 +17,11 @@ hue_search: [30, 90]
 hue_halfwidth: 12
 min_saturation: 60
 min_value: 60
-# Components thicker than this (mean thickness = 2 * area / perimeter, as a fraction of the
-# frame long edge) are solid blobs such as gloves, not rail.
-max_thickness_frac: 0.025
+# A rail component is a band: mean thickness (2 * area / perimeter, as a fraction of the
+# frame long edge) at most max_thickness_frac, and length / thickness (perimeter^2 / 4 area)
+# at least min_elongation. Solid blobs such as gloves fail the elongation test.
+max_thickness_frac: 0.06
+min_elongation: 5.0
 # Components smaller than this fraction of the frame area are noise.
 min_component_frac: 0.0001
 
@@ -34,17 +36,26 @@ work_width: 480
 coarse_rotation_step_deg: 5.0
 coarse_scale_min: 0.5
 coarse_scale_max: 1.8
-coarse_scale_steps: 12
+coarse_scale_steps: 9
 coarse_top_k: 5
 refine_iterations: 150
 # A model rail point within this distance of rail evidence counts as matched (inference px).
 inlier_px: 6.0
 # Minimum share of model rail points matched, and of rail evidence explained by the model.
-min_coverage: 0.5
-min_precision: 0.5
+min_coverage: 0.8
+# Provisional (2026-11-11): the transparent lid refracts a second image of the rail that the
+# model cannot explain, so real fits score 0.4-0.7 here; re-derive with manual truth.
+min_precision: 0.3
 # Minimum share of the fitted model rail that lies inside the frame (coverage and precision
 # are measured on the in-frame part, so a rail mostly outside the frame cannot be trusted).
 min_rail_in_frame: 0.5
+# After the affine fit, a full homography is tried. It is kept only when coverage x
+# precision does not drop, the mean distance of the model rail to the frame's rail centre
+# line shrinks by at least perspective_min_gain_px (inference px), and its perspective terms
+# max(|h20|, |h21|) (inference px, h22 = 1) stay within max_perspective: an oval alone
+# cannot pin perspective, the rail's straight sides and notch can.
+max_perspective: 0.001
+perspective_min_gain_px: 0.5
 # Fits from two candidate frames agree when their zones differ by at most this (inference px).
 agreement_px: 8.0
 # A pocket whose in-frame area share is below this gets zone_out_of_frame@<zone>.
