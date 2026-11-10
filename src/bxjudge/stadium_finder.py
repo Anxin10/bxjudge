@@ -61,6 +61,10 @@ class StadiumFinderConfig:
     min_coverage: float
     min_precision: float
     min_rail_in_frame: float
+    notch_halfwidth_frac: float
+    min_notch_coverage: float
+    min_quadrant_coverage: float
+    orientation_min_gain: float
     max_perspective: float
     perspective_min_gain_px: float
     agreement_px: float
@@ -71,7 +75,8 @@ _INT_FIELDS = ("model_points", "hue_halfwidth", "min_saturation", "min_value",
                "candidate_frames", "work_width", "coarse_scale_steps", "coarse_top_k",
                "refine_iterations")
 _FRACTIONS = ("roi_margin_frac", "max_thickness_frac", "min_component_frac", "min_coverage",
-              "min_precision", "min_rail_in_frame", "zone_visible_min")
+              "min_precision", "min_rail_in_frame", "notch_halfwidth_frac", "min_notch_coverage",
+              "min_quadrant_coverage", "orientation_min_gain", "zone_visible_min")
 
 
 @config_loader
@@ -242,6 +247,11 @@ class StadiumFit:
     precision: float  # rail evidence within reach of the fitted model rail
     mean_error_px: float  # mean distance (inference px) of in-frame model points to evidence
     rail_in_frame: float  # share of model rail points that land inside the frame
+    # Matched share of the model's cat-ear (notch) points and of its weakest quadrant
+    # (left/right x near/far), points outside the frame counting as unmatched: the direction
+    # and every side must be seen, or the zones are not determined.
+    notch_coverage: float = 0.0
+    quadrant_coverage: float = 0.0
 
 
 def _rot(theta: float) -> np.ndarray:
@@ -394,6 +404,11 @@ def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.nd
     ij[:, 1] = np.clip(ij[:, 1], 0, rh - 1)
     d = dt[ij[:, 1], ij[:, 0]]
     coverage = float((d <= cfg.inlier_px).mean())
+    matched = np.zeros(len(pts), bool)
+    matched[inside] = d <= cfg.inlier_px
+    notch, quadrants = _model_regions(model, cfg)
+    notch_cov = float(matched[notch].mean()) if notch.any() else 0.0
+    quad_cov = min((float(matched[q].mean()) if q.any() else 0.0) for q in quadrants)
     reach = np.zeros((rh, rw), np.uint8)
     for x, y in ij:
         cv2.circle(reach, (int(x), int(y)), round(2 * cfg.inlier_px), 255, -1)
@@ -407,7 +422,20 @@ def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.nd
     return StadiumFit(homography=tuple(tuple(float(v) for v in row) for row in h),
                       coverage=coverage, precision=precision,
                       mean_error_px=float(np.minimum(dr, 2 * cfg.inlier_px).mean()),
-                      rail_in_frame=in_frame)
+                      rail_in_frame=in_frame, notch_coverage=notch_cov, quadrant_coverage=quad_cov)
+
+
+def _model_regions(model: StadiumModel,
+                   cfg: StadiumFinderConfig) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Boolean masks over ``model.rail``: the cat-ear notch (near half, within
+    ``notch_halfwidth_frac`` of the rail width from the centre) and the four quadrants
+    left/right x near/far. The model template is upright: its near end is at the bottom."""
+    x, y = model.rail[:, 0], model.rail[:, 1]
+    cx, cy = model.rail.mean(0)
+    near = y > cy
+    left = x < cx
+    notch = near & (np.abs(x - cx) <= cfg.notch_halfwidth_frac * (x.max() - x.min()))
+    return notch, [left & near, ~left & near, left & ~near, ~left & ~near]
 
 
 _QUALITY_TIE = 0.02  # coverage x precision differences below this are a tie
@@ -424,9 +452,10 @@ def _rank(fit: StadiumFit) -> tuple[float, float]:
     return (round(_quality(fit) / _QUALITY_TIE), -fit.mean_error_px)
 
 
-def _perspective(h: np.ndarray, ref_scale: float) -> float:
-    """max(|h20|, |h21|) of ``h`` expressed in inference px (frame scaled to long edge 1280)."""
-    hr = np.diag([ref_scale, ref_scale, 1.0]) @ h
+def _perspective(h: np.ndarray, ref_scale: float, model_scale: float) -> float:
+    """max(|h20|, |h21|) of ``h`` (model px -> frame px) with both ends in inference px:
+    ``ref_scale`` scales the frame and ``model_scale`` the model template to long edge 1280."""
+    hr = np.diag([ref_scale, ref_scale, 1.0]) @ h @ np.diag([1 / model_scale, 1 / model_scale, 1.0])
     return float(max(abs(hr[2, 0]), abs(hr[2, 1])) / abs(hr[2, 2]))
 
 
@@ -462,16 +491,32 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
         hp = _refine(mask_ref, ref_scale, model, h, cfg, cv2.MOTION_HOMOGRAPHY)
         if hp is not None:
             fp = _score(mask_ref, ref_scale, model, hp, cfg)
-            if (fp is not None and _perspective(hp, ref_scale) <= cfg.max_perspective
+            model_scale = _REF_LONG_EDGE / max(model.image_size)
+            if (fp is not None and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
                     and _quality(fp) >= _quality(fit) - _QUALITY_TIE
                     and fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px):
                 fit = fp
         if best is None or _rank(fit) > _rank(best):
             best = fit
     if (best is None or best.coverage < cfg.min_coverage or best.precision < cfg.min_precision
-            or best.rail_in_frame < cfg.min_rail_in_frame):
+            or best.rail_in_frame < cfg.min_rail_in_frame
+            or best.notch_coverage < cfg.min_notch_coverage
+            or best.quadrant_coverage < cfg.min_quadrant_coverage):
+        return None
+    if _orientation_ambiguous(mask_ref, ref_scale, model, best, cfg):
         return None
     return best
+
+
+def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel,
+                           best: StadiumFit, cfg: StadiumFinderConfig) -> bool:
+    """True when the fit turned 180 degrees about the rail centre explains the rail almost as
+    well: then the direction (X/B sides, which end holds the Xtreme pocket) is not determined."""
+    cx, cy = model.rail.mean(0)
+    turn = np.array([[-1.0, 0.0, 2 * cx], [0.0, -1.0, 2 * cy], [0.0, 0.0, 1.0]])
+    h = _refine(mask_ref, ref_scale, model, np.asarray(best.homography) @ turn, cfg)
+    alt = None if h is None else _score(mask_ref, ref_scale, model, h, cfg)
+    return alt is not None and _quality(alt) > _quality(best) - cfg.orientation_min_gain
 
 
 # --------------------------------------------------------------------------- whole video

@@ -302,6 +302,55 @@ def test_low_coverage_returns_none(synth_model):
     assert fit_stadium(rail_mask(_frame_for(h, cover=(0, 0, 1020, 720)), cfg), model, cfg) is None
 
 
+# --------------------------------------------------------------------------- review fixes
+def rail_without_notch(n: int = 720) -> np.ndarray:
+    cx, cy, a, b, p = 640.0, 360.0, 420.0, 230.0, 3.0
+    t = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    c, s = np.cos(t), np.sin(t)
+    return np.stack([cx + a * np.sign(c) * np.abs(c) ** (2 / p),
+                     cy + b * np.sign(s) * np.abs(s) ** (2 / p)], 1)
+
+
+def test_ring_without_notch_returns_none(synth_model):
+    # Codex review High 1: without the cat ears the direction (and so X/B, Xtreme) is unknown.
+    cfg, model = synth_model
+    h = similarity(rot_deg=3, scale=0.9)
+    img = draw_rail(apply_h(h, rail_without_notch()))
+    assert fit_stadium(rail_mask(img, cfg), model, cfg) is None
+
+
+def test_hidden_notch_returns_none(synth_model):
+    # Hands over the near end: the rest of the ring cannot tell 0 from 180 degrees.
+    cfg, model = synth_model
+    h = similarity(scale=0.9)
+    assert fit_stadium(rail_mask(_frame_for(h, cover=(470, 460, 810, 720)), cfg), model, cfg) is None
+
+
+def test_partly_cut_notch_still_fits(synth_model):
+    # 11/08 close-ups: the near end runs off the bottom edge, part of the notch stays visible.
+    cfg, model = synth_model
+    h = similarity(scale=0.95, shift=(0, 190))  # notch coverage about 0.6
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 4.0
+    assert fit.notch_coverage < 0.8  # the case is really cut
+
+
+def test_cropped_rail_returns_none(synth_model):
+    # Codex review High 2: a third of the rail outside the frame leaves zones unconstrained.
+    cfg, model = synth_model
+    h = similarity(rot_deg=180, scale=1.2, shift=(0, -250))
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is None or zone_error(fit.homography, h) < 8.0
+
+
+def test_perspective_is_measured_in_inference_px():
+    # Codex review Medium 3: both ends of the homography must be in inference px.
+    from bxjudge.stadium_finder import _perspective
+
+    h = np.array([[1.0, 0, 0], [0, 1.0, 0], [0.0008, 0, 1.0]])  # model 1920 px -> frame 1280 px
+    assert _perspective(h, ref_scale=1.0, model_scale=1280 / 1920) == pytest.approx(0.0012)
+
+
 # --------------------------------------------------------------------------- Task 4: video
 def write_video(path: Path, frames, fps: int = 30) -> Path:
     out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))

@@ -31,6 +31,21 @@ from bxjudge.stadium_finder import (
     zone_boundary_errors,
 )
 
+def check_output_dir(out: Path, folders: list[Path]) -> None:
+    """Refuse an output folder inside calib/ or inside any input video folder (resolved, so a
+    symlink cannot reach them): sources stay read only."""
+    real = out.expanduser().resolve()
+    protected = [(PROJECT_ROOT / "calib").resolve(), *(f.expanduser().resolve() for f in folders)]
+    for p in protected:
+        if real == p or p in real.parents:
+            raise SystemExit(f"{out}: output must stay outside {p}")
+
+
+def result_path(out: Path, kind: str, batch: str, video: str, suffix: str) -> Path:
+    """Per-batch result file, so equal video names in two batches never share a file."""
+    return out / kind / batch / f"{Path(video).stem}{suffix}"
+
+
 _ZONE_COLORS = {"stadium": (255, 255, 255), "battle_area": (0, 0, 255), "over_left": (255, 0, 0),
                 "over_right": (0, 165, 255), "xtreme": (0, 255, 255)}
 _TRUTH_NAMES = [z[0] for z in TRUTH_ZONES]
@@ -54,6 +69,12 @@ def _one(job: tuple[str, str, str, bool]) -> dict:
     cfg = load_stadium_finder_config()
     model = load_stadium_model()
     row: dict = {"batch": batch, "video": video_p.name}
+    try:
+        from bxjudge.manifest import probe
+
+        row["fps"] = probe(video_p).fps
+    except Exception as e:
+        row["fps_error"] = f"{type(e).__name__}: {e}"
     t = time.time()
     try:
         found = find_stadium(video_p, model, cfg)
@@ -62,22 +83,26 @@ def _one(job: tuple[str, str, str, bool]) -> dict:
         found = None
     row["seconds"] = round(time.time() - t, 1)
     if found is not None:
-        cal_path = out_p / "found" / f"{video_p.stem}.json"
+        cal_path = result_path(out_p, "found", batch, video_p.name, ".json")
         save_calibration(found.calibration, cal_path)
         f = found.fit
         row.update(found=True, frame_index=found.frame_index, coverage=round(f.coverage, 3),
                    precision=round(f.precision, 3), mean_error_px=round(f.mean_error_px, 2),
                    rail_in_frame=round(f.rail_in_frame, 3), agreeing_frames=found.agreeing_frames,
+                   notch_coverage=round(f.notch_coverage, 3),
+                   quadrant_coverage=round(f.quadrant_coverage, 3),
                    perspective=float(max(abs(f.homography[2][0]), abs(f.homography[2][1]))),
                    zone_visibility={k: round(v, 3) for k, v in found.zone_visibility.items()},
                    pocket_out_of_frame=[k for k in ("over_left", "over_right", "xtreme")
                                         if found.zone_visibility[k] < cfg.zone_visible_min])
-        _preview(found.frame, found.calibration, out_p / "preview" / f"{video_p.stem}.jpg",
+        prev = result_path(out_p, "preview", batch, video_p.name, ".jpg")
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        _preview(found.frame, found.calibration, prev,
                  f"{batch}/{video_p.stem} f{found.frame_index} cov {f.coverage:.2f} prec {f.precision:.2f}")
     else:
         row.setdefault("found", False)
     if reference:
-        row["reference"] = _reference(video_p, out_p, found)
+        row["reference"] = _reference(video_p, out_p / "reference" / batch, found)
     return row
 
 
@@ -95,7 +120,7 @@ def _reference(video: Path, out: Path, found) -> dict:
     acfg = load_autocalib_config()
     try:
         frame = found.frame if found is not None else first_second_frame(manifest.probe(video), th)
-        snap = select_snapshot(frame, PROJECT_ROOT / "calib", out / "reference", th, acfg)
+        snap = select_snapshot(frame, PROJECT_ROOT / "calib", out, th, acfg)
     except Exception as e:
         return {"kind": "error", "error": f"{type(e).__name__}: {e}"}
     if snap is None:
@@ -110,13 +135,29 @@ def _reference(video: Path, out: Path, found) -> dict:
     return ref
 
 
-def _truth_rows(truth_dir: Path, out: Path, limit_px: float, long_edge: int) -> list[dict]:
-    rows = []
+def truth_rows(truth_dir: Path, out: Path, rows: list[dict], limit_px: float,
+               long_edge: int) -> list[dict]:
+    """Grade manual truth against the found zones of the same video and the same frame.
+
+    A video name found in two batches is AMBIGUOUS; truth clicked on another frame than the
+    finder chose (more than one source frame apart) is FRAME_MISMATCH: the camera may have
+    moved, so neither a pass nor a fail would mean anything."""
+    graded = []
     for path in sorted(truth_dir.glob("*.json")):
         doc = json.loads(path.read_text(encoding="utf-8"))
-        found_path = out / "found" / f"{Path(doc['video']).stem}.json"
         row = {"video": doc["video"], "at_s": doc["at_s"]}
-        if not found_path.exists():
+        matches = [r for r in rows if r["video"] == doc["video"]]
+        if len(matches) > 1:
+            row.update(status="AMBIGUOUS")
+            graded.append(row)
+            continue
+        r = matches[0] if matches else None
+        found_path = result_path(out, "found", r["batch"], r["video"], ".json") if r else None
+        if r is None or not r.get("found"):
+            row.update(status="REJECTED")
+        elif "fps" not in r or abs(round(doc["at_s"] * r["fps"]) - r["frame_index"]) > 1:
+            row.update(status="FRAME_MISMATCH", frame_index=r.get("frame_index"))
+        elif not found_path.exists():
             row.update(status="REJECTED")
         else:
             found = load_calibration(found_path)
@@ -125,8 +166,8 @@ def _truth_rows(truth_dir: Path, out: Path, limit_px: float, long_edge: int) -> 
             worst = max(errs.values())
             row.update(boundary_error_px={k: round(v, 2) for k, v in errs.items()},
                        worst_px=round(worst, 2), status="PASS" if worst < limit_px else "FAIL")
-        rows.append(row)
-    return rows
+        graded.append(row)
+    return graded
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,9 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=4)
     a = p.parse_args(argv)
     out = a.out.expanduser()
-    calib = (PROJECT_ROOT / "calib").resolve()
-    if out.resolve() == calib or calib in out.resolve().parents:
-        raise SystemExit(f"{out}: output must stay outside calib/")
+    check_output_dir(out, a.folders)
     rows_path = out / "rows.jsonl"
     if not a.only_truth:
         for sub in ("found", "preview", "reference"):
@@ -182,11 +221,13 @@ def main(argv: list[str] | None = None) -> int:
         from bxjudge.autocalib import load_autocalib_config
         from bxjudge.config import load_thresholds
 
-        truth_rows = _truth_rows(a.truth.expanduser(), out, load_autocalib_config().max_boundary_error_px,
-                                 load_thresholds().infer_long_edge)
-        summary["truth"] = {"rows": truth_rows,
-                            "counts": {s: sum(1 for r in truth_rows if r["status"] == s)
-                                       for s in ("PASS", "FAIL", "REJECTED")}}
+        graded = truth_rows(a.truth.expanduser(), out, rows,
+                            load_autocalib_config().max_boundary_error_px,
+                            load_thresholds().infer_long_edge)
+        summary["truth"] = {"rows": graded,
+                            "counts": {s: sum(1 for r in graded if r["status"] == s)
+                                       for s in ("PASS", "FAIL", "REJECTED", "FRAME_MISMATCH",
+                                                 "AMBIGUOUS")}}
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in summary.items() if k != "truth"}, ensure_ascii=False, indent=1))
     if "truth" in summary:

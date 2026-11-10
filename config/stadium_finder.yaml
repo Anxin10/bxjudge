@@ -49,8 +49,21 @@ min_precision: 0.3
 # Minimum share of the fitted model rail that lies inside the frame (coverage and precision
 # are measured on the in-frame part, so a rail mostly outside the frame cannot be trusted).
 min_rail_in_frame: 0.5
+# The direction and every side must be seen (Codex review 2026-11-11): a plain ring cannot
+# tell 0 from 180 degrees (X/B and Xtreme would swap), and a rail cut off on one side leaves
+# that side's zones free. Matched shares, points outside the frame counting as unmatched:
+# the cat-ear notch (near half, within notch_halfwidth_frac of the rail width from the
+# centre) and the weakest of the four quadrants left/right x near/far.
+notch_halfwidth_frac: 0.2
+# Part of the notch must be seen (11/08 close-ups cut the near end off at the bottom edge);
+# the direction itself is then checked against the fit turned 180 degrees: that alternative,
+# refined, must explain the rail clearly worse (coverage x precision lower by at least
+# orientation_min_gain), or the direction is ambiguous and nothing is returned.
+min_notch_coverage: 0.3
+min_quadrant_coverage: 0.5
+orientation_min_gain: 0.2
 # After the affine fit, a full homography is tried. It is kept only when coverage x
-# precision does not drop, the mean distance of the model rail to the frame's rail centre
+# precision drops by less than 0.02 (implementation tie, ledger Low 7), the mean distance of the model rail to the frame's rail centre
 # line shrinks by at least perspective_min_gain_px (inference px), and its perspective terms
 # max(|h20|, |h21|) (inference px, h22 = 1) stay within max_perspective: an oval alone
 # cannot pin perspective, the rail's straight sides and notch can.
