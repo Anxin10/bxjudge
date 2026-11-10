@@ -98,7 +98,7 @@ def reference_dir(out: Path, batch: str, video: str) -> Path:
 def ensure_tree_has_no_links(root: Path) -> None:
     """Refuse a write tree that holds any symlink or junction: a linked folder can hide links
     that lead into a protected folder, and later writes inside it would follow them."""
-    if root.is_symlink():
+    if root.is_symlink() or (os.name == "nt" and os.path.isjunction(root)):
         raise SystemExit(f"{root}: refusing a linked write folder")
     if not root.exists():
         return

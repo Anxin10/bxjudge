@@ -408,6 +408,73 @@ def test_unacceptable_top_candidate_does_not_crowd_out_an_acceptable_one(monkeyp
     assert got is fits[2]
 
 
+def _fit(cov, prec, err=1.0):
+    from bxjudge.stadium_finder import StadiumFit
+
+    ident = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    return StadiumFit(ident, coverage=cov, precision=prec, mean_error_px=err, rail_in_frame=1.0,
+                      notch_coverage=1.0, quadrant_coverage=1.0)
+
+
+def test_unacceptable_homography_does_not_replace_an_acceptable_affine_fit(monkeypatch):
+    # Codex round 5: the perspective fit (coverage just below the floor) beat the affine fit
+    # on error and replaced it, then failed acceptance: the good affine fit was lost.
+    import bxjudge.stadium_finder as sf
+
+    cfg = load_stadium_finder_config()
+    affine = _fit(cfg.min_coverage + 0.01, 0.60, err=1.0)
+    persp = _fit(cfg.min_coverage - 0.001, 0.61, err=0.1)
+    h_aff, h_hom = np.eye(3), np.eye(3) * 2.0
+    monkeypatch.setattr(sf, "_coarse_candidates", lambda *a: [(0.9, h_aff)])
+    monkeypatch.setattr(sf, "_refine", lambda m, r, mo, h, c, motion=None: h_hom if motion else h_aff)
+    monkeypatch.setattr(sf, "_score", lambda m, r, mo, h, c: persp if h[0, 0] == 2.0 else affine)
+    monkeypatch.setattr(sf, "_perspective", lambda *a: 0.0)
+    monkeypatch.setattr(sf, "_orientation_ambiguous", lambda *a: False)
+
+    class M:
+        image_size = (1920, 1080)
+
+    mask = np.zeros((H, W), np.uint8)
+    mask[10, 10] = 255
+    assert sf.fit_stadium(mask, M(), cfg) is affine
+
+
+def test_turned_alternative_beyond_the_perspective_limit_cannot_veto(monkeypatch, synth_model):
+    # Codex round 5: the 180-degree homography alternative must obey max_perspective too.
+    import bxjudge.stadium_finder as sf
+
+    cfg, model = synth_model
+    best = _fit(1.0, 0.54)
+    wild = np.array([[1.0, 0, 0], [0, 1.0, 0], [cfg.max_perspective * 2, 0, 1.0]])
+    monkeypatch.setattr(sf, "_refine", lambda m, r, mo, h, c, motion=None: wild if motion else None)
+    monkeypatch.setattr(sf, "_score", lambda m, r, mo, h, c: _fit(1.0, 0.46) if h is wild else None)
+    mask = np.zeros((H, W), np.uint8)
+    assert not sf._orientation_ambiguous(mask, 1.0, model, best, cfg)
+
+
+def test_zones_must_project_finitely(synth_model):
+    # Codex round 5: a projective denominator crossing zero inside the zones throws them to
+    # infinity; such a mapping is never a stadium.
+    from bxjudge.stadium_finder import _zones_valid
+
+    cfg, model = synth_model
+    xmax = max(x for x, _ in model.calibration.stadium)
+    near_pole = np.array([[1.0, 0, 0], [0, 1.0, 0], [-1.0 / (xmax - 0.5), 0, 1.0]])
+    assert not _zones_valid(model, near_pole, (W, H))
+    assert _zones_valid(model, np.eye(3), (W, H))
+
+
+def test_zone_visibility_of_a_huge_polygon_is_cheap():
+    # Codex round 5: rasterising a polygon reaching 1e9 px asked for petabytes.
+    from dataclasses import replace
+
+    cal = synthetic_calibration()
+    huge = [(-1e9, -1e9), (0.0, -5e8), (1e9, -1e9), (1e9, 1e9), (-1e9, 1e9)]  # non-convex
+    area = 4e18 - 1e9 * 5e8  # square minus the notch triangle
+    vis = zone_visibility(replace(cal, stadium=huge))
+    assert vis["stadium"] == pytest.approx(W * H / area, rel=1e-6)
+
+
 def test_perspective_is_measured_in_inference_px():
     # Codex review Medium 3: both ends of the homography must be in inference px.
     from bxjudge.stadium_finder import _perspective

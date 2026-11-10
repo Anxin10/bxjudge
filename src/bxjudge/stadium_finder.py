@@ -392,6 +392,8 @@ def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.nd
     jac = np.stack([p[1] - p[0], p[2] - p[0]], 1) / eps
     if not np.isfinite(jac).all() or np.linalg.det(jac) <= 0:
         return None
+    if not _zones_valid(model, h, (round(rw / ref_scale), round(rh / ref_scale))):
+        return None
     pts = _project(h, model.rail) * ref_scale
     inside = (pts[:, 0] >= 0) & (pts[:, 0] < rw) & (pts[:, 1] >= 0) & (pts[:, 1] < rh)
     in_frame = float(inside.mean())
@@ -423,6 +425,31 @@ def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.nd
                       coverage=coverage, precision=precision,
                       mean_error_px=float(np.minimum(dr, 2 * cfg.inlier_px).mean()),
                       rail_in_frame=in_frame, notch_coverage=notch_cov, quadrant_coverage=quad_cov)
+
+
+_MIN_DENOM_RATIO = 0.2  # zone vertex projective denominator vs the rail centre's
+_MAX_ZONE_EXTENT = 10.0  # projected zone vertices stay within this many frame sizes
+
+
+def _zones_valid(model: StadiumModel, h: np.ndarray, frame_size: tuple[int, int]) -> bool:
+    """Every zone vertex projects finitely through ``h`` (model px -> frame px): its projective
+    denominator keeps the rail centre's sign and stays well away from zero, and it lands
+    within ``_MAX_ZONE_EXTENT`` frame sizes. A mapping whose horizon crosses the stadium
+    throws zones to infinity and is never a camera view of it."""
+    h = np.asarray(h, np.float64)
+    verts = np.concatenate([np.array(getattr(model.calibration, z), np.float64).reshape(-1, 2)
+                            for z in _POLY_FIELDS if getattr(model.calibration, z)])
+    cx, cy = model.rail.mean(0)
+    w_c = h[2, 0] * cx + h[2, 1] * cy + h[2, 2]
+    w = verts @ h[2, :2] + h[2, 2]
+    if not np.isfinite(w).all() or not np.isfinite(w_c) or w_c == 0:
+        return False
+    if (w / w_c).min() < _MIN_DENOM_RATIO:
+        return False
+    pts = _project(h, verts)
+    fw, fh = frame_size
+    lim = _MAX_ZONE_EXTENT * max(fw, fh)
+    return bool(np.isfinite(pts).all() and np.abs(pts).max() <= lim)
 
 
 def _model_regions(model: StadiumModel,
@@ -490,7 +517,10 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
             if hp is not None:
                 fp = _score(mask_ref, ref_scale, model, hp, cfg)
                 model_scale = _REF_LONG_EDGE / max(model.image_size)
-                if (fp is not None and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
+                # The perspective fit replaces the affine one only when it is acceptable itself:
+                # a better centre-line error must never cost an acceptable result.
+                if (fp is not None and _acceptable(fp, cfg)
+                        and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
                         and _quality(fp) >= _quality(fit) - _QUALITY_TIE
                         and fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px):
                     fit = fp
@@ -531,7 +561,9 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
         hypotheses.append(affine)
     hom = _refine(mask_ref, ref_scale, model, raw if affine is None else affine, cfg,
                   cv2.MOTION_HOMOGRAPHY)
-    if hom is not None:
+    # The alternative obeys the same perspective limit as any accepted fit.
+    if hom is not None and _perspective(hom, ref_scale, _REF_LONG_EDGE / max(model.image_size)) \
+            <= cfg.max_perspective:
         hypotheses.append(hom)
     for h in hypotheses:
         alt = _score(mask_ref, ref_scale, model, h, cfg)
@@ -556,36 +588,48 @@ def zone_visibility(c: Calibration) -> dict[str, float]:
         if len(poly) < 3:
             out[name] = 0.0
             continue
-        total = abs(cv2.contourArea(poly.astype(np.float32)))
-        if total <= 0.0:
+        total = abs(_area(poly))
+        if not np.isfinite(total) or total <= 0.0:
             out[name] = 0.0
             continue
-        frame = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float32)
-        inter, _ = cv2.intersectConvexConvex(_convex(poly), frame) if _is_convex(poly) else (
-            _clipped_area(poly, w, h), None)
-        out[name] = float(min(1.0, max(0.0, inter / total)))
+        inside = abs(_area(_clip_to_rect(poly, w, h)))
+        out[name] = float(min(1.0, max(0.0, inside / total)))
     return out
 
 
-def _is_convex(poly: np.ndarray) -> bool:
-    return bool(cv2.isContourConvex(poly.astype(np.float32).reshape(-1, 1, 2)))
+def _area(poly: np.ndarray) -> float:
+    """Shoelace area (float64, any size) of a closed polygon."""
+    if len(poly) < 3:
+        return 0.0
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
-def _convex(poly: np.ndarray) -> np.ndarray:
-    return poly.astype(np.float32).reshape(-1, 1, 2)
+def _clip_to_rect(poly: np.ndarray, w: float, h: float) -> np.ndarray:
+    """Sutherland-Hodgman clip of ``poly`` to the frame rectangle. The clip region is convex,
+    so the clipped area is exact for any simple polygon; no raster, no size limit."""
+    pts = [tuple(p) for p in poly]
+    for axis, bound, keep_low in ((0, 0.0, False), (0, float(w), True),
+                                  (1, 0.0, False), (1, float(h), True)):
+        inside = (lambda p: p[axis] <= bound) if keep_low else (lambda p: p[axis] >= bound)
+        out: list[tuple[float, float]] = []
+        for i, cur in enumerate(pts):
+            prev = pts[i - 1]
+            if inside(cur):
+                if not inside(prev):
+                    out.append(_cross(prev, cur, axis, bound))
+                out.append(cur)
+            elif inside(prev):
+                out.append(_cross(prev, cur, axis, bound))
+        pts = out
+        if not pts:
+            break
+    return np.array(pts, np.float64).reshape(-1, 2)
 
 
-def _clipped_area(poly: np.ndarray, w: int, h: int) -> float:
-    """Area of ``poly`` inside the frame for a non-convex polygon: rasterised on a canvas
-    padded by the polygon's own extent, counted inside the frame."""
-    lo = np.floor(np.minimum(poly.min(0), 0)).astype(int)
-    hi = np.ceil(np.maximum(poly.max(0), [w, h])).astype(int)
-    canvas = np.zeros((hi[1] - lo[1] + 1, hi[0] - lo[0] + 1), np.uint8)
-    cv2.fillPoly(canvas, [np.round(poly - lo).astype(np.int32)], 1)
-    inside = canvas[-lo[1]:-lo[1] + h, -lo[0]:-lo[0] + w]
-    full = float(canvas.sum())
-    total = abs(cv2.contourArea(poly.astype(np.float32)))
-    return float(inside.sum()) / full * total if full else 0.0
+def _cross(a: tuple[float, float], b: tuple[float, float], axis: int, bound: float) -> tuple[float, float]:
+    t = (bound - a[axis]) / (b[axis] - a[axis])
+    return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
 
 
 @dataclass(frozen=True)

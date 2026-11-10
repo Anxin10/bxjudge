@@ -108,6 +108,18 @@ def test_symlinks_inside_the_reference_tree_are_refused(tmp_path):
     ev.ensure_tree_has_no_links(tmp_path / "eval" / "reference" / "missing")  # absent: fine
 
 
+def test_a_junction_at_the_reference_root_is_refused(tmp_path, monkeypatch):
+    # Codex round 5: the root was only checked with is_symlink; Windows junctions are not.
+    root = tmp_path / "eval" / "reference" / "batch" / "clip"
+    root.mkdir(parents=True)
+    real = ev.os.path.isjunction
+    monkeypatch.setattr(ev.os, "name", "nt")
+    # compare as text: with os.name patched, Path() would build a WindowsPath
+    monkeypatch.setattr(ev.os.path, "isjunction", lambda p: str(p) == str(root) or real(p))
+    with pytest.raises(SystemExit):
+        ev.ensure_tree_has_no_links(root)
+
+
 def test_resume_compares_batch_names_without_case(tmp_path):
     # Codex round 4: archiveA/batch earlier, archiveB/BATCH now -> same files on Windows.
     out = tmp_path / "eval"
