@@ -107,6 +107,7 @@ def test_default_config_loads():
     {"inlier_px": 0},
     {"unknown_key": 1},
     {"hue_search": [90, 30]},
+    {"edge_refinement": "yes"},
 ])
 def test_config_rejects_missing_or_nonpositive_keys(tmp_path, change):
     with pytest.raises(ValueError):
@@ -402,9 +403,12 @@ def test_unacceptable_top_candidate_does_not_crowd_out_an_acceptable_one(monkeyp
     monkeypatch.setattr(sf, "_refine", lambda m, r, mo, h, c, motion=None: None if motion else h)
     monkeypatch.setattr(sf, "_score", lambda m, r, mo, h, c: fits[1 if h[0, 0] == 1.0 else 2])
     monkeypatch.setattr(sf, "_orientation_ambiguous", lambda *a: False)
+    class M:  # stands in for a model: only its size is read here
+        image_size = (1920, 1080)
+
     mask = np.zeros((H, W), np.uint8)
     mask[10, 10] = 255
-    got = sf.fit_stadium(mask, None, cfg)
+    got = sf.fit_stadium(mask, M(), cfg)
     assert got is fits[2]
 
 
@@ -644,6 +648,54 @@ def test_zone_boundary_errors_shifted_and_rescaled():
     errs = zone_boundary_errors(cal, truth, (1920, 1080), 1280)
     assert set(errs) == {"battle_area", "xtreme"}
     assert errs["battle_area"] == pytest.approx(10 * 1280 / 1920, abs=0.3)
+
+
+# --------------------------------------------------------------------------- edge refinement
+def _oval_rail(cx=640.0, cy=440.0, a=420.0, b=210.0, n=720) -> np.ndarray:
+    """A plain oval with a near-end notch: the rail alone cannot pin perspective."""
+    t = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    x, y = cx + a * np.cos(t), cy + b * np.sin(t)
+    d = np.abs(t - math.pi / 2)
+    notch = d < 0.3
+    y[notch] -= 60.0 * (1.0 - d[notch] / 0.3)
+    return np.stack([x, y], 1)
+
+
+@pytest.fixture(scope="module")
+def edge_scene():
+    from tests.helpers import stadium_scene
+
+    cfg = load_stadium_finder_config()
+    base, cal = stadium_scene()
+    bgr = cv2.cvtColor(np.uint8([[[60, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0].tolist()
+    cv2.polylines(base, [np.round(_oval_rail()).astype(np.int32)], True, bgr, 12, cv2.LINE_AA)
+    return cfg, cal, base, build_stadium_model(cal, base, cfg)
+
+
+def test_model_keeps_a_reference_image(tmp_path, edge_scene):
+    cfg, cal, base, model = edge_scene
+    assert model.image is not None and model.image.ndim == 3
+    assert model.image.shape[1] == round(cal.frame_size[0] * model.image_scale)
+    save_stadium_model(model, tmp_path / "m.json")
+    back = load_stadium_model(tmp_path / "m.json")
+    assert back.image_scale == model.image_scale and np.array_equal(back.image, model.image)
+
+
+@pytest.mark.parametrize("persp", [(0.0, 3e-4), (2e-4, -1e-4)])
+def test_stadium_edges_pin_the_perspective_the_rail_cannot(edge_scene, persp):
+    # Codex round 8: an oval rail fits equally well under views whose pockets differ by tens of
+    # px; the stadium's own edges (lid, pockets, outline) decide.
+    from bxjudge.autocalib import load_autocalib_config
+
+    cfg, cal, base, model = edge_scene
+    h = similarity(rot_deg=4, scale=0.85, centre=(640.0, 400.0), persp=persp)
+    frame = cv2.warpPerspective(base, h, (W, H), borderValue=(128, 128, 128))
+    mask = rail_mask(frame, cfg)
+    fit = fit_stadium(mask, model, cfg, frame=frame, acfg=load_autocalib_config())
+    assert fit is not None
+    for z in ("battle_area", "over_left", "over_right", "xtreme"):
+        err = np.linalg.norm(apply_h(fit.homography, getattr(cal, z)) - apply_h(h, getattr(cal, z)), axis=1)
+        assert err.mean() < 4.0, (z, err.mean())
 
 
 def test_model_roundtrip(tmp_path):

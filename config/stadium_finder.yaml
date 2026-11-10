@@ -69,6 +69,15 @@ orientation_min_gain: 0.2
 # cannot pin perspective, the rail's straight sides and notch can.
 max_perspective: 0.001
 perspective_min_gain_px: 0.5
+# Edge refinement (the stadium's lid, pockets and outline, as autocalib aligns templates)
+# may move the zones at most this far (mean, inference px) from the rail fit it starts from;
+# a larger move means the edges disagree with the rail and the candidate is dropped.
+edge_max_shift_px: 40.0
+# Off (2026-11-11): edges from the one model template only match its own scene (edge score
+# 0.86); across other boxes and camera heights they score 0.15-0.39 (lid parallax, different
+# surroundings), so find_stadium would refuse nearly every new video. Kept for per-setup
+# templates; fit_stadium still refines when a caller passes the frame.
+edge_refinement: false
 # Fits from two candidate frames agree when their zones differ by at most this (inference px).
 agreement_px: 8.0
 # A pocket whose in-frame area share is below this gets zone_out_of_frame@<zone>.

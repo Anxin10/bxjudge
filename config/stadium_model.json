@@ -2042,5 +2042,7 @@
    ]
   ],
   "ref_frame": ""
- }
+ },
+ "image_scale": 0.5,
+ "image": "stadium_model.png"
 }

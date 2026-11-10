@@ -32,6 +32,7 @@ DEFAULT_STADIUM_MODEL = PROJECT_ROOT / "config" / "stadium_model.json"
 
 _POLY_FIELDS = [z[0] for z in ZONES]
 _MODEL_SCHEMA = "bxjudge-stadium-model-v1"
+_MODEL_IMAGE_WIDTH = 960  # stored reference image width (edge refinement runs at 640)
 
 
 # --------------------------------------------------------------------------- config
@@ -67,6 +68,8 @@ class StadiumFinderConfig:
     orientation_min_gain: float
     max_perspective: float
     perspective_min_gain_px: float
+    edge_max_shift_px: float
+    edge_refinement: bool
     agreement_px: float
     zone_visible_min: float
 
@@ -95,7 +98,10 @@ def load_stadium_finder_config(path: Path = DEFAULT_STADIUM_FINDER_CONFIG) -> St
     values: dict = {}
     for name in names:
         v = raw[name]
-        if name == "model_template":
+        if name == "edge_refinement":
+            if not isinstance(v, bool):
+                raise ValueError(f"{path}: edge_refinement must be true or false, got {v!r}")
+        elif name == "model_template":
             if not isinstance(v, str) or not v or "/" in v or "\\" in v:
                 raise ValueError(f"{path}: model_template must be a calibration name, got {v!r}")
         elif name == "hue_search":
@@ -178,12 +184,20 @@ class StadiumModel:
     calibration: Calibration  # the template's 8 zones, template px
     source_sha256: str
     image_size: tuple[int, int]  # (width, height) of the template frame
+    # The template's reference image, downscaled (model px * image_scale = image px); used to
+    # refine the rail fit with the stadium's own edges. None for a model without one.
+    image: np.ndarray | None = None
+    image_scale: float = 1.0
 
-    def __eq__(self, other):  # ndarray field: compare by value
+    def __eq__(self, other):  # ndarray fields: compare by value
         return (isinstance(other, StadiumModel) and np.array_equal(self.rail, other.rail)
                 and self.calibration == other.calibration
                 and self.source_sha256 == other.source_sha256
-                and self.image_size == other.image_size)
+                and self.image_size == other.image_size
+                and self.image_scale == other.image_scale
+                and ((self.image is None and other.image is None)
+                     or (self.image is not None and other.image is not None
+                         and np.array_equal(self.image, other.image))))
 
 
 def _calibration_doc(c: Calibration) -> dict:
@@ -228,8 +242,11 @@ def build_stadium_model(template: Calibration, image: np.ndarray,
     digest.update(json.dumps(_calibration_doc(template), sort_keys=True).encode())
     digest.update(np.ascontiguousarray(image).tobytes())
     cal = _calibration_from_doc(_calibration_doc(template))
+    scale = min(1.0, _MODEL_IMAGE_WIDTH / w)
+    small = cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
     return StadiumModel(rail=rail, calibration=cal, source_sha256=digest.hexdigest(),
-                        image_size=(int(w), int(h)))
+                        image_size=(int(w), int(h)), image=small,
+                        image_scale=small.shape[1] / w)
 
 
 # --------------------------------------------------------------------------- fitting
@@ -494,12 +511,19 @@ def _perspective(h: np.ndarray, ref_scale: float, model_scale: float) -> float:
     return float(max(abs(hr[2, 0]), abs(hr[2, 1])) / abs(hr[2, 2]))
 
 
-def fit_stadium(mask: np.ndarray, model: StadiumModel,
-                cfg: StadiumFinderConfig) -> StadiumFit | None:
+def fit_stadium(mask: np.ndarray, model: StadiumModel, cfg: StadiumFinderConfig, *,
+                frame: np.ndarray | None = None, acfg=None) -> StadiumFit | None:
     """Best homography mapping the model rail onto the rail ``mask`` (frame px), or ``None``
-    when no candidate reaches ``min_coverage``, ``min_precision`` and ``min_rail_in_frame``."""
+    when no candidate passes the acceptance checks.
+
+    With ``frame`` (the BGR image ``mask`` came from), ``acfg`` (``AutoCalibConfig``) and a
+    model reference image, every candidate is refined with the stadium's own edges (see
+    ``_edge_refine``): the rail alone cannot pin perspective, the lid, pockets and outline can.
+    Without them only the rail decides, and a candidate whose affine and perspective fits
+    place the zones apart is dropped."""
     if not (mask > 0).any():
         return None
+    use_edges = frame is not None and acfg is not None and model.image is not None
     fh, fw = mask.shape[:2]
     ref_scale = _REF_LONG_EDGE / max(fw, fh)
     rw, rh = round(fw * ref_scale), round(fh * ref_scale)
@@ -517,35 +541,129 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
         fit = _score(mask_ref, ref_scale, model, h, cfg)
         if fit is None:
             continue
+        model_scale = _REF_LONG_EDGE / max(model.image_size)
+        fp = None  # an acceptable perspective fit within the limit, if any
         if fit.coverage >= cfg.min_coverage - _HOMOGRAPHY_SKIP:
-            # Perspective only where the rail shape supports it: an oval alone cannot pin the
-            # two perspective terms, so the homography must clearly beat the affine fit and
-            # stay mild. Far below min_coverage, perspective cannot rescue the candidate.
+            # Far below min_coverage, perspective cannot rescue the candidate.
             hp = _refine(mask_ref, ref_scale, model, h, cfg, cv2.MOTION_HOMOGRAPHY)
-            if hp is not None:
+            if hp is not None and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective:
                 fp = _score(mask_ref, ref_scale, model, hp, cfg)
-                model_scale = _REF_LONG_EDGE / max(model.image_size)
-                # An acceptable perspective fit within the limit is compared by the centre-line
-                # error, the continuous measure of how well the rail lines up (coverage x
-                # precision saturates and drifts with stray green). Clearly better: it wins.
-                # About as good but placing the zones elsewhere: the rail cannot tell which
-                # view is right, so this candidate is dropped rather than published.
-                if (fp is not None and _acceptable(fp, cfg)
-                        and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective):
-                    if fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px:
-                        fit = fp
-                    elif (float(np.linalg.norm(_zones(model, fp) - _zones(model, fit), axis=1).mean())
-                          * ref_scale > cfg.agreement_px):
-                        continue
+                if fp is not None and not _acceptable(fp, cfg):
+                    fp = None
+        if use_edges:
+            # Refine from the affine and the perspective fit with the stadium's edges. The
+            # refined fits must still match the rail, and when both seeds refine they must
+            # agree on the zones; otherwise the edges did not settle the view.
+            refined = []
+            for seed in [fit] + ([fp] if fp is not None else []):
+                he = _edge_refine(frame, model, np.asarray(seed.homography, np.float64), cfg, acfg)
+                if he is None or _perspective(he, ref_scale, model_scale) > cfg.max_perspective:
+                    continue
+                fe = _score(mask_ref, ref_scale, model, he, cfg)
+                if fe is not None and _acceptable(fe, cfg):
+                    refined.append(fe)
+            if not refined:
+                continue
+            if (len(refined) == 2 and float(np.linalg.norm(
+                    _zones(model, refined[0]) - _zones(model, refined[1]), axis=1).mean())
+                    * ref_scale > cfg.agreement_px):
+                continue
+            fit = min(refined, key=lambda f: f.mean_error_px)
+        elif fp is not None:
+            # Rail only. An acceptable perspective fit is compared by the centre-line error,
+            # the continuous measure of how well the rail lines up (coverage x precision
+            # saturates and drifts with stray green). Clearly better: it wins. About as good
+            # but placing the zones elsewhere: the rail cannot tell which view is right, so the
+            # candidate is dropped rather than published.
+            if fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px:
+                fit = fp
+            elif (float(np.linalg.norm(_zones(model, fp) - _zones(model, fit), axis=1).mean())
+                  * ref_scale > cfg.agreement_px):
+                continue
         # Only acceptable candidates compete: a higher-ranked candidate that fails the checks
         # must not crowd out one that passes them.
         if _acceptable(fit, cfg) and (best is None or _rank(fit) > _rank(best)):
             best = fit
     if best is None:
         return None
-    if _orientation_ambiguous(mask_ref, ref_scale, model, best, cfg):
+    confirm = None
+    if use_edges:
+        def confirm(h: np.ndarray) -> StadiumFit | None:
+            """The turned alternative as the edges see it: refined and still on the rail."""
+            he = _edge_refine(frame, model, np.asarray(h, np.float64), cfg, acfg)
+            if he is None or _perspective(he, ref_scale, _REF_LONG_EDGE / max(model.image_size)) \
+                    > cfg.max_perspective:
+                return None
+            return _score(mask_ref, ref_scale, model, he, cfg)
+    if _orientation_ambiguous(mask_ref, ref_scale, model, best, cfg, confirm):
         return None
     return best
+
+
+def _edge_refine(frame: np.ndarray, model: StadiumModel, h0: np.ndarray,
+                 cfg: StadiumFinderConfig, acfg) -> np.ndarray | None:
+    """Refine ``h0`` (model px -> frame px) with the stadium's own edges, or ``None``.
+
+    The model's reference image is warped into the frame through ``h0``; the remaining
+    motion is estimated as in ``autocalib.estimate_alignment`` but without its coarse search
+    (``h0`` is already close): polarity- and colour-free edge maps normalised inside the warped
+    template's rim region (lid, pockets, outline), homography ECC at work/2 then work width.
+    Rejected when ECC fails, the edge score is below ``acfg.min_score``, or the zones would
+    move more than ``edge_max_shift_px`` (inference px): the edges then do not confirm the
+    rail fit's neighbourhood."""
+    from bxjudge.autocalib import _ECC_GAUSS, _edge_ncc, _gray, _normalise, _region_mask, _scale_h
+    from bxjudge.calibration import _edge_map
+    from bxjudge.geometry import RIM_MASK_MARGIN, rim_mask
+
+    fh, fw = frame.shape[:2]
+    s = model.image_scale
+    h_img = h0 @ np.diag([1.0 / s, 1.0 / s, 1.0])
+    warped = cv2.warpPerspective(model.image, h_img, (fw, fh), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REPLICATE)
+    polys = {f: [tuple(p) for p in _project(h0, np.array(getattr(model.calibration, f), np.float64))]
+             for f in _POLY_FIELDS}
+    wcal = Calibration(name="warped", frame_size=(fw, fh), ref_frame="", **polys)
+    full = (acfg.work_width, max(1, round(acfg.work_width * fh / fw)))
+    crit = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, acfg.ecc_iterations, acfg.ecc_epsilon)
+    h = np.eye(3)
+    prev = None
+    try:
+        for div in (2, 1):
+            size = (max(1, round(full[0] / div)), max(1, round(full[1] / div)))
+            mask = _region_mask(wcal, size)
+            tmap = _normalise(_edge_map(_gray(warped, size)), mask)
+            fmap = _normalise(_edge_map(_gray(frame, size)), mask)
+            if tmap is None or fmap is None:
+                return None
+            if prev is not None:
+                h = _scale_h(h, size[0] / prev[0], size[1] / prev[1])
+            prev = size
+            warp = np.linalg.inv(h).astype(np.float32)
+            _, warp = cv2.findTransformECC(fmap, tmap, warp, cv2.MOTION_HOMOGRAPHY, crit,
+                                           mask.astype(np.uint8) * 255, _ECC_GAUSS)
+            h = np.linalg.inv(warp.astype(np.float64))
+    except (cv2.error, np.linalg.LinAlgError):
+        return None
+    if not np.all(np.isfinite(h)) or abs(h[2, 2]) < 1e-12:
+        return None
+    h /= h[2, 2]
+    rim = rim_mask(wcal, full, max(1, round(RIM_MASK_MARGIN * full[0] / 320)))
+    te = _edge_map(_gray(warped, full))
+    fe = _edge_map(_gray(frame, full))
+    wte = cv2.warpPerspective(te, h, full, flags=cv2.INTER_LINEAR)
+    wrim = cv2.warpPerspective(rim.astype(np.uint8), h, full, flags=cv2.INTER_NEAREST) > 0
+    if _edge_ncc(wte, fe, wrim) < acfg.min_score:
+        return None
+    s_f = np.diag([full[0] / fw, full[1] / fh, 1.0])
+    out = np.linalg.inv(s_f) @ h @ s_f @ h0
+    out /= out[2, 2]
+    moved = np.concatenate([_project(out, np.array(getattr(model.calibration, z), np.float64))
+                            - _project(h0, np.array(getattr(model.calibration, z), np.float64))
+                            for z in _AGREEMENT_ZONES])
+    shift = float(np.linalg.norm(moved, axis=1).mean()) * (_REF_LONG_EDGE / max(fw, fh))
+    if not np.isfinite(shift) or shift > cfg.edge_max_shift_px:
+        return None
+    return out
 
 
 def _acceptable(fit: StadiumFit, cfg: StadiumFinderConfig) -> bool:
@@ -556,7 +674,8 @@ def _acceptable(fit: StadiumFit, cfg: StadiumFinderConfig) -> bool:
 
 
 def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel,
-                           best: StadiumFit, cfg: StadiumFinderConfig) -> bool:
+                           best: StadiumFit, cfg: StadiumFinderConfig,
+                           confirm=None) -> bool:
     """True when the fit turned 180 degrees about the rail centre is itself an acceptable fit
     explaining the rail almost as well: then the direction (X/B sides, which end holds the
     Xtreme pocket) is not determined.
@@ -564,7 +683,8 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
     The turned fit is scored as it is, after affine refinement and after a homography
     refinement; a failed refinement never discards evidence the unrefined turn already has.
     An alternative failing the acceptance checks (coverage, notch, quadrants, ...) cannot
-    veto a direction the rail shows clearly."""
+    veto a direction the rail shows clearly. With ``confirm`` (edge refinement of a
+    hypothesis), an alternative counts only when the stadium's edges confirm it too."""
     cx, cy = model.rail.mean(0)
     turn = np.array([[-1.0, 0.0, 2 * cx], [0.0, -1.0, 2 * cy], [0.0, 0.0, 1.0]])
     raw = np.asarray(best.homography) @ turn
@@ -580,8 +700,15 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
         hypotheses.append(hom)
     for h in hypotheses:
         alt = _score(mask_ref, ref_scale, model, h, cfg)
-        if (alt is not None and _acceptable(alt, cfg)
-                and _quality(alt) > _quality(best) - cfg.orientation_min_gain):
+        if (alt is None or not _acceptable(alt, cfg)
+                or _quality(alt) <= _quality(best) - cfg.orientation_min_gain):
+            continue
+        if confirm is None:
+            return True
+        # With the frame at hand the stadium's edges also judge the turned view: a turn they
+        # cannot confirm (refinement fails or leaves the rail) is not a competitor.
+        seen = confirm(h)
+        if seen is not None and _acceptable(seen, cfg):
             return True
     return False
 
@@ -725,10 +852,11 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
     the best ``candidate_frames`` are fitted in that order. A result needs two fits whose zones
     agree within ``agreement_px`` (inference px); the better-ranked of them is returned. A
     video without such a pair (no stadium, a moving camera, hands everywhere) gives ``None``."""
-    from bxjudge.autocalib import warp_calibration
+    from bxjudge.autocalib import load_autocalib_config, warp_calibration
     from bxjudge.manifest import probe
     from bxjudge.video import VideoDecodeError, iter_frames
 
+    acfg = load_autocalib_config()
     try:
         fps = probe(Path(video)).fps
         step = max(1, round(cfg.sample_step_s * fps))
@@ -745,7 +873,8 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
     for pixels, idx, frame, mask in samples[:cfg.candidate_frames]:
         if pixels == 0:
             break
-        fit = fit_stadium(mask, model, cfg)
+        fit = (fit_stadium(mask, model, cfg, frame=frame, acfg=acfg) if cfg.edge_refinement
+               else fit_stadium(mask, model, cfg))
         if fit is None:
             continue
         zones = _zones(model, fit)
@@ -792,7 +921,12 @@ def save_stadium_model(model: StadiumModel, path: Path) -> None:
         "image_size": list(model.image_size),
         "rail": [[float(x), float(y)] for x, y in model.rail],
         "calibration": _calibration_doc(model.calibration),
+        "image_scale": model.image_scale,
+        "image": Path(path).with_suffix(".png").name if model.image is not None else None,
     }
+    if model.image is not None:
+        if not cv2.imwrite(str(Path(path).with_suffix(".png")), model.image):
+            raise OSError(f"cannot write {Path(path).with_suffix('.png')}")
     Path(path).write_text(json.dumps(doc, indent=1), encoding="utf-8")
 
 
@@ -804,5 +938,11 @@ def load_stadium_model(path: Path = DEFAULT_STADIUM_MODEL) -> StadiumModel:
     w, h = doc["image_size"]
     cal = _calibration_from_doc(doc["calibration"])
     _check_simple_zones(cal, str(path))
+    image = None
+    if doc.get("image"):
+        image = cv2.imread(str(Path(path).parent / doc["image"]), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"{path}: cannot read its reference image {doc['image']}")
     return StadiumModel(rail=rail, calibration=cal,
-                        source_sha256=str(doc["source_sha256"]), image_size=(int(w), int(h)))
+                        source_sha256=str(doc["source_sha256"]), image_size=(int(w), int(h)),
+                        image=image, image_scale=float(doc.get("image_scale", 1.0)))
