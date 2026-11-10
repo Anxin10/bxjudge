@@ -71,6 +71,70 @@ def test_resume_from_another_source_folder_is_refused(tmp_path):
     assert same == {("batch", "clip.mp4")}
 
 
+def test_only_truth_protects_the_recorded_source_folders(tmp_path):
+    # Codex round 4: --only-truth without folders must still protect where the videos were.
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "original.json").write_text("{}")
+    out = tmp_path / "eval"
+    out.mkdir()
+    row = {"batch": "videos", "video": "clip.mp4", "source": str(videos.resolve()), "found": False,
+           "seconds": 1.0}
+    (out / "rows.jsonl").write_text(json.dumps(row) + "\n")
+    (out / "summary.json").symlink_to(videos / "original.json")
+    with pytest.raises(SystemExit):
+        ev.main(["--out", str(out), "--only-truth"])
+    assert (videos / "original.json").read_text() == "{}"
+
+
+def test_only_truth_without_recorded_sources_needs_the_folders(tmp_path):
+    out = tmp_path / "eval"
+    out.mkdir()
+    (out / "rows.jsonl").write_text(json.dumps({"batch": "b", "video": "c.mp4", "found": False,
+                                                "seconds": 1.0}) + "\n")
+    with pytest.raises(SystemExit):
+        ev.main(["--out", str(out), "--only-truth"])
+
+
+def test_symlinks_inside_the_reference_tree_are_refused(tmp_path):
+    # Codex round 4: rglob does not descend into a linked folder; refuse links in the tree.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    ref = tmp_path / "eval" / "reference" / "batch"
+    ref.mkdir(parents=True)
+    (ref / "calibrations").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(SystemExit):
+        ev.ensure_tree_has_no_links(ref)
+    ev.ensure_tree_has_no_links(tmp_path / "eval" / "reference" / "missing")  # absent: fine
+
+
+def test_resume_compares_batch_names_without_case(tmp_path):
+    # Codex round 4: archiveA/batch earlier, archiveB/BATCH now -> same files on Windows.
+    out = tmp_path / "eval"
+    out.mkdir()
+    old = {"batch": "batch", "video": "clip.mp4", "source": str((tmp_path / "archiveA" / "batch").resolve())}
+    (out / "rows.jsonl").write_text(json.dumps(old) + "\n")
+    with pytest.raises(SystemExit):
+        ev.done_rows(out / "rows.jsonl", {"BATCH": (tmp_path / "archiveB" / "BATCH").resolve()})
+
+
+def test_reference_folders_are_per_video(tmp_path):
+    # Codex round 4: parallel workers sharing one snapshot folder race on its temp file.
+    a = ev.reference_dir(tmp_path, "batch", "a.mp4")
+    b = ev.reference_dir(tmp_path, "batch", "b.mp4")
+    assert a != b and a.parent == b.parent
+
+
+def test_truth_for_another_video_with_the_same_name_is_not_graded(tmp_path):
+    # Codex round 4: frame and name match, but the truth was clicked on a different file.
+    rows = [{"batch": "20261108", "video": "clip.mp4", "found": True, "frame_index": 390,
+             "fps": 120.0, "video_sha256": "a" * 64}]
+    out = tmp_path / "eval"
+    out.mkdir()
+    [row] = ev.truth_rows(_truth(tmp_path, at_s=3.25), out, rows, 8.0, 1280)  # truth sha "x"
+    assert row["status"] == "VIDEO_MISMATCH"
+
+
 def test_summary_through_a_symlink_is_refused(tmp_path):
     # Codex round 3: out/summary.json linking into a video folder would overwrite a source.
     videos = tmp_path / "videos"

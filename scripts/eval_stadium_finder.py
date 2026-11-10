@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -68,19 +70,51 @@ def done_rows(rows_path: Path, sources: dict[str, Path]) -> set[tuple[str, str]]
     make a different video look done and share its result files."""
     if not rows_path.exists():
         return set()
+    by_key = {name.casefold(): (name, src) for name, src in sources.items()}  # paths ignore case
     done = set()
     for r in map(json.loads, rows_path.read_text().splitlines()):
-        if r["batch"] in sources:
-            if Path(r.get("source", "")) != sources[r["batch"]]:
-                raise SystemExit(f"{rows_path}: batch {r['batch']!r} was evaluated from "
-                                 f"{r.get('source')!r}, not {sources[r['batch']]}; use another --out")
-            done.add((r["batch"], r["video"]))
+        hit = by_key.get(r["batch"].casefold())
+        if hit is None:
+            continue
+        name, src = hit
+        if Path(r.get("source", "")) != src:
+            raise SystemExit(f"{rows_path}: batch {r['batch']!r} was evaluated from "
+                             f"{r.get('source')!r}, not {src}; use another --out")
+        done.add((name, r["video"]))
     return done
 
 
 def result_path(out: Path, kind: str, batch: str, video: str, suffix: str) -> Path:
     """Per-batch result file, so equal video names in two batches never share a file."""
     return out / kind / batch / f"{Path(video).stem}{suffix}"
+
+
+def reference_dir(out: Path, batch: str, video: str) -> Path:
+    """Template-path snapshots go to one folder per video: parallel workers sharing a snapshot
+    folder race on its temporary files."""
+    return out / "reference" / batch / Path(video).stem
+
+
+def ensure_tree_has_no_links(root: Path) -> None:
+    """Refuse a write tree that holds any symlink or junction: a linked folder can hide links
+    that lead into a protected folder, and later writes inside it would follow them."""
+    if root.is_symlink():
+        raise SystemExit(f"{root}: refusing a linked write folder")
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink() or (os.name == "nt" and os.path.isjunction(p)):
+                raise SystemExit(f"{p}: refusing a link inside a write folder")
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 _ZONE_COLORS = {"stadium": (255, 255, 255), "battle_area": (0, 0, 255), "over_left": (255, 0, 0),
@@ -106,7 +140,8 @@ def _one(job: tuple[str, str, str, bool, list[str]]) -> dict:
     protected = [Path(p) for p in protected_s]
     cfg = load_stadium_finder_config()
     model = load_stadium_model()
-    row: dict = {"batch": batch, "video": video_p.name, "source": str(video_p.parent.resolve())}
+    row: dict = {"batch": batch, "video": video_p.name, "source": str(video_p.parent.resolve()),
+                 "video_sha256": _sha256(video_p)}
     try:
         from bxjudge.manifest import probe
 
@@ -142,11 +177,9 @@ def _one(job: tuple[str, str, str, bool, list[str]]) -> dict:
     else:
         row.setdefault("found", False)
     if reference:
-        ref_dir = out_p / "reference" / batch
+        ref_dir = reference_dir(out_p, batch, video_p.name)
         ensure_safe(ref_dir, protected)
-        if ref_dir.exists():  # select_snapshot writes inside: no existing entry may lead out
-            for entry in ref_dir.rglob("*"):
-                ensure_safe(entry, protected)
+        ensure_tree_has_no_links(ref_dir)  # select_snapshot writes inside it
         row["reference"] = _reference(video_p, ref_dir, found)
     return row
 
@@ -202,6 +235,8 @@ def truth_rows(truth_dir: Path, out: Path, rows: list[dict], limit_px: float,
             row.update(status="REJECTED")
         elif "fps" not in r or abs(round(doc["at_s"] * r["fps"]) - r["frame_index"]) > 1:
             row.update(status="FRAME_MISMATCH", frame_index=r.get("frame_index"))
+        elif r.get("video_sha256") != doc.get("video_sha256"):  # same name, another file
+            row.update(status="VIDEO_MISMATCH")
         elif not found_path.exists():
             row.update(status="REJECTED")
         else:
@@ -226,8 +261,14 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     out = a.out.expanduser()
     check_output_dir(out, a.folders)
-    guard = protected_dirs(a.folders)
     rows_path = out / "rows.jsonl"
+    recorded = [json.loads(x) for x in rows_path.read_text().splitlines()] if rows_path.exists() else []
+    if a.only_truth and not a.folders and any("source" not in r for r in recorded):
+        raise SystemExit(f"{rows_path}: rows name no source folder; pass the video folders")
+    # Folders recorded by earlier runs stay protected even when not given this time.
+    guard = protected_dirs(a.folders) + sorted({Path(r["source"]).resolve() for r in recorded
+                                                if "source" in r})
+    check_output_dir(out, [p for p in guard[1:]])
     summary_path = out / "summary.json"
     ensure_safe(rows_path, guard)
     ensure_safe(summary_path, guard)
@@ -252,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     summary: dict = {}
     for batch in sorted({r["batch"] for r in rows}):
         rs = [r for r in rows if r["batch"] == batch]
-        ok = [r for r in rs if r["found"]]
+        ok = [r for r in rs if r.get("found")]
         refs = [r["reference"] for r in rs if "reference" in r]
         summary[batch] = {
             "videos": len(rs), "found": len(ok),
@@ -278,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["truth"] = {"rows": graded,
                             "counts": {s: sum(1 for r in graded if r["status"] == s)
                                        for s in ("PASS", "FAIL", "REJECTED", "FRAME_MISMATCH",
-                                                 "AMBIGUOUS")}}
+                                                 "VIDEO_MISMATCH", "AMBIGUOUS")}}
     ensure_safe(summary_path, guard)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in summary.items() if k != "truth"}, ensure_ascii=False, indent=1))

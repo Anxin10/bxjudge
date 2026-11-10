@@ -482,23 +482,23 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
         fit = _score(mask_ref, ref_scale, model, h, cfg)
         if fit is None:
             continue
-        if fit.coverage < cfg.min_coverage - _HOMOGRAPHY_SKIP:  # perspective cannot rescue it
-            if best is None or _rank(fit) > _rank(best):
-                best = fit
-            continue
-        # Perspective only where the rail shape supports it: an oval alone cannot pin the two
-        # perspective terms, so the homography must clearly beat the affine fit and stay mild.
-        hp = _refine(mask_ref, ref_scale, model, h, cfg, cv2.MOTION_HOMOGRAPHY)
-        if hp is not None:
-            fp = _score(mask_ref, ref_scale, model, hp, cfg)
-            model_scale = _REF_LONG_EDGE / max(model.image_size)
-            if (fp is not None and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
-                    and _quality(fp) >= _quality(fit) - _QUALITY_TIE
-                    and fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px):
-                fit = fp
-        if best is None or _rank(fit) > _rank(best):
+        if fit.coverage >= cfg.min_coverage - _HOMOGRAPHY_SKIP:
+            # Perspective only where the rail shape supports it: an oval alone cannot pin the
+            # two perspective terms, so the homography must clearly beat the affine fit and
+            # stay mild. Far below min_coverage, perspective cannot rescue the candidate.
+            hp = _refine(mask_ref, ref_scale, model, h, cfg, cv2.MOTION_HOMOGRAPHY)
+            if hp is not None:
+                fp = _score(mask_ref, ref_scale, model, hp, cfg)
+                model_scale = _REF_LONG_EDGE / max(model.image_size)
+                if (fp is not None and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
+                        and _quality(fp) >= _quality(fit) - _QUALITY_TIE
+                        and fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px):
+                    fit = fp
+        # Only acceptable candidates compete: a higher-ranked candidate that fails the checks
+        # must not crowd out one that passes them.
+        if _acceptable(fit, cfg) and (best is None or _rank(fit) > _rank(best)):
             best = fit
-    if best is None or not _acceptable(best, cfg):
+    if best is None:
         return None
     if _orientation_ambiguous(mask_ref, ref_scale, model, best, cfg):
         return None

@@ -385,6 +385,29 @@ def test_unqualified_alternative_does_not_veto(synth_model):
     assert fit is not None and zone_error(fit.homography, h) < 2.0
 
 
+def test_unacceptable_top_candidate_does_not_crowd_out_an_acceptable_one(monkeypatch):
+    # Codex round 4: rank only candidates that pass the acceptance checks.
+    import bxjudge.stadium_finder as sf
+    from bxjudge.stadium_finder import StadiumFit
+
+    cfg = load_stadium_finder_config()
+    ident = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    good = dict(rail_in_frame=1.0, notch_coverage=1.0, quadrant_coverage=1.0, mean_error_px=1.0)
+    # 1 ranks higher (quality 1.0 x 0.29) but fails min_precision; 2 (0.8 x 0.31) passes.
+    fits = {1: StadiumFit(ident, coverage=1.0, precision=cfg.min_precision - 0.01, **good),
+            2: StadiumFit(ident, coverage=cfg.min_coverage, precision=cfg.min_precision + 0.01, **good)}
+    assert fits[1].coverage * fits[1].precision > fits[2].coverage * fits[2].precision
+    hs = {1: np.eye(3) * 1.0, 2: np.eye(3) * 2.0}
+    monkeypatch.setattr(sf, "_coarse_candidates", lambda *a: [(0.9, hs[1]), (0.89, hs[2])])
+    monkeypatch.setattr(sf, "_refine", lambda m, r, mo, h, c, motion=None: None if motion else h)
+    monkeypatch.setattr(sf, "_score", lambda m, r, mo, h, c: fits[1 if h[0, 0] == 1.0 else 2])
+    monkeypatch.setattr(sf, "_orientation_ambiguous", lambda *a: False)
+    mask = np.zeros((H, W), np.uint8)
+    mask[10, 10] = 255
+    got = sf.fit_stadium(mask, None, cfg)
+    assert got is fits[2]
+
+
 def test_perspective_is_measured_in_inference_px():
     # Codex review Medium 3: both ends of the homography must be in inference px.
     from bxjudge.stadium_finder import _perspective
