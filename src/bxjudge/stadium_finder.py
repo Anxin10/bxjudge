@@ -498,25 +498,47 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
                 fit = fp
         if best is None or _rank(fit) > _rank(best):
             best = fit
-    if (best is None or best.coverage < cfg.min_coverage or best.precision < cfg.min_precision
-            or best.rail_in_frame < cfg.min_rail_in_frame
-            or best.notch_coverage < cfg.min_notch_coverage
-            or best.quadrant_coverage < cfg.min_quadrant_coverage):
+    if best is None or not _acceptable(best, cfg):
         return None
     if _orientation_ambiguous(mask_ref, ref_scale, model, best, cfg):
         return None
     return best
 
 
+def _acceptable(fit: StadiumFit, cfg: StadiumFinderConfig) -> bool:
+    return (fit.coverage >= cfg.min_coverage and fit.precision >= cfg.min_precision
+            and fit.rail_in_frame >= cfg.min_rail_in_frame
+            and fit.notch_coverage >= cfg.min_notch_coverage
+            and fit.quadrant_coverage >= cfg.min_quadrant_coverage)
+
+
 def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel,
                            best: StadiumFit, cfg: StadiumFinderConfig) -> bool:
-    """True when the fit turned 180 degrees about the rail centre explains the rail almost as
-    well: then the direction (X/B sides, which end holds the Xtreme pocket) is not determined."""
+    """True when the fit turned 180 degrees about the rail centre is itself an acceptable fit
+    explaining the rail almost as well: then the direction (X/B sides, which end holds the
+    Xtreme pocket) is not determined.
+
+    The turned fit is scored as it is, after affine refinement and after a homography
+    refinement; a failed refinement never discards evidence the unrefined turn already has.
+    An alternative failing the acceptance checks (coverage, notch, quadrants, ...) cannot
+    veto a direction the rail shows clearly."""
     cx, cy = model.rail.mean(0)
     turn = np.array([[-1.0, 0.0, 2 * cx], [0.0, -1.0, 2 * cy], [0.0, 0.0, 1.0]])
-    h = _refine(mask_ref, ref_scale, model, np.asarray(best.homography) @ turn, cfg)
-    alt = None if h is None else _score(mask_ref, ref_scale, model, h, cfg)
-    return alt is not None and _quality(alt) > _quality(best) - cfg.orientation_min_gain
+    raw = np.asarray(best.homography) @ turn
+    hypotheses = [raw]
+    affine = _refine(mask_ref, ref_scale, model, raw, cfg)
+    if affine is not None:
+        hypotheses.append(affine)
+    hom = _refine(mask_ref, ref_scale, model, raw if affine is None else affine, cfg,
+                  cv2.MOTION_HOMOGRAPHY)
+    if hom is not None:
+        hypotheses.append(hom)
+    for h in hypotheses:
+        alt = _score(mask_ref, ref_scale, model, h, cfg)
+        if (alt is not None and _acceptable(alt, cfg)
+                and _quality(alt) > _quality(best) - cfg.orientation_min_gain):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- whole video

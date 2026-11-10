@@ -31,14 +31,34 @@ from bxjudge.stadium_finder import (
     zone_boundary_errors,
 )
 
-def check_output_dir(out: Path, folders: list[Path]) -> None:
-    """Refuse an output folder inside calib/ or inside any input video folder (resolved, so a
-    symlink cannot reach them): sources stay read only."""
-    real = out.expanduser().resolve()
-    protected = [(PROJECT_ROOT / "calib").resolve(), *(f.expanduser().resolve() for f in folders)]
+def protected_dirs(folders: list[Path]) -> list[Path]:
+    """calib/ and every input video folder, resolved: never written to."""
+    return [(PROJECT_ROOT / "calib").resolve(), *(f.expanduser().resolve() for f in folders)]
+
+
+def ensure_safe(path: Path, protected: list[Path]) -> None:
+    """Refuse a write target that resolves (symlinks and junctions included, for the file and
+    every existing parent) into a protected folder."""
+    real = path.expanduser().resolve()
     for p in protected:
         if real == p or p in real.parents:
-            raise SystemExit(f"{out}: output must stay outside {p}")
+            raise SystemExit(f"{path}: refusing to write inside {p}")
+
+
+def check_output_dir(out: Path, folders: list[Path]) -> None:
+    """Refuse an output folder inside calib/ or inside any input video folder: sources stay
+    read only. Each later write is checked again with ``ensure_safe``."""
+    ensure_safe(out, protected_dirs(folders))
+
+
+def batch_names(folders: list[Path]) -> list[str]:
+    """Batch id per input folder (its name); two folders with one name would share result
+    files and resume records, so they are refused."""
+    names = [f.expanduser().name for f in folders]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise SystemExit(f"input folders share the batch name(s) {dup}; evaluate them separately")
+    return names
 
 
 def result_path(out: Path, kind: str, batch: str, video: str, suffix: str) -> Path:
@@ -62,10 +82,11 @@ def _preview(frame: np.ndarray, cal, path: Path, label: str) -> None:
     cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
 
-def _one(job: tuple[str, str, str, bool]) -> dict:
-    video, batch, out, reference = job
+def _one(job: tuple[str, str, str, bool, list[str]]) -> dict:
+    video, batch, out, reference, protected_s = job
     cv2.setNumThreads(1)
     video_p, out_p = Path(video), Path(out)
+    protected = [Path(p) for p in protected_s]
     cfg = load_stadium_finder_config()
     model = load_stadium_model()
     row: dict = {"batch": batch, "video": video_p.name}
@@ -84,6 +105,7 @@ def _one(job: tuple[str, str, str, bool]) -> dict:
     row["seconds"] = round(time.time() - t, 1)
     if found is not None:
         cal_path = result_path(out_p, "found", batch, video_p.name, ".json")
+        ensure_safe(cal_path, protected)
         save_calibration(found.calibration, cal_path)
         f = found.fit
         row.update(found=True, frame_index=found.frame_index, coverage=round(f.coverage, 3),
@@ -96,13 +118,16 @@ def _one(job: tuple[str, str, str, bool]) -> dict:
                    pocket_out_of_frame=[k for k in ("over_left", "over_right", "xtreme")
                                         if found.zone_visibility[k] < cfg.zone_visible_min])
         prev = result_path(out_p, "preview", batch, video_p.name, ".jpg")
+        ensure_safe(prev, protected)
         prev.parent.mkdir(parents=True, exist_ok=True)
         _preview(found.frame, found.calibration, prev,
                  f"{batch}/{video_p.stem} f{found.frame_index} cov {f.coverage:.2f} prec {f.precision:.2f}")
     else:
         row.setdefault("found", False)
     if reference:
-        row["reference"] = _reference(video_p, out_p / "reference" / batch, found)
+        ref_dir = out_p / "reference" / batch
+        ensure_safe(ref_dir, protected)
+        row["reference"] = _reference(video_p, ref_dir, found)
     return row
 
 
@@ -188,9 +213,14 @@ def main(argv: list[str] | None = None) -> int:
         done = set()
         if rows_path.exists():  # resumable: videos already evaluated are skipped
             done = {(r["batch"], r["video"]) for r in map(json.loads, rows_path.read_text().splitlines())}
-        jobs = [(str(v), f.name, str(out), a.reference)
-                for f in map(lambda x: x.expanduser(), a.folders) for v in sorted(f.glob("*.mp4"))
-                if (f.name, v.name) not in done]
+        names = batch_names(a.folders)
+        protected = [str(p) for p in protected_dirs(a.folders)]
+        for sub in ("found", "preview", "reference"):
+            ensure_safe(out / sub, [Path(p) for p in protected])
+        ensure_safe(rows_path, [Path(p) for p in protected])
+        jobs = [(str(v), name, str(out), a.reference, protected)
+                for f, name in zip(map(lambda x: x.expanduser(), a.folders), names)
+                for v in sorted(f.glob("*.mp4")) if (name, v.name) not in done]
         with ProcessPoolExecutor(max_workers=a.workers) as pool, open(rows_path, "a") as fh:
             for row in pool.map(_one, jobs):
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")

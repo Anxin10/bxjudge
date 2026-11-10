@@ -343,6 +343,48 @@ def test_cropped_rail_returns_none(synth_model):
     assert fit is None or zone_error(fit.homography, h) < 8.0
 
 
+def _turn(model, h):
+    cx, cy = model.rail.mean(0)
+    return np.asarray(h) @ np.array([[-1.0, 0, 2 * cx], [0, -1.0, 2 * cy], [0, 0, 1.0]])
+
+
+def test_orientation_check_keeps_an_unrefined_competitor(synth_model, monkeypatch):
+    # Codex re-review High: a rail drawn both ways round; the 180-degree alternative is as
+    # good even when its refinement fails, so the direction must count as ambiguous.
+    import bxjudge.stadium_finder as sf
+    from bxjudge.stadium_finder import _orientation_ambiguous, _score
+
+    monkeypatch.setattr(sf, "_refine", lambda *a, **k: None)  # ECC fails on the alternative
+
+    cfg, _ = synth_model
+    model = load_stadium_model()  # the shipped model (1920 px template), as Codex reproduced
+    k = W / model.image_size[0]
+    h = np.diag([k, k, 1.0]) @ similarity(scale=0.85, centre=tuple(model.rail.mean(0)),
+                                          persp=(2e-5, 1e-5))
+    mask = np.zeros((H, W), np.uint8)
+    for hh in (h, _turn(model, h)):
+        for x, y in apply_h(hh, model.rail):
+            cv2.circle(mask, (round(x), round(y)), 5, 255, -1)
+    best = _score(mask, 1.0, model, h, cfg)
+    assert best is not None and best.coverage > 0.9
+    assert _orientation_ambiguous(mask, 1.0, model, best, cfg)
+
+
+def test_unqualified_alternative_does_not_veto(synth_model):
+    # Codex re-review Medium: extra green dilutes precision; a 180-degree alternative that
+    # fails the acceptance checks itself must not veto a clear direction.
+    cfg, model = synth_model
+    h = similarity(scale=0.6)
+    bgr = cv2.cvtColor(np.uint8([[[60, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0].tolist()
+
+    def lines(img):
+        cv2.line(img, (80, 20), (700, 20), bgr, 8)
+        cv2.line(img, (80, 690), (700, 690), bgr, 8)
+
+    fit = fit_stadium(rail_mask(_frame_for(h, extra=lines), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 2.0
+
+
 def test_perspective_is_measured_in_inference_px():
     # Codex review Medium 3: both ends of the homography must be in inference px.
     from bxjudge.stadium_finder import _perspective

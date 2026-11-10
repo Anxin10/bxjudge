@@ -40,6 +40,29 @@ def test_output_reaching_a_video_folder_through_a_symlink_is_refused(tmp_path):
         ev.check_output_dir(link / "eval", [videos])
 
 
+def test_two_input_folders_with_one_name_are_refused(tmp_path):
+    # Codex re-review Medium: archiveA/batch and archiveB/batch would share result files.
+    a, b = tmp_path / "archiveA" / "batch", tmp_path / "archiveB" / "batch"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        ev.batch_names([a, b])
+    assert ev.batch_names([a, tmp_path / "archiveA"]) == ["batch", "archiveA"]
+
+
+def test_writes_through_a_symlinked_result_folder_are_refused(tmp_path):
+    # Codex re-review Medium: out/ is safe but out/found links into a video folder.
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    out = tmp_path / "eval"
+    out.mkdir()
+    (out / "found").symlink_to(videos, target_is_directory=True)
+    protected = ev.protected_dirs([videos])
+    with pytest.raises(SystemExit):
+        ev.ensure_safe(ev.result_path(out, "found", "videos", "clip.mp4", ".json"), protected)
+    ev.ensure_safe(ev.result_path(out, "preview", "videos", "clip.mp4", ".jpg"), protected)
+
+
 def test_results_are_kept_per_batch(tmp_path):
     a = ev.result_path(tmp_path, "found", "20261024", "clip.mp4", ".json")
     b = ev.result_path(tmp_path, "found", "20261108", "clip.mp4", ".json")
