@@ -261,7 +261,15 @@ def _rot(theta: float) -> np.ndarray:
 
 
 def _project(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    return cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float64), h).reshape(-1, 2)
+    """Points through homography ``h`` by plain homogeneous division. OpenCV's
+    perspectiveTransform returns (0, 0) for a near-zero denominator, which would hide a point
+    thrown towards infinity inside the frame; here it comes out huge or non-finite."""
+    p = np.asarray(pts, np.float64).reshape(-1, 2)
+    h = np.asarray(h, np.float64)
+    num = p @ h[:2, :2].T + h[:2, 2]
+    w = p @ h[2, :2] + h[2, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return num / w[:, None]
 
 
 def _blurred(mask: np.ndarray, size: tuple[int, int], sigma: float) -> np.ndarray:

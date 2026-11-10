@@ -476,6 +476,18 @@ def test_a_steep_but_valid_view_keeps_its_zones():
     assert _zones_valid(model, h, (W, H))
 
 
+def test_a_vertex_next_to_the_horizon_is_not_hidden_at_the_origin():
+    # Codex round 7: perspectiveTransform returns (0, 0) for a tiny denominator, so a vertex
+    # thrown 6e9 px away looked in frame.
+    from bxjudge.stadium_finder import _zones_valid
+
+    model = load_stadium_model()
+    s = 2694.000001
+    h = np.array([[1.0, 0, 1200.0], [0, 1.0, 700.0], [0, 0, 1.0]]) @ np.array(
+        [[-0.0015, 0, 0], [0, -0.0015, 0], [-1 / s, -1 / s, 1.0]])
+    assert not _zones_valid(model, h, (W, H))
+
+
 def test_self_intersecting_zone_is_never_reported_visible():
     # Codex round 6: a bow-tie polygon's signed area cancels and its share came out as 1.0.
     from dataclasses import replace
