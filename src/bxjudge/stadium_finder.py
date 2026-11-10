@@ -211,6 +211,7 @@ def build_stadium_model(template: Calibration, image: np.ndarray,
     h, w = image.shape[:2]
     if (w, h) != tuple(template.frame_size):
         raise ValueError(f"template image {w}x{h} does not match frame_size {template.frame_size}")
+    _check_simple_zones(template, f"template {template.name}")
     roi = polygon_mask(template.battle_area, (w, h))
     grow = max(1, round(cfg.roi_margin_frac * w))
     roi = cv2.dilate(roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
@@ -427,15 +428,14 @@ def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.nd
                       rail_in_frame=in_frame, notch_coverage=notch_cov, quadrant_coverage=quad_cov)
 
 
-_MIN_DENOM_RATIO = 0.2  # zone vertex projective denominator vs the rail centre's
 _MAX_ZONE_EXTENT = 10.0  # projected zone vertices stay within this many frame sizes
 
 
 def _zones_valid(model: StadiumModel, h: np.ndarray, frame_size: tuple[int, int]) -> bool:
     """Every zone vertex projects finitely through ``h`` (model px -> frame px): its projective
-    denominator keeps the rail centre's sign and stays well away from zero, and it lands
-    within ``_MAX_ZONE_EXTENT`` frame sizes. A mapping whose horizon crosses the stadium
-    throws zones to infinity and is never a camera view of it."""
+    denominator has the rail centre's sign (the horizon does not cross the zones) and it lands
+    within ``_MAX_ZONE_EXTENT`` frame sizes. A vertex near the horizon is thrown far away and
+    fails the extent check; a steep but valid view with all zones on screen passes."""
     h = np.asarray(h, np.float64)
     verts = np.concatenate([np.array(getattr(model.calibration, z), np.float64).reshape(-1, 2)
                             for z in _POLY_FIELDS if getattr(model.calibration, z)])
@@ -444,7 +444,7 @@ def _zones_valid(model: StadiumModel, h: np.ndarray, frame_size: tuple[int, int]
     w = verts @ h[2, :2] + h[2, 2]
     if not np.isfinite(w).all() or not np.isfinite(w_c) or w_c == 0:
         return False
-    if (w / w_c).min() < _MIN_DENOM_RATIO:
+    if (w / w_c).min() <= 0.0:
         return False
     pts = _project(h, verts)
     fw, fh = frame_size
@@ -589,12 +589,48 @@ def zone_visibility(c: Calibration) -> dict[str, float]:
             out[name] = 0.0
             continue
         total = abs(_area(poly))
-        if not np.isfinite(total) or total <= 0.0:
-            out[name] = 0.0
+        if not np.isfinite(total) or total <= 0.0 or not _is_simple(poly):
+            out[name] = 0.0  # a self-intersecting zone's signed area cancels: never "visible"
             continue
         inside = abs(_area(_clip_to_rect(poly, w, h)))
         out[name] = float(min(1.0, max(0.0, inside / total)))
     return out
+
+
+def _is_simple(poly: np.ndarray) -> bool:
+    """True when no two non-adjacent edges of the closed polygon cross or touch."""
+    p = np.asarray(poly, np.float64).reshape(-1, 2)
+    n = len(p)
+
+    def orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        return 0 if v == 0 else (1 if v > 0 else -1)
+
+    def on_seg(a, b, c):
+        return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
+
+    for i in range(n):
+        a, b = p[i], p[(i + 1) % n]
+        for j in range(i + 1, n):
+            if j == i or (j + 1) % n == i or (i + 1) % n == j:
+                continue  # adjacent edges share a vertex
+            c, d = p[j], p[(j + 1) % n]
+            o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+            if o1 != o2 and o3 != o4:
+                return False
+            if (o1 == 0 and on_seg(a, b, c)) or (o2 == 0 and on_seg(a, b, d)) \
+                    or (o3 == 0 and on_seg(c, d, a)) or (o4 == 0 and on_seg(c, d, b)):
+                return False
+    return True
+
+
+def _check_simple_zones(c: Calibration, where: str) -> None:
+    """The judged zones (whose visibility decides reviews) must not cross themselves. The lid
+    and launch zones are not checked: the manual 20261014_202713 lid crosses itself (ledger)."""
+    for name in VISIBILITY_ZONES:
+        poly = getattr(c, name)
+        if poly and not _is_simple(np.array(poly, np.float64)):
+            raise ValueError(f"{where}: zone {name} crosses itself")
 
 
 def _area(poly: np.ndarray) -> float:
@@ -753,5 +789,7 @@ def load_stadium_model(path: Path = DEFAULT_STADIUM_MODEL) -> StadiumModel:
         raise ValueError(f"{path}: not a {_MODEL_SCHEMA} file")
     rail = np.array(doc["rail"], np.float64).reshape(-1, 2)
     w, h = doc["image_size"]
-    return StadiumModel(rail=rail, calibration=_calibration_from_doc(doc["calibration"]),
+    cal = _calibration_from_doc(doc["calibration"])
+    _check_simple_zones(cal, str(path))
+    return StadiumModel(rail=rail, calibration=cal,
                         source_sha256=str(doc["source_sha256"]), image_size=(int(w), int(h)))

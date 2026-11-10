@@ -464,6 +464,41 @@ def test_zones_must_project_finitely(synth_model):
     assert _zones_valid(model, np.eye(3), (W, H))
 
 
+def test_a_steep_but_valid_view_keeps_its_zones():
+    # Codex round 6: horizon at x = 2100, outside every zone; all judged zones in frame.
+    # The far launch zone's small denominator must not make this view invalid.
+    from bxjudge.stadium_finder import _zones_valid
+
+    model = load_stadium_model()
+    h = np.array([[-0.088095238095, 0, 349.115375],
+                  [-0.142857142857, 0.15, 221.634],
+                  [-0.000476190476, 0, 1.0]])
+    assert _zones_valid(model, h, (W, H))
+
+
+def test_self_intersecting_zone_is_never_reported_visible():
+    # Codex round 6: a bow-tie polygon's signed area cancels and its share came out as 1.0.
+    from dataclasses import replace
+
+    cal = replace(synthetic_calibration(), frame_size=(100, 100),
+                  xtreme=[(-150.0, 10.0), (90.0, 90.0), (-100.0, 90.0), (50.0, 10.0)])
+    assert zone_visibility(cal)["xtreme"] < 0.8
+
+
+def test_model_with_a_self_intersecting_zone_is_refused(tmp_path):
+    from dataclasses import replace
+
+    cfg = load_stadium_finder_config()
+    bow = [(160.0, 260.0), (215.0, 420.0), (160.0, 420.0), (215.0, 260.0)]
+    with pytest.raises(ValueError):
+        build_stadium_model(replace(synthetic_calibration(), over_left=bow), draw_rail(rail_polyline()), cfg)
+    good = build_stadium_model(synthetic_calibration(), draw_rail(rail_polyline()), cfg)
+    path = tmp_path / "m.json"
+    save_stadium_model(replace(good, calibration=replace(good.calibration, over_left=bow)), path)
+    with pytest.raises(ValueError):
+        load_stadium_model(path)
+
+
 def test_zone_visibility_of_a_huge_polygon_is_cheap():
     # Codex round 5: rasterising a polygon reaching 1e9 px asked for petabytes.
     from dataclasses import replace
