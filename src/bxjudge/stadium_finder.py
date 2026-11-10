@@ -59,6 +59,7 @@ class StadiumFinderConfig:
     inlier_px: float
     min_coverage: float
     min_precision: float
+    min_rail_in_frame: float
     agreement_px: float
     zone_visible_min: float
 
@@ -67,7 +68,7 @@ _INT_FIELDS = ("model_points", "hue_halfwidth", "min_saturation", "min_value",
                "candidate_frames", "work_width", "coarse_scale_steps", "coarse_top_k",
                "refine_iterations")
 _FRACTIONS = ("roi_margin_frac", "max_thickness_frac", "min_component_frac", "min_coverage",
-              "min_precision", "zone_visible_min")
+              "min_precision", "min_rail_in_frame", "zone_visible_min")
 
 
 @config_loader
@@ -217,6 +218,202 @@ def build_stadium_model(template: Calibration, image: np.ndarray,
     cal = _calibration_from_doc(_calibration_doc(template))
     return StadiumModel(rail=rail, calibration=cal, source_sha256=digest.hexdigest(),
                         image_size=(int(w), int(h)))
+
+
+# --------------------------------------------------------------------------- fitting
+# Implementation constants (not policy).
+_REF_LONG_EDGE = 1280  # inference px: refinement and scoring run at this long edge
+_COARSE_BLUR = 1.5  # px at work width: widens the coarse basin
+_ECC_BLUR = 3.0  # px at reference width: both rails are blurred into comparable bands
+_DOT_RADIUS = 3  # px at reference width: model points drawn as discs before blurring
+_ECC_EPS = 1e-6
+
+
+@dataclass(frozen=True)
+class StadiumFit:
+    homography: tuple[tuple[float, float, float], ...]  # model (template) px -> frame px
+    coverage: float  # in-frame model rail points within inlier_px of rail evidence
+    precision: float  # rail evidence within reach of the fitted model rail
+    mean_error_px: float  # mean distance (inference px) of in-frame model points to evidence
+    rail_in_frame: float  # share of model rail points that land inside the frame
+
+
+def _rot(theta: float) -> np.ndarray:
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+
+def _project(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    return cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float64), h).reshape(-1, 2)
+
+
+def _blurred(mask: np.ndarray, size: tuple[int, int], sigma: float) -> np.ndarray:
+    small = cv2.resize(mask, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    small = (small > 0).astype(np.float32)
+    return cv2.GaussianBlur(small, (0, 0), sigma)
+
+
+def _coarse_candidates(mask: np.ndarray, model: StadiumModel,
+                       cfg: StadiumFinderConfig) -> list[tuple[float, np.ndarray]]:
+    """Top similarity transforms (score, 3x3 model px -> frame px) by rail overlap."""
+    fh, fw = mask.shape[:2]
+    sf = cfg.work_width / fw
+    ww, wh = cfg.work_width, max(1, round(fh * sf))
+    ev = _blurred(mask, (ww, wh), _COARSE_BLUR)
+    ev /= max(float(ev.max()), 1e-6)
+    pad = ww // 2
+    ev_pad = cv2.copyMakeBorder(ev, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    centre = model.rail.mean(0)
+    base = cfg.work_width / model.image_size[0]
+    rel = model.rail - centre
+    found: list[tuple[float, float, float, np.ndarray]] = []
+    thetas = np.arange(0.0, 360.0, cfg.coarse_rotation_step_deg)
+    scales = np.geomspace(cfg.coarse_scale_min, cfg.coarse_scale_max, cfg.coarse_scale_steps)
+    for deg in thetas:
+        r = _rot(math.radians(deg))
+        for sc in scales:
+            pts = (rel @ r.T) * (sc * base)
+            lo = np.floor(pts.min(0)).astype(int)
+            hi = np.ceil(pts.max(0)).astype(int)
+            tw, th = hi - lo + 1
+            if tw >= ev_pad.shape[1] or th >= ev_pad.shape[0]:
+                continue
+            tpl = np.zeros((th, tw), np.float32)
+            ij = np.round(pts - lo).astype(int)
+            np.add.at(tpl, (ij[:, 1], ij[:, 0]), 1.0)
+            res = cv2.matchTemplate(ev_pad, tpl, cv2.TM_CCORR)
+            _, best, _, loc = cv2.minMaxLoc(res)
+            score = best / len(pts)
+            # model centre lands at (loc - lo) in padded work px
+            cx = (loc[0] - lo[0] - pad) / sf
+            cy = (loc[1] - lo[1] - pad) / sf
+            a = r * (sc * base / sf)
+            h = np.eye(3)
+            h[:2, :2] = a
+            h[:2, 2] = np.array([cx, cy]) - a @ centre
+            found.append((score, deg, sc, h))
+    found.sort(key=lambda t: -t[0])
+    picked: list[tuple[float, np.ndarray]] = []
+    for score, deg, sc, h in found:  # keep distinct directions/scales only
+        if all(abs((deg - d + 180) % 360 - 180) > 2 * cfg.coarse_rotation_step_deg
+               or abs(math.log(sc / s)) > 0.15 for _, d, s, _ in picked):
+            picked.append((score, deg, sc, h))
+        if len(picked) >= cfg.coarse_top_k:
+            break
+    return [(score, h) for score, _, _, h in picked]
+
+
+def _refine(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h0: np.ndarray,
+            cfg: StadiumFinderConfig) -> np.ndarray | None:
+    """ECC-refined homography (model px -> frame px) or None when ECC fails.
+
+    Two passes: the first aligns the whole model rail to all rail evidence; the second keeps
+    only model points that found evidence and evidence within reach of the fitted rail, so an
+    occluded stretch or a green finger next to the rail cannot pull the fit."""
+    h = _ecc(mask_ref, ref_scale, model, h0, model.rail, cfg)
+    if h is None:
+        return None
+    pts = _project(h, model.rail) * ref_scale
+    rh, rw = mask_ref.shape[:2]
+    evidence = mask_ref > 0
+    dt = cv2.distanceTransform((~evidence).astype(np.uint8), cv2.DIST_L2, 5)
+    ij = np.round(pts).astype(int)
+    ok = (ij[:, 0] >= 0) & (ij[:, 0] < rw) & (ij[:, 1] >= 0) & (ij[:, 1] < rh)
+    near = np.zeros(len(pts), bool)
+    near[ok] = dt[ij[ok, 1], ij[ok, 0]] <= 3 * cfg.inlier_px
+    if near.sum() < 0.25 * len(pts):
+        return h
+    reach = np.zeros((rh, rw), np.uint8)
+    for x, y in ij[near]:
+        cv2.circle(reach, (int(x), int(y)), round(3 * cfg.inlier_px), 255, -1)
+    trimmed = np.where(evidence & (reach > 0), 255, 0).astype(np.uint8)
+    h2 = _ecc(trimmed, ref_scale, model, h, model.rail[near], cfg)
+    return h if h2 is None else h2
+
+
+def _ecc(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h0: np.ndarray,
+         rail: np.ndarray, cfg: StadiumFinderConfig) -> np.ndarray | None:
+    m_scale = _REF_LONG_EDGE / max(model.image_size)
+    mw, mh = round(model.image_size[0] * m_scale), round(model.image_size[1] * m_scale)
+    tpl = np.zeros((mh, mw), np.float32)
+    for x, y in rail * m_scale:
+        cv2.circle(tpl, (round(x), round(y)), _DOT_RADIUS, 1.0, -1)
+    tpl = cv2.GaussianBlur(tpl, (0, 0), _ECC_BLUR)
+    inp = cv2.GaussianBlur((mask_ref > 0).astype(np.float32), (0, 0), _ECC_BLUR)
+    s_in = np.diag([ref_scale, ref_scale, 1.0])
+    s_tpl_inv = np.diag([1 / m_scale, 1 / m_scale, 1.0])
+    w3 = s_in @ h0 @ s_tpl_inv
+    w3 /= w3[2, 2]
+    # Affine only: an oval maps to an oval under any homography, so the rail alone cannot fix
+    # the 2 perspective terms; affine plus the notch is fully determined (ledger ruling T3).
+    w = w3[:2].astype(np.float32)
+    crit = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, cfg.refine_iterations, _ECC_EPS)
+    try:
+        _, w = cv2.findTransformECC(tpl, inp, w, cv2.MOTION_AFFINE, crit, None, 5)
+    except cv2.error:
+        return None
+    w3 = np.vstack([w.astype(np.float64), [0.0, 0.0, 1.0]])
+    return np.linalg.inv(s_in) @ w3 @ np.linalg.inv(s_tpl_inv)
+
+
+def _score(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel, h: np.ndarray,
+           cfg: StadiumFinderConfig) -> StadiumFit | None:
+    rh, rw = mask_ref.shape[:2]
+    centre = model.rail.mean(0)
+    # local Jacobian at the rail centre: a mirror (or degenerate) mapping is never accepted
+    eps = 1.0
+    p = _project(h, np.array([centre, centre + [eps, 0], centre + [0, eps]]))
+    jac = np.stack([p[1] - p[0], p[2] - p[0]], 1) / eps
+    if not np.isfinite(jac).all() or np.linalg.det(jac) <= 0:
+        return None
+    pts = _project(h, model.rail) * ref_scale
+    inside = (pts[:, 0] >= 0) & (pts[:, 0] < rw) & (pts[:, 1] >= 0) & (pts[:, 1] < rh)
+    in_frame = float(inside.mean())
+    if inside.sum() == 0:
+        return None
+    evidence = mask_ref > 0
+    dt = cv2.distanceTransform((~evidence).astype(np.uint8), cv2.DIST_L2, 5)
+    ij = np.round(pts[inside]).astype(int)
+    ij[:, 0] = np.clip(ij[:, 0], 0, rw - 1)
+    ij[:, 1] = np.clip(ij[:, 1], 0, rh - 1)
+    d = dt[ij[:, 1], ij[:, 0]]
+    coverage = float((d <= cfg.inlier_px).mean())
+    reach = np.zeros((rh, rw), np.uint8)
+    for x, y in ij:
+        cv2.circle(reach, (int(x), int(y)), round(2 * cfg.inlier_px), 255, -1)
+    n_ev = int(evidence.sum())
+    precision = float((reach[evidence] > 0).sum() / n_ev) if n_ev else 0.0
+    return StadiumFit(homography=tuple(tuple(float(v) for v in row) for row in h),
+                      coverage=coverage, precision=precision,
+                      mean_error_px=float(np.minimum(d, 4 * cfg.inlier_px).mean()),
+                      rail_in_frame=in_frame)
+
+
+def fit_stadium(mask: np.ndarray, model: StadiumModel,
+                cfg: StadiumFinderConfig) -> StadiumFit | None:
+    """Best homography mapping the model rail onto the rail ``mask`` (frame px), or ``None``
+    when no candidate reaches ``min_coverage``, ``min_precision`` and ``min_rail_in_frame``."""
+    if not (mask > 0).any():
+        return None
+    fh, fw = mask.shape[:2]
+    ref_scale = _REF_LONG_EDGE / max(fw, fh)
+    rw, rh = round(fw * ref_scale), round(fh * ref_scale)
+    mask_ref = cv2.resize(mask, (rw, rh), interpolation=cv2.INTER_AREA)
+    mask_ref = np.where(mask_ref > 0, 255, 0).astype(np.uint8)
+    best: StadiumFit | None = None
+    for _, h0 in _coarse_candidates(mask, model, cfg):
+        h = _refine(mask_ref, ref_scale, model, h0, cfg)
+        if h is None:
+            continue
+        fit = _score(mask_ref, ref_scale, model, h, cfg)
+        if fit is None:
+            continue
+        if best is None or fit.coverage * fit.precision > best.coverage * best.precision:
+            best = fit
+    if (best is None or best.coverage < cfg.min_coverage or best.precision < cfg.min_precision
+            or best.rail_in_frame < cfg.min_rail_in_frame):
+        return None
+    return best
 
 
 def save_stadium_model(model: StadiumModel, path: Path) -> None:

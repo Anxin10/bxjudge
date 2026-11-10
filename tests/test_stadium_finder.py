@@ -12,6 +12,7 @@ import yaml
 from bxjudge.stadium_finder import (
     DEFAULT_STADIUM_FINDER_CONFIG,
     build_stadium_model,
+    fit_stadium,
     load_stadium_finder_config,
     load_stadium_model,
     rail_mask,
@@ -151,6 +152,118 @@ def test_build_model_from_synthetic_rail():
     ys = np.clip(np.round(model.rail[:, 1]).astype(int), 0, H - 1)
     assert dist[ys, xs].max() <= 2.0
     assert model.image_size == (W, H)
+
+
+# --------------------------------------------------------------------------- Task 3: fitting
+FIT_ZONES = ("battle_area", "over_left", "over_right", "xtreme")
+
+
+def similarity(rot_deg=0.0, scale=1.0, shift=(0.0, 0.0), centre=(640.0, 360.0), persp=(0.0, 0.0)):
+    """Homography: rotate/scale about ``centre``, then shift, then a slight perspective."""
+    a = math.radians(rot_deg)
+    c, s = math.cos(a) * scale, math.sin(a) * scale
+    cx, cy = centre
+    m = np.array([[c, -s, cx - c * cx + s * cy + shift[0]],
+                  [s, c, cy - s * cx - c * cy + shift[1]],
+                  [0.0, 0.0, 1.0]])
+    p = np.array([[1.0, 0, 0], [0, 1.0, 0], [persp[0], persp[1], 1.0]])
+    # perspective about the centre so the stadium stays in frame
+    t = np.array([[1.0, 0, cx], [0, 1.0, cy], [0, 0, 1.0]])
+    return t @ p @ np.linalg.inv(t) @ m
+
+
+def apply_h(h, pts):
+    pts = np.asarray(pts, np.float64).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(pts, np.asarray(h, np.float64)).reshape(-1, 2)
+
+
+def zone_error(h_found, h_true) -> float:
+    """Mean vertex distance (px) of the zones near the rail warped by two homographies."""
+    cal = synthetic_calibration()
+    errs = [np.linalg.norm(apply_h(h_found, getattr(cal, z)) - apply_h(h_true, getattr(cal, z)), axis=1)
+            for z in FIT_ZONES]
+    return float(np.concatenate(errs).mean())
+
+
+@pytest.fixture(scope="module")
+def synth_model():
+    cfg = load_stadium_finder_config()
+    return cfg, build_stadium_model(synthetic_calibration(), draw_rail(rail_polyline()), cfg)
+
+
+def _frame_for(h, *, cover=None, extra=None):
+    img = draw_rail(apply_h(h, rail_polyline()))
+    if cover is not None:
+        x0, y0, x1, y1 = cover
+        img[y0:y1, x0:x1] = 128
+    if extra is not None:
+        extra(img)
+    return img
+
+
+def test_fit_recovers_known_affine(synth_model):
+    cfg, model = synth_model
+    shear = np.array([[1.0, 0.08, -30.0], [0.0, 0.82, 60.0], [0.0, 0.0, 1.0]])  # tilted view
+    h = similarity(rot_deg=12, scale=0.85, shift=(30, -20)) @ shear
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is not None
+    assert zone_error(fit.homography, h) < 2.0
+    assert fit.coverage >= cfg.min_coverage and fit.precision >= cfg.min_precision
+
+
+def test_slight_perspective_is_approximated(synth_model):
+    # The rail cannot pin perspective (an oval stays an oval); a mild one must stay small.
+    cfg, model = synth_model
+    h = similarity(rot_deg=-6, scale=0.85, persp=(2e-5, -3e-5))
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 6.0
+
+
+@pytest.mark.parametrize("rot", [0, 90, 180, 270])
+def test_rotated_and_mirrored_orientation(synth_model, rot):
+    cfg, model = synth_model
+    h = similarity(rot_deg=rot, scale=0.6)
+    fit = fit_stadium(rail_mask(_frame_for(h), cfg), model, cfg)
+    assert fit is not None
+    assert zone_error(fit.homography, h) < 3.0  # the notch fixes the direction: no 180° flip
+
+
+def test_mirrored_rail_keeps_left_zones_left(synth_model):
+    cfg, model = synth_model
+    img = cv2.flip(_frame_for(similarity(scale=0.9)), 1)
+    fit = fit_stadium(rail_mask(img, cfg), model, cfg)
+    if fit is not None:  # the rail is left/right symmetric; a mirror must never be fitted
+        assert np.linalg.det(np.asarray(fit.homography)[:2, :2]) > 0
+        cal = synthetic_calibration()
+        left = apply_h(fit.homography, cal.over_left).mean(0)[0]
+        right = apply_h(fit.homography, cal.over_right).mean(0)[0]
+        assert left < right
+
+
+def test_partial_rail_still_fits(synth_model):
+    cfg, model = synth_model
+    h = similarity(rot_deg=-8, scale=0.9, shift=(-20, 10))
+    fit = fit_stadium(rail_mask(_frame_for(h, cover=(820, 0, 1280, 720)), cfg), model, cfg)
+    assert fit is not None and zone_error(fit.homography, h) < 4.0
+
+
+def test_green_glove_does_not_shift_fit(synth_model):
+    cfg, model = synth_model
+    h = similarity(rot_deg=5, scale=0.9)
+    bgr = cv2.cvtColor(np.uint8([[[60, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0].tolist()
+
+    def finger(img):  # thin green strokes just inside the rail, like a gloved finger
+        cv2.line(img, (420, 250), (560, 330), bgr, 10)
+        cv2.line(img, (430, 270), (540, 360), bgr, 10)
+
+    fit = fit_stadium(rail_mask(_frame_for(h, extra=finger), cfg), model, cfg)
+    assert fit is None or zone_error(fit.homography, h) < 4.0
+
+
+def test_low_coverage_returns_none(synth_model):
+    cfg, model = synth_model
+    h = similarity(scale=0.9)
+    assert fit_stadium(rail_mask(_frame_for(h, cover=(0, 0, 1020, 720)), cfg), model, cfg) is None
 
 
 def test_model_roundtrip(tmp_path):

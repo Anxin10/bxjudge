@@ -36,12 +36,15 @@ coarse_scale_min: 0.5
 coarse_scale_max: 1.8
 coarse_scale_steps: 12
 coarse_top_k: 5
-refine_iterations: 30
+refine_iterations: 150
 # A model rail point within this distance of rail evidence counts as matched (inference px).
 inlier_px: 6.0
 # Minimum share of model rail points matched, and of rail evidence explained by the model.
 min_coverage: 0.5
 min_precision: 0.5
+# Minimum share of the fitted model rail that lies inside the frame (coverage and precision
+# are measured on the in-frame part, so a rail mostly outside the frame cannot be trusted).
+min_rail_in_frame: 0.5
 # Fits from two candidate frames agree when their zones differ by at most this (inference px).
 agreement_px: 8.0
 # A pocket whose in-frame area share is below this gets zone_out_of_frame@<zone>.
