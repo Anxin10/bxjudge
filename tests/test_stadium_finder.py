@@ -476,6 +476,24 @@ def test_a_steep_but_valid_view_keeps_its_zones():
     assert _zones_valid(model, h, (W, H))
 
 
+def test_a_clearly_better_perspective_fit_wins_over_a_slightly_higher_quality_affine_one():
+    # Codex round 8 High: the affine fit kept pockets 22-61 px off because the accurate
+    # perspective fit scored 0.023 lower on coverage x precision.
+    cfg = load_stadium_finder_config()
+    model = load_stadium_model()
+    h = np.array([[0.694846963212522, -0.2280081270664012, 125.5160533082303],
+                  [0.1934023680784852, 0.5121197390024432, -43.29898558076382],
+                  [0.0001873560199982714, -0.00016531413529259238, 1.0]])
+    img = np.full((H, W, 3), 128, np.uint8)
+    cv2.polylines(img, [np.round(apply_h(h, model.rail)).astype(np.int32)], True, (0, 230, 0), 10)
+    fit = fit_stadium(rail_mask(img, cfg), model, cfg)
+    if fit is not None:
+        for z in ("battle_area", "over_left", "over_right", "xtreme"):
+            got = apply_h(fit.homography, getattr(model.calibration, z))
+            want = apply_h(h, getattr(model.calibration, z))
+            assert np.linalg.norm(got - want, axis=1).mean() < 8.0, z
+
+
 def test_a_vertex_next_to_the_horizon_is_not_hidden_at_the_origin():
     # Codex round 7: perspectiveTransform returns (0, 0) for a tiny denominator, so a vertex
     # thrown 6e9 px away looked in frame.

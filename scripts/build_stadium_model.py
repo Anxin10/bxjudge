@@ -1,6 +1,7 @@
 """Build the canonical stadium model (config/stadium_model.json) from one manual calibration.
 
-Read only on calib/. Usage:
+Read only on calib/: the model and the preview are refused inside calib/ and over the
+template or its reference image (resolved paths, so links cannot reach them). Usage:
     uv run python scripts/build_stadium_model.py [--template calib/20261014_202713.json]
         [--out config/stadium_model.json] [--preview <jpg>]
 """
@@ -22,6 +23,19 @@ from bxjudge.stadium_finder import (
 )
 
 
+def check_targets(targets: list[Path], *, template: Path, reference: Path | None, calib: Path) -> None:
+    """Refuse any write target inside ``calib`` or equal to the template or its reference
+    image, all compared after resolving links."""
+    protected_dir = calib.expanduser().resolve()
+    protected_files = {template.expanduser().resolve()}
+    if reference is not None:
+        protected_files.add(Path(reference).expanduser().resolve())
+    for t in targets:
+        real = t.expanduser().resolve()
+        if real in protected_files or real == protected_dir or protected_dir in real.parents:
+            raise SystemExit(f"{t}: refusing to write over manual calibration data")
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = load_stadium_finder_config()
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -30,7 +44,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, default=DEFAULT_STADIUM_MODEL)
     p.add_argument("--preview", type=Path, default=None)
     a = p.parse_args(argv)
+    targets = [a.out] + ([a.preview] if a.preview else [])
+    calib = PROJECT_ROOT / "calib"
+    check_targets(targets, template=a.template, reference=None, calib=calib)  # before reading
     template = load_calibration(a.template)
+    check_targets(targets, template=a.template, reference=Path(template.ref_frame), calib=calib)
     image = cv2.imread(template.ref_frame, cv2.IMREAD_COLOR)
     if image is None:
         raise SystemExit(f"cannot read reference image {template.ref_frame}")

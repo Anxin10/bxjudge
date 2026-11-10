@@ -525,13 +525,18 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
             if hp is not None:
                 fp = _score(mask_ref, ref_scale, model, hp, cfg)
                 model_scale = _REF_LONG_EDGE / max(model.image_size)
-                # The perspective fit replaces the affine one only when it is acceptable itself:
-                # a better centre-line error must never cost an acceptable result.
+                # An acceptable perspective fit within the limit is compared by the centre-line
+                # error, the continuous measure of how well the rail lines up (coverage x
+                # precision saturates and drifts with stray green). Clearly better: it wins.
+                # About as good but placing the zones elsewhere: the rail cannot tell which
+                # view is right, so this candidate is dropped rather than published.
                 if (fp is not None and _acceptable(fp, cfg)
-                        and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective
-                        and _quality(fp) >= _quality(fit) - _QUALITY_TIE
-                        and fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px):
-                    fit = fp
+                        and _perspective(hp, ref_scale, model_scale) <= cfg.max_perspective):
+                    if fp.mean_error_px <= fit.mean_error_px - cfg.perspective_min_gain_px:
+                        fit = fp
+                    elif (float(np.linalg.norm(_zones(model, fp) - _zones(model, fit), axis=1).mean())
+                          * ref_scale > cfg.agreement_px):
+                        continue
         # Only acceptable candidates compete: a higher-ranked candidate that fails the checks
         # must not crowd out one that passes them.
         if _acceptable(fit, cfg) and (best is None or _rank(fit) > _rank(best)):
