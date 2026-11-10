@@ -474,6 +474,134 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel,
     return best
 
 
+# --------------------------------------------------------------------------- whole video
+VISIBILITY_ZONES = ("stadium", "battle_area", "over_left", "over_right", "xtreme")
+_AGREEMENT_ZONES = ("battle_area", "over_left", "over_right", "xtreme")
+
+
+def zone_visibility(c: Calibration) -> dict[str, float]:
+    """Share of each judged zone's area that lies inside the frame (0.0 for a zone with no
+    area). A pocket outside the frame cannot show a finish, so callers flag it for review."""
+    w, h = c.frame_size
+    out: dict[str, float] = {}
+    for name in VISIBILITY_ZONES:
+        poly = np.array(getattr(c, name), np.float64).reshape(-1, 2)
+        if len(poly) < 3:
+            out[name] = 0.0
+            continue
+        total = abs(cv2.contourArea(poly.astype(np.float32)))
+        if total <= 0.0:
+            out[name] = 0.0
+            continue
+        frame = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float32)
+        inter, _ = cv2.intersectConvexConvex(_convex(poly), frame) if _is_convex(poly) else (
+            _clipped_area(poly, w, h), None)
+        out[name] = float(min(1.0, max(0.0, inter / total)))
+    return out
+
+
+def _is_convex(poly: np.ndarray) -> bool:
+    return bool(cv2.isContourConvex(poly.astype(np.float32).reshape(-1, 1, 2)))
+
+
+def _convex(poly: np.ndarray) -> np.ndarray:
+    return poly.astype(np.float32).reshape(-1, 1, 2)
+
+
+def _clipped_area(poly: np.ndarray, w: int, h: int) -> float:
+    """Area of ``poly`` inside the frame for a non-convex polygon: rasterised on a canvas
+    padded by the polygon's own extent, counted inside the frame."""
+    lo = np.floor(np.minimum(poly.min(0), 0)).astype(int)
+    hi = np.ceil(np.maximum(poly.max(0), [w, h])).astype(int)
+    canvas = np.zeros((hi[1] - lo[1] + 1, hi[0] - lo[0] + 1), np.uint8)
+    cv2.fillPoly(canvas, [np.round(poly - lo).astype(np.int32)], 1)
+    inside = canvas[-lo[1]:-lo[1] + h, -lo[0]:-lo[0] + w]
+    full = float(canvas.sum())
+    total = abs(cv2.contourArea(poly.astype(np.float32)))
+    return float(inside.sum()) / full * total if full else 0.0
+
+
+@dataclass(frozen=True)
+class FoundStadium:
+    calibration: Calibration  # zones in the decoded (inference-size) frame
+    fit: StadiumFit
+    frame_index: int  # source frame index of the chosen frame
+    frame: np.ndarray  # that frame (BGR, inference size)
+    zone_visibility: dict[str, float]
+    agreeing_frames: int  # candidate frames whose zones agree with the chosen one
+
+
+def _zones(model: StadiumModel, fit: StadiumFit) -> np.ndarray:
+    h = np.asarray(fit.homography, np.float64)
+    return np.concatenate([_project(h, np.array(getattr(model.calibration, z), np.float64))
+                           for z in _AGREEMENT_ZONES])
+
+
+def _alignment(fit: StadiumFit, model: StadiumModel, frame_size: tuple[int, int]):
+    """The ``autocalib.Alignment`` ``warp_calibration`` expects; only ``homography`` moves the
+    zones, the other fields describe the mapping at the rail centre."""
+    from bxjudge.autocalib import Alignment
+
+    h = np.asarray(fit.homography, np.float64)
+    centre = model.rail.mean(0)
+    p = _project(h, np.array([centre, centre + [1.0, 0.0], centre + [0.0, 1.0]]))
+    jac = np.stack([p[1] - p[0], p[2] - p[0]], 1)
+    return Alignment(
+        homography=fit.homography,
+        score=min(fit.coverage, fit.precision),
+        shift_frac=float(np.linalg.norm(p[0] - centre) / frame_size[0]),
+        rotation_deg=float(math.degrees(math.atan2(jac[1, 0], jac[0, 0]))),
+        scale=float(math.sqrt(abs(np.linalg.det(jac)))),
+        perspective=float(max(abs(h[2, 0]), abs(h[2, 1]))),
+    )
+
+
+def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
+                 hwaccel: str = "cpu") -> FoundStadium | None:
+    """Stadium zones for ``video`` from its clearest early frames, or ``None``.
+
+    Frames are sampled every ``sample_step_s`` within the first ``sample_window_s`` (playback
+    seconds until the physical time base lands, ledger ruling T4), ranked by rail pixels, and
+    the best ``candidate_frames`` are fitted in that order. A result needs two fits whose zones
+    agree within ``agreement_px`` (inference px); the better-ranked of them is returned. A
+    video without such a pair (no stadium, a moving camera, hands everywhere) gives ``None``."""
+    from bxjudge.autocalib import warp_calibration
+    from bxjudge.manifest import probe
+    from bxjudge.video import VideoDecodeError, iter_frames
+
+    try:
+        fps = probe(Path(video)).fps
+        step = max(1, round(cfg.sample_step_s * fps))
+        samples = []
+        for idx, frame in iter_frames(Path(video), 0.0, cfg.sample_window_s,
+                                      long_edge=_REF_LONG_EDGE, hwaccel=hwaccel):
+            if idx % step == 0:
+                mask = rail_mask(frame, cfg)
+                samples.append((int((mask > 0).sum()), idx, frame, mask))
+    except (VideoDecodeError, ValueError, OSError):
+        return None
+    samples.sort(key=lambda s: (-s[0], s[1]))
+    fits: list[tuple[int, np.ndarray, StadiumFit, np.ndarray]] = []
+    for pixels, idx, frame, mask in samples[:cfg.candidate_frames]:
+        if pixels == 0:
+            break
+        fit = fit_stadium(mask, model, cfg)
+        if fit is None:
+            continue
+        zones = _zones(model, fit)
+        fits.append((idx, frame, fit, zones))
+        agree = [f for f in fits
+                 if float(np.linalg.norm(f[3] - zones, axis=1).mean()) <= cfg.agreement_px]
+        if len(agree) >= 2:
+            idx, frame, fit, _ = max(agree, key=lambda f: _rank(f[2]))
+            fh, fw = frame.shape[:2]
+            cal = warp_calibration(model.calibration, _alignment(fit, model, (fw, fh)), (fw, fh),
+                                   f"found-{Path(video).stem}")
+            return FoundStadium(calibration=cal, fit=fit, frame_index=idx, frame=frame,
+                                zone_visibility=zone_visibility(cal), agreeing_frames=len(agree))
+    return None
+
+
 def save_stadium_model(model: StadiumModel, path: Path) -> None:
     doc = {
         "schema": _MODEL_SCHEMA,

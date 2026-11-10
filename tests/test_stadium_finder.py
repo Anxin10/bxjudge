@@ -12,7 +12,9 @@ import yaml
 from bxjudge.stadium_finder import (
     DEFAULT_STADIUM_FINDER_CONFIG,
     build_stadium_model,
+    find_stadium,
     fit_stadium,
+    zone_visibility,
     load_stadium_finder_config,
     load_stadium_model,
     rail_mask,
@@ -298,6 +300,70 @@ def test_low_coverage_returns_none(synth_model):
     cfg, model = synth_model
     h = similarity(scale=0.9)
     assert fit_stadium(rail_mask(_frame_for(h, cover=(0, 0, 1020, 720)), cfg), model, cfg) is None
+
+
+# --------------------------------------------------------------------------- Task 4: video
+def write_video(path: Path, frames, fps: int = 30) -> Path:
+    out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    for f in frames:
+        out.write(f)
+    out.release()
+    return path
+
+
+def test_finds_stadium_in_a_steady_video(tmp_path, synth_model):
+    cfg, model = synth_model
+    h = similarity(rot_deg=6, scale=0.85, shift=(20, 10))
+    clip = write_video(tmp_path / "steady.mp4", [_frame_for(h)] * 60)
+    found = find_stadium(clip, model, cfg)
+    assert found is not None and found.agreeing_frames >= 2
+    assert found.calibration.frame_size == (W, H)
+    assert zone_error(found.fit.homography, h) < 4.0
+    assert found.zone_visibility["battle_area"] == pytest.approx(1.0)
+
+
+def test_skips_occluded_frames(tmp_path, synth_model):
+    cfg, model = synth_model
+    h = similarity(rot_deg=-4, scale=0.9)
+    hidden = _frame_for(h, cover=(0, 0, 1000, 720))  # hands over most of the rail at launch
+    clip = write_video(tmp_path / "occluded.mp4", [hidden] * 45 + [_frame_for(h)] * 45)
+    found = find_stadium(clip, model, cfg)
+    assert found is not None and found.frame_index >= 45
+    assert zone_error(found.fit.homography, h) < 4.0
+
+
+@pytest.mark.parametrize("value", [0, 128])
+def test_no_stadium_returns_none(tmp_path, synth_model, value):
+    cfg, model = synth_model
+    blank = np.full((H, W, 3), value, np.uint8)
+    assert find_stadium(write_video(tmp_path / f"blank{value}.mp4", [blank] * 30), model, cfg) is None
+
+
+def test_disagreeing_frames_return_none(tmp_path, synth_model):
+    # A camera panning through the whole window: no two sampled frames show the same stadium.
+    cfg, model = synth_model
+    frames = [_frame_for(similarity(scale=0.8, shift=(-150 + 5 * i, 0))) for i in range(60)]
+    assert find_stadium(write_video(tmp_path / "pan.mp4", frames), model, cfg) is None
+
+
+# --------------------------------------------------------------------------- Task 5: visibility
+def test_zone_visibility_out_of_frame():
+    cal = synthetic_calibration()
+    x0, y0 = cal.xtreme[0]
+    x1, y1 = cal.xtreme[2]
+    half = (x1 - x0) / 2
+    moved = [(x + (W - x0 - half), y) for x, y in cal.xtreme]  # half of xtreme past the right edge
+    from dataclasses import replace
+    vis = zone_visibility(replace(cal, xtreme=moved))
+    assert vis["xtreme"] == pytest.approx(0.5, abs=0.02)
+    assert vis["battle_area"] == pytest.approx(1.0) and vis["over_left"] == pytest.approx(1.0)
+    assert set(vis) == {"stadium", "battle_area", "over_left", "over_right", "xtreme"}
+
+
+def test_zone_visibility_degenerate():
+    from dataclasses import replace
+    cal = replace(synthetic_calibration(), over_left=[(10.0, 10.0), (10.0, 10.0), (10.0, 10.0)])
+    assert zone_visibility(cal)["over_left"] == 0.0
 
 
 def test_model_roundtrip(tmp_path):
