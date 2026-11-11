@@ -817,7 +817,22 @@ def test_case_variant_video_artifact_collision_fails_preflight(tmp_path):
 def _vlm_config(tmp_path, **change):
     import yaml
 
-    raw = yaml.safe_load(Path("config/vlm.yaml").read_text(encoding="utf-8"))
+    raw = {
+        "host": "http://127.0.0.1:11435",
+        "model": "fixture-primary:1b",
+        "fallback": "fixture-fallback:1b",
+        "after_run": True,
+        "timeout_s": 10,
+        "preflight_timeout_s": 1,
+        "keep_alive": 0,
+        "think": False,
+        "num_ctx": 1024,
+        "num_predict": 128,
+        "temperature": None,
+        "event_window_s": 1,
+        "frames": 8,
+        "image_long_edge": 768,
+    }
     raw.update(change)
     path = tmp_path / "vlm.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -899,7 +914,7 @@ def test_vlm_phase_runs_after_detector_is_released(tmp_path, monkeypatch):
     )
     [(out_dir, kw)] = phases
     assert out_dir == out and kw["videos"] == {"a.mp4"}
-    assert "calib_dir" not in kw and kw["config"].model == "qwen3.8:27b"
+    assert "calib_dir" not in kw and kw["config"].model == "fixture-primary:1b"
 
 
 def test_detector_freed_then_gpu_cache_released_before_first_vlm_work(
