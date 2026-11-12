@@ -661,3 +661,156 @@ def test_bad_reference_does_not_remove_human_review_controls(tmp_path,monkeypatc
     assert not at.exception,at.exception
     widget(at.button,"確認無誤")
     assert at.warning
+
+
+# ---- handheld camera outcomes (plan 2026-11-12-dynamic-calibration, Task 7) -----------
+
+
+@pytest.mark.parametrize("reason, needle", [
+    ("handheld_requires_dynamic_calibration", "--dynamic-calibration"),
+    ("handheld_reference_unlocated", "bxjudge calibrate"),
+])
+def test_repair_steps_explain_handheld_reasons(tmp_path, reason, needle):
+    steps = review_ui.repair_steps(row(review_reasons=["recalibrate", reason]),
+                                   Path("/v/a.mp4"), tmp_path)
+    assert any("手持" in s for s in steps)
+    assert any(needle in s for s in steps)
+    # The generic recalibrate explanation (first-second frame vs calib/) does not apply.
+    assert not any("第一秒" in s for s in steps)
+
+
+def test_camera_handheld_note_is_labelled():
+    assert review_ui.reason_text("camera_handheld") == "`camera_handheld`（手持鏡頭：發射觸碰無法判定）"
+    assert "觸碰" in review_ui.reason_text("stadium_motion_unknown@camera_handheld")
+    assert "xtreme" in review_ui.reason_text("zone_out_of_frame@xtreme")
+    assert review_ui.reason_text("X_stop_still") == "`X_stop_still`"  # unlabelled: code only
+
+
+def test_geometry_gaps_merge_consecutive_unknown_frames():
+    def s(frame, status, reason=None, aligned=False):
+        return {"frame": frame, "status": status, "rejection_reason": reason,
+                "alignment": {"homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]} if aligned
+                else None}
+
+    samples = [s(0, "lost", "x"), s(1, "tracking", aligned=True), s(2, "tracking", aligned=True),
+               s(3, "invalidated", "refind_disagreement"), s(4, "invalidated"),
+               s(5, "unconfirmed"), s(6, "refound", aligned=True), s(7, "tracking", aligned=True),
+               s(8, "tracking", aligned=True), s(9, "lost", "frame_features_missing"),
+               s(10, "tracking", aligned=True), s(11, "lost")]
+    assert review_ui.geometry_gaps(samples, 1, 10) == [
+        {"start": 3, "end": 5, "status": "invalidated", "reason": "refind_disagreement"},
+        {"start": 9, "end": 9, "status": "lost", "reason": "frame_features_missing"},
+    ]
+    assert review_ui.geometry_gaps(samples, 4, 4) == [
+        {"start": 4, "end": 4, "status": "invalidated", "reason": None}]
+    bridged = [s(0, "tracking", aligned=True), {**s(1, "bridged", aligned=True)}]
+    assert review_ui.geometry_gaps(bridged, 0, 1) == [
+        {"start": 1, "end": 1, "status": "bridged", "reason": None}]
+
+
+def test_round_geometry_gaps_read_the_recorded_evidence(tmp_path):
+    from bxjudge.dynamic_calibration import save_geometry
+
+    samples = [{"frame": f, "status": "tracking" if f < 40 else "unconfirmed",
+                "rejection_reason": None if f < 40 else "follower_lost",
+                "alignment": {"homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]} if f < 40
+                else None} for f in range(90)]
+    evidence = save_geometry(tmp_path, "v.mp4", {
+        "schema": 1, "coordinate_mapping": "reference_to_source", "calibration_id": "abc",
+        "source": "/videos/v.mp4", "samples": samples})
+    r = row(video="v.mp4", calibration_id="abc", geometry_evidence=evidence, t_launch=1.0,
+            t_end=2.0, motion_evidence={"fps": 30})
+    assert review_ui.round_geometry_gaps(tmp_path, r) == [
+        {"start": 40, "end": 60, "status": "unconfirmed", "reason": "follower_lost"}]
+    assert review_ui.round_geometry_gaps(tmp_path, row()) == []  # no dynamic geometry
+    path = tmp_path / evidence["path"]
+    path.write_text(path.read_text() + " ")
+    with pytest.raises(ValueError, match="SHA256"):
+        review_ui.round_geometry_gaps(tmp_path, r)
+
+
+def _gap_evidence(tmp_path, **overrides):
+    from bxjudge.dynamic_calibration import save_geometry
+
+    samples = [{"frame": f, "status": "tracking" if f < 40 else "lost",
+                "rejection_reason": None,
+                "alignment": {"homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]} if f < 40
+                else None} for f in range(90)]
+    record = {"schema": 1, "coordinate_mapping": "reference_to_source", "calibration_id": "abc",
+              "source": "/videos/20261101/a.mp4", "samples": samples, **overrides}
+    return save_geometry(tmp_path, "a.mp4", record)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"samples": None},
+    {"samples": [None]},
+    {"samples": [{"frame": "x", "status": "lost", "alignment": None}]},
+    {"schema": 2},
+    {"coordinate_mapping": "source_to_reference"},
+    {"calibration_id": "other"},  # another snapshot's evidence
+    {"source": "/videos/20261101/b.mp4"},  # another video's evidence
+])
+def test_round_geometry_gaps_refuse_evidence_of_another_round_or_shape(tmp_path, overrides):
+    evidence = _gap_evidence(tmp_path, **overrides)
+    r = row(video="a.mp4", calibration_id="abc", geometry_evidence=evidence, t_launch=1.0,
+            t_end=2.0, motion_evidence={"fps": 30})
+    with pytest.raises(ValueError):
+        review_ui.round_geometry_gaps(tmp_path, r)
+
+
+def test_round_geometry_gaps_accept_the_rounds_own_evidence(tmp_path):
+    evidence = _gap_evidence(tmp_path)
+    r = row(video="a.mp4", calibration_id="abc", geometry_evidence=evidence, t_launch=1.0,
+            t_end=2.0, motion_evidence={"fps": 30})
+    assert review_ui.round_geometry_gaps(tmp_path, r) == [
+        {"start": 40, "end": 60, "status": "lost", "reason": None}]
+
+
+def _with_geometry(batch, samples, *, source_sha=None):
+    """Give round a.mp4::1 dynamic geometry evidence of its readable source video."""
+    from bxjudge.dynamic_calibration import save_geometry
+    from bxjudge.trajectory_video import _source_hash
+
+    path = batch / "rounds.json"
+    rows = json.loads(path.read_text())
+    source = batch.parent / "a.mp4"
+    record = {"schema": 1, "coordinate_mapping": "reference_to_source", "calibration_id": None,
+              "source": str(source), "reference_size": [320, 180],
+              "source_sha256": source_sha or _source_hash(source), "samples": samples}
+    rows[0]["geometry_evidence"] = save_geometry(batch, "a.mp4", record)
+    rows[0]["motion_evidence"] = {"fps": 30, "displacements": {}, "window": [0, 0]}
+    rows[0]["t_end"] = 2.0
+    path.write_text(json.dumps(rows))
+
+
+def _gap_samples():
+    return [{"frame": f, "status": "tracking" if f < 45 else "lost",
+             "rejection_reason": None if f < 45 else "follower_lost",
+             "alignment": {"homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "score": 1.0,
+                           "shift_frac": 0.0, "rotation_deg": 0.0, "scale": 1.0,
+                           "perspective": 0.0} if f < 45 else None}
+            for f in range(90)]
+
+
+def test_app_survives_malformed_geometry_evidence_of_a_readable_video(batch):
+    _with_geometry(batch, None)
+    at = pick(app().run(), "a.mp4::1")
+    assert not at.exception, at.exception
+    assert any("幾何證據" in w.value for w in at.warning)
+    widget(at.button, "儲存修正")
+
+
+def test_app_lists_the_unknown_geometry_spans_of_the_round(batch):
+    _with_geometry(batch, _gap_samples())
+    at = pick(app().run(), "a.mp4::1")
+    assert not at.exception, at.exception
+    text = " ".join(m.value for m in at.markdown)
+    assert "場地區域未知的區間" in text and "第 45–60 格" in text and "follower_lost" in text
+
+
+def test_app_hides_unknown_spans_of_evidence_for_a_changed_video(batch):
+    _with_geometry(batch, _gap_samples(), source_sha="0" * 64)
+    at = pick(app().run(), "a.mp4::1")
+    assert not at.exception, at.exception
+    assert "場地區域未知的區間" not in " ".join(m.value for m in at.markdown)
+    assert any("source mismatch" in w.value for w in at.warning)

@@ -187,7 +187,21 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
     )
     reasons = row.get("review_reasons") or []
     steps = []
-    if "recalibrate" in reasons:
+    if "handheld_requires_dynamic_calibration" in reasons:
+        steps += [
+            "這支影片判為手持鏡頭；手持模式要定期重找場地，需要開啟動態校準。",
+            (f"加上動態校準重跑：`bxjudge run {folder} --out {results_dir} "
+             "--stadium-keypoints --dynamic-calibration config/dynamic_calibration.yaml`"),
+            ("若其實是固定機位（腳架），在 config/camera_mode.yaml 的 overrides.videos "
+             "把這支影片設為 fixed 後重跑。"),
+        ]
+    elif "handheld_reference_unlocated" in reasons:
+        steps += [
+            "這支影片判為手持鏡頭，但參考畫面上找不到場地關鍵點，無法定期重找場地。",
+            ("確認影片開頭拍到完整場地；或為這個鏡頭人工校準："
+             f"`bxjudge calibrate {video} --name <新校準名稱> --out calib`"),
+        ]
+    elif "recalibrate" in reasons:
         steps += [
             ("影片第一秒的畫面與 calib/ 內所有校準都不相符，也無法自動對齊（鏡頭或場地位置"
              "改變；或此機位的自動校準已被否決）。"),
@@ -209,6 +223,90 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
             "查看 `bxjudge run` 的紀錄中 `analysis failed for` 那一段的錯誤訊息並修正原因。",
         ]
     return [*steps, rerun]
+
+
+# Plain-language labels for review reasons added by the dynamic calibration plan
+# (2026-11-12); any other reason is shown by its code alone.
+_REASON_LABELS = {
+    "camera_handheld": "手持鏡頭：發射觸碰無法判定",
+    "stadium_motion_unknown@camera_handheld": "手持鏡頭：盤面位移無法量測，觸碰不確定",
+    "handheld_requires_dynamic_calibration": "手持鏡頭需要動態校準",
+    "handheld_reference_unlocated": "手持鏡頭：參考畫面找不到場地",
+}
+
+
+def reason_text(reason: str) -> str:
+    """``reason`` as shown in review: its code, plus a plain-language label when known."""
+    label = _REASON_LABELS.get(reason)
+    if label is None and reason.startswith("zone_out_of_frame@"):
+        zone = reason.split("@", 1)[1]
+        label = f"{zone} 袋區大部分在畫面外：涉及此袋區的終結需人工確認"
+    return f"`{reason}`（{label}）" if label else f"`{reason}`"
+
+
+def geometry_gaps(samples: list[dict], first: int, last: int) -> list[dict]:
+    """Runs of frames in ``[first, last]`` without judging geometry (alignment ``None``, or a
+    ``bridged`` frame, which is never judging evidence) in recorded geometry ``samples``
+    (``DynamicCalibration``/``HandheldCalibration`` ``record()`` format), as
+    ``{"start", "end", "status", "reason"}``; status and reason are the run's first frame's."""
+    gaps: list[dict] = []
+    for sample in sorted(samples, key=lambda x: x["frame"]):
+        f = sample["frame"]
+        if not first <= f <= last:
+            continue
+        if sample["alignment"] is not None and sample["status"] != "bridged":
+            continue
+        if gaps and gaps[-1]["end"] == f - 1:
+            gaps[-1]["end"] = f
+        else:
+            gaps.append({"start": f, "end": f, "status": sample["status"],
+                         "reason": sample.get("rejection_reason")})
+    return gaps
+
+
+def round_geometry_gaps(out_dir: Path, row: dict, source_sha256: str | None = None) -> list[dict]:
+    """``geometry_gaps`` of ``row``'s round from its recorded geometry evidence (``[]``
+    without dynamic geometry). The evidence must match its recorded SHA-256, be the
+    ``reference_to_source`` schema 1 record of this row's video and calibration, and have
+    well-formed samples; anything else is a ``ValueError`` (the page warns, never crashes).
+    Rounds are closed frame ranges: ``t_launch``/``t_end`` are frame / fps. With
+    ``source_sha256`` (the readable source video's hash) the evidence must be of that file."""
+    import hashlib
+
+    evidence = row.get("geometry_evidence")
+    if not evidence:
+        return []
+    root = (Path(out_dir) / "geometry").resolve()
+    path = (Path(out_dir) / evidence["path"]).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("geometry evidence path outside result geometry folder")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != evidence["sha256"]:
+        raise ValueError("geometry evidence SHA256 mismatch")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"geometry evidence is not JSON ({e})") from None
+    if (not isinstance(data, dict) or data.get("schema") != 1
+            or data.get("coordinate_mapping") != "reference_to_source"):
+        raise ValueError("invalid geometry evidence schema")
+    if data.get("calibration_id") != row.get("calibration_id"):
+        raise ValueError("geometry evidence belongs to another calibration")
+    source = data.get("source")
+    if not isinstance(source, str) or Path(source).name != Path(str(row.get("video"))).name:
+        raise ValueError("geometry evidence belongs to another video")
+    if source_sha256 is not None and data.get("source_sha256") != source_sha256:
+        raise ValueError("geometry evidence source mismatch (the video changed)")
+    samples = data.get("samples")
+    if not isinstance(samples, list) or not all(
+            isinstance(x, dict) and type(x.get("frame")) is int
+            and isinstance(x.get("status"), str) and "alignment" in x for x in samples):
+        raise ValueError("invalid geometry evidence samples")
+    fps = (row.get("motion_evidence") or {}).get("fps")
+    if not fps:
+        return []
+    first, last = round(row["t_launch"] * fps), round(row["t_end"] * fps)
+    return geometry_gaps(samples, first, last)
 
 
 def _video_calibration_record(

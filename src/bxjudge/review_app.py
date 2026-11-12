@@ -123,7 +123,7 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
             from bxjudge.dynamic_calibration import read_geometry
             from bxjudge.trajectory_video import _source_hash
             try:geometry_record=read_geometry(out,row,_source_hash(source))
-            except (ValueError,OSError,KeyError) as error:
+            except (ValueError,OSError,KeyError,TypeError) as error:
                 st.warning(f'動態幾何證據無法驗證：{error}')
                 calibration=None  # never silently draw fixed zones on a dynamic judgment
         cols = st.columns(2)
@@ -173,7 +173,8 @@ def _evidence(row: dict, source, out: Path, a: argparse.Namespace, rules,
             st.info(f"此回合沒有靜態軌跡圖（{png}）。")
 
 
-def _judgment(row: dict, rows: list[dict], rules, vetoed: set[str]) -> None:
+def _judgment(row: dict, rows: list[dict], rules, vetoed: set[str], out: Path,
+              source: Path | str) -> None:
     eff = effective(row)
     flagged = "需覆核" if row.get("needs_review") else "不需覆核"
     human = "已完成" if row.get("reviewed") else "尚未"
@@ -183,7 +184,23 @@ def _judgment(row: dict, rows: list[dict], rules, vetoed: set[str]) -> None:
     st.markdown(f"**人工覆核：{human}**")
     st.markdown("**覆核原因（review_reasons）**")
     reasons = row.get("review_reasons") or []
-    st.markdown("\n".join(f"- `{r}`" for r in reasons) if reasons else "（無）")
+    st.markdown("\n".join(f"- {ui.reason_text(r)}" for r in reasons) if reasons else "（無）")
+    try:
+        source_sha = None
+        if not isinstance(source, str) and row.get("geometry_evidence") is not None:
+            from bxjudge.trajectory_video import _source_hash
+
+            source_sha = _source_hash(source)
+        gaps = ui.round_geometry_gaps(out, row, source_sha)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        st.warning(f"無法讀取場地幾何證據：{e}")
+        gaps = []
+    if gaps:
+        st.markdown("**場地區域未知的區間（這些格不用來判定）**")
+        st.markdown("\n".join(
+            f"- 第 {g['start']}–{g['end']} 格：`{g['status']}`"
+            + (f"（{g['reason']}）" if g["reason"] else "")
+            for g in gaps))
     st.markdown("**VLM 第二意見（僅供參考，不改判）**")
     st.info(row.get("vlm_note") or "（無）")
     points = finish_points(rules, eff["finish"]) if eff["finish"] else 0
@@ -377,7 +394,7 @@ def main() -> None:
     with left:
         _evidence(row, source, out, a, rules, autocalib)
     with right:
-        _judgment(row, rows, rules, vetoed)
+        _judgment(row, rows, rules, vetoed, out, source)
         _form(row, out, rules)
         history = [
             {
