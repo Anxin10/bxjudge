@@ -1,0 +1,14 @@
+# Capture and nominal playback rates must agree with the file metadata.
+batches:
+  "20261001": {capture_fps: 240, playback_fps: 30}
+  "20261014": {capture_fps: 120, playback_fps: 120}
+  "20261024": {capture_fps: 120, playback_fps: 120}
+  "20261101": {capture_fps: 120, playback_fps: 120}
+  "20261108": {capture_fps: 120, playback_fps: 120}
+anomalies:
+  timestamp_gap_ratio: 3
+  noise_percentile: 10
+  freeze_noise_ratio: 0.25
+  min_freeze_transitions: 4
+  content_jump_ratio: 6
+  analysis_long_edge: 160

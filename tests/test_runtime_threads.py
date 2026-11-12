@@ -62,6 +62,13 @@ def test_thread_budget_applied_after_model_load_before_analysis(
         },
     )
     monkeypatch.setattr(pipeline, "load_detector", load)
+    from bxjudge.timebase import Timeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "probe_timeline",
+        lambda *_: Timeline(tuple(i / 30 for i in range(30)), 240, 30),
+    )
     monkeypatch.setattr(pipeline.cv2, "setNumThreads", set_threads)
     monkeypatch.setattr(pipeline.cv2, "getNumThreads", lambda: threads["value"])
     monkeypatch.setattr(pipeline, "judge_video", judge)

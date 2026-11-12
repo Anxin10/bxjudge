@@ -144,12 +144,17 @@ def _endpoint_motion(ordered, frames, *, tail):
     return tuple(map(float, velocity)), list(map(int, indices))
 
 
+def launch_sample_count(playback_seconds: float, avg_fps: float) -> int:
+    """Minimum consecutive samples for a launch hold or separation."""
+    return max(2, math.ceil(playback_seconds * avg_fps - 1e-9))
+
+
 def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("fps must be positive finite")
     side_hints = dict(side_hints or {})
-    held_n = max(2, math.ceil(policy["held_s"] * fps))
-    free_n = max(2, math.ceil(policy["separation_s"] * fps))
+    held_n = launch_sample_count(policy["held_s"], fps)
+    free_n = launch_sample_count(policy["separation_s"], fps)
     bodies = {}
     for t in tracks:
         if t.cls == "launcher":

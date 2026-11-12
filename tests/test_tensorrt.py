@@ -272,6 +272,13 @@ def test_pipeline_records_exact_backend_evidence(artifact, tmp_path, monkeypatch
         )
 
     monkeypatch.setattr(pipeline, "judge_video", judge)
+    from bxjudge.timebase import Timeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "probe_timeline",
+        lambda *_: Timeline(tuple(i / 60 for i in range(6)), 120, 60),
+    )
     output = tmp_path / "output"
     pipeline.run_batch(videos, calib, output, selection=selection, trt_manifest=path)
     rounds = json.loads((output / "rounds.json").read_text())

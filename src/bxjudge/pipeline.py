@@ -13,7 +13,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
@@ -52,7 +52,7 @@ from .finish import (
 )
 from .identity import anchor_sides, inherited_sides, load_identity_policy
 from .launch_check import analyze_launch
-from .launch_phase import load_launch_policy, prepare_launch_tracks
+from .launch_phase import launch_sample_count, load_launch_policy, prepare_launch_tracks
 from .manifest import (
     VideoInfo,
     forget_processed,
@@ -77,6 +77,12 @@ from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
 from .stadium_motion import RAW_MOTION_WORKERS, iter_stadium_displacement
 from .temporal_geometry import load_temporal_policy
+from .timebase import (
+    JudgmentTime,
+    load_physical_time,
+    load_video_sources,
+    probe_timeline,
+)
 from .track import track_frames
 from .trajectory_video import load_video_policy
 from .two_bey_integration import appearance_descriptor, reconstruct_round_tracks
@@ -84,6 +90,7 @@ from .two_bey_tracking import identity_unknown_at
 from .two_bey_tracking import load_policy as load_two_bey_policy
 from .types import RoundResult, Track
 from .video import VideoDecodeError, iter_frames, prefetched
+from .video_anomalies import AnomalyPolicy, ImageChanges, annotate_round
 from .vlm import load_vlm_config, review_results_dir
 
 log = logging.getLogger(__name__)
@@ -172,6 +179,8 @@ def judge_video(
     two_bey_config: Path | None = None,
     on_snapshot: Callable[[Snapshot | None], None] | None = None,
     vetoed: set[str] | frozenset[str] = frozenset(),
+    timing: JudgmentTime | None = None,
+    anomaly_policy: AnomalyPolicy | None = None,
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
@@ -188,13 +197,23 @@ def judge_video(
     """
     if two_bey_config is not None and dynamic_config is None:
         raise ValueError('two-bey tracking requires dynamic calibration')
-    two_policy=load_two_bey_policy(two_bey_config) if two_bey_config is not None else None
+    values = timing.values if timing is not None else {}
+
+    def converted(policy):
+        return {key: values.get(key, value) for key, value in policy.items()}
+
+    if values:
+        th = replace(th, **{key: values[key] for key in asdict(th).keys() & values.keys()})
+    two_policy = (
+        converted(load_two_bey_policy(two_bey_config)) if two_bey_config is not None else None
+    )
     evidence_confidence = load_policy(detection_config)["confidence"]
     source_before = None
     if dynamic_config is not None:
         with info.path.open("rb") as f:
             source_before = hashlib.file_digest(f, "sha256").hexdigest()
     cancelled = Event()
+    changes = ImageChanges(anomaly_policy) if timing and anomaly_policy else None
     try:
         with closing(
             iter_frames(
@@ -238,7 +257,8 @@ def judge_video(
                     cv2.imread(snap.calibration.ref_frame),
                     info.fps,
                     load_video_policy()["stadium_follow"],
-                    load_dynamic_policy(dynamic_config),
+                    converted(load_dynamic_policy(dynamic_config)),
+                    **({"temporal_policy": converted(load_temporal_policy())} if timing else {}),
                 )
             disp = {}
             crops = {}
@@ -253,6 +273,8 @@ def judge_video(
                 try:
                     for f, image, displacement in displacements:
                         disp[f] = displacement
+                        if changes is not None:
+                            changes.observe(f, image)
                         yield f, image
                 finally:
                     displacements.close()
@@ -295,17 +317,21 @@ def judge_video(
                     (lambda image, f: frame_detections.pop(f)) if geometry is not None else detecting,
                     info.fps, config=detection_config
                 )
+        if timing and len(disp) != len(timing.timeline.pts_s):
+            raise ValueError(f"{info.path}: decoded frame count does not match PTS count")
+        anomalies = changes.events(timing.timeline) if changes is not None else []
         phase = None
         native_tracks=list(tracks)
         side_hints = {}
         geometry_evidence = None
         if geometry is not None:
-            phase_policy = load_launch_policy()
+            phase_policy = converted(load_launch_policy())
             anchors = anchor_sides(
                 tracks, normalize_tracks(tracks, geometry.samples), c,
-                required_frames=max(2, math.ceil(phase_policy["held_s"] * info.fps)),
+                required_frames=launch_sample_count(phase_policy["held_s"], info.fps),
                 body_margin_px=phase_policy["body_margin_px"],
                 fps=info.fps,
+                **({"policy": converted(load_identity_policy())} if timing else {}),
             )
             phase = prepare_launch_tracks(
                 tracks, info.fps, phase_policy, side_hints=anchors.sides
@@ -412,6 +438,8 @@ def judge_video(
                 r=RoundResult(info.path.name,number,start/info.fps,end/info.fps,None,None,None,0,0.,True,
                     ['two_bey_tracking_requires_review','two_bey_singleton_segment','two_bey_unassigned_identity_unknown',*calibration_notes])
                 r.geometry_evidence=geometry_evidence
+                if timing:
+                    annotate_round(r, timing.timeline, anomalies, start, end)
                 results.append(r)
                 write_trajectory(out_dir,r,{},[],c,info.fps,
                     {'landing_X':None,'landing_B':None,'air_collision':None,'finish':None},
@@ -618,6 +646,17 @@ def judge_video(
                 },
                 "impact_frames": sorted(analysis.impacts),
             }
+            if timing:
+                stop_windows = [
+                    (
+                        side,
+                        kind,
+                        stops[side],
+                        stops[side] + (th.still_frames if kind == "still" else th.reverse_frames) - 1,
+                    )
+                    for side, kind in stop_kinds.items()
+                ]
+                annotate_round(r, timing.timeline, anomalies, start, end, stop_windows)
             results.append(r)
             write_trajectory(
                 out_dir,
@@ -867,10 +906,15 @@ def run_batch(
     if vlm is not None and not vlm.after_run:
         vlm = None
     provenance = None
+    source_policy = physical_policy = anomaly_policy = None
     if trt_manifest is not None and detector is not None:
         raise ValueError("trt_manifest cannot be combined with an injected detector")
     if detector is None:
         provenance = _load_selection(Path(selection).expanduser(), th)
+        if not provenance["dataset"]["provenance"].get("synthetic", False):
+            source_policy = load_video_sources()
+            physical_policy = load_physical_time()
+            anomaly_policy = AnomalyPolicy(**source_policy["anomalies"])
         provenance["runtime"] = {
             "detection_config": str(Path(detection_config).resolve()),
             "thresholds_path": None
@@ -883,6 +927,8 @@ def run_batch(
             "device": policy["device"],
             "thresholds": asdict(th),
             "rules": asdict(rules),
+            "physical_time": physical_policy,
+            "video_sources": source_policy,
         }
         backend_options = {} if trt_manifest is None else {"trt_manifest": trt_manifest}
         detector = load_detector(
@@ -924,6 +970,12 @@ def run_batch(
             }
         if provenance is not None:
             provenance["dynamic_calibration"] = dynamic_signature
+    if source_policy is not None:
+        dynamic_signature = {
+            **(dynamic_signature or {}),
+            "physical_time": physical_policy,
+            "video_sources": source_policy,
+        }
     video_records_path = out_dir / "videos.json"
     video_records = (
         json.loads(video_records_path.read_text())
@@ -1082,6 +1134,14 @@ def run_batch(
         if info is None:
             results = _provenance([_review(path.name, 0.0, "decode_error")], provenance)
         else:
+            timing_options = {}
+            if source_policy is not None:
+                # Reject missing or conflicting capture metadata before judging.
+                timeline = probe_timeline(info.path, source_policy)
+                timing_options = {
+                    "timing": JudgmentTime(timeline, **physical_policy),
+                    "anomaly_policy": anomaly_policy,
+                }
             try:
                 results = judge_video(
                     info,
@@ -1101,6 +1161,7 @@ def run_batch(
                         else {}
                     ),
                     **preselected,
+                    **timing_options,
                     **({'two_bey_config':two_bey_config} if two_bey_config is not None else {}),
                 )
             except Exception:

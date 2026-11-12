@@ -1,0 +1,42 @@
+# Physical milliseconds; *_frames stores N sample periods at 240 FPS.
+# Seconds-based settings retain their original comparison and rounding rule.
+durations_ms:
+  air_collision_frames: 8.333333333333334
+  bridge_s: 25.0
+  burst_part_overlap_s: 12.5
+  burst_part_window_s: 37.5
+  context_wait_s: 93.75
+  held_s: 25.0
+  id_swap_overlap_frames: 12.5
+  impact_coincide_frames: 12.5
+  launch_missing_landing_s: 375.0
+  launch_post_s: 62.5
+  launch_pre_s: 62.5
+  link_gap_s: 15.0
+  link_velocity_frames: 20.833333333333332
+  max_chain_s: 125.0
+  merge_observation_max_gap_s: 18.75
+  pair_confirmation_frames: 8.333333333333334
+  pocket_confirm_s: 62.5
+  reacquire_confirm_frames: 20.833333333333332
+  reacquire_min_gap_s: 125.0
+  reanchor_motion_max_gap_s: 25.0
+  reanchor_s: 62.5
+  reject_s: 62.5
+  resume_frames: 12.5
+  retry_s: 62.5
+  reverse_frames: 25.0
+  round_gap_s: 250.0
+  separation_s: 12.5
+  settle_frames: 25.0
+  simultaneous_stop_frames: 12.5
+  spin_dir_window_s: 250.0
+  still_frames: 125.0
+rates_per_s:
+  abrupt_min_speed_px: 360
+  fall_speed_px: 1440
+  link_min_speed_px_s: 120
+  link_velocity_error_px_s: 960
+  reverse_max_move_px: 720
+  reverse_max_rate_deg: 4800
+  still_px: 360

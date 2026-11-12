@@ -112,8 +112,10 @@ def anchor_sides(
     body_margin_px: float,
     fps: float,
     config: Path = DEFAULT_IDENTITY_CONFIG,
+    policy: dict | None = None,
 ) -> IdentityAnchors:
-    policy = load_identity_policy(config)
+    if policy is None:
+        policy = load_identity_policy(config)
     if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
         raise ValueError("identity needs positive source FPS")
     if type(required_frames) is not int or required_frames < 2:

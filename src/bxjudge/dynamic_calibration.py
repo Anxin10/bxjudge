@@ -74,7 +74,7 @@ class DynamicCalibration:
     flow chains gain geometry only after template closure; bridges stay ineligible.
     """
 
-    def __init__(self, c: Calibration, reference, fps, follow_policy, policy):
+    def __init__(self, c: Calibration, reference, fps, follow_policy, policy, *, temporal_policy=None):
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("fps must be positive finite")
         self.c = c
@@ -121,7 +121,8 @@ class DynamicCalibration:
         self.samples = {}
         self.diagnostics = {}
         self.temporal = TemporalRimTracker(
-            c, reference, fps, follow_policy, load_temporal_policy()
+            c, reference, fps, follow_policy,
+            load_temporal_policy() if temporal_policy is None else temporal_policy,
         )
         self.foreground_boxes = []
         self.last_verified = None
