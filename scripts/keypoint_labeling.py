@@ -85,31 +85,21 @@ def sample_keypoint_frames(videos: list[VideoRef], quota: dict[str, int], seed: 
 def label_config() -> str:
     labels = "\n".join(f'    <Label value="{LABEL_TEXT[k]}" background="{c}"/>'
                        for k, c in zip(KEYPOINTS, COLORS))
+    # No stadium box: a box over the whole stadium swallowed the clicks meant for points
+    # (2026-11-11); the export derives the box from the labelled points (plan K3).
     return f"""<View>
-  <Header value="先拉一個 stadium 框住整個場地，再點看得到的關鍵點。被擋住、在畫面外或看不清楚的點不要點，也不要猜。預標可能偏 10–20 px，每一點都要拖到正確位置或刪掉。左右以場地為準：貓耳朝向鏡頭時的左邊。"/>
+  <Header value="先在下方選一個編號，再在圖上點那個位置；只點看得到的點，被擋住、在畫面外或看不清楚的不要點，也不要猜。預標可能偏 10–20 px，每一點都要拖到正確位置或刪掉。左右以場地為準：貓耳朝向鏡頭時的左邊。"/>
   <Image name="image" value="$image" zoom="true" zoomControl="true"/>
-  <RectangleLabels name="box" toName="image">
-    <Label value="stadium" background="#2980B9"/>
-  </RectangleLabels>
   <KeyPointLabels name="kp" toName="image" smart="false">
 {labels}
   </KeyPointLabels>
 </View>"""
 
 
-def prediction(points: dict[str, tuple[float, float]], box: tuple[float, float, float, float] | None,
-               size: tuple[int, int]) -> dict:
+def prediction(points: dict[str, tuple[float, float]], size: tuple[int, int]) -> dict:
     """Label Studio prediction: percent coordinates; points outside the image are left out."""
     w, h = size
     result = []
-    if box is not None:
-        x0, y0, x1, y1 = max(0.0, box[0]), max(0.0, box[1]), min(float(w), box[2]), min(float(h), box[3])
-        if x1 > x0 and y1 > y0:
-            result.append({"from_name": "box", "to_name": "image", "type": "rectanglelabels",
-                           "original_width": w, "original_height": h,
-                           "value": {"x": 100 * x0 / w, "y": 100 * y0 / h, "width": 100 * (x1 - x0) / w,
-                                     "height": 100 * (y1 - y0) / h, "rotation": 0,
-                                     "rectanglelabels": ["stadium"]}})
     for name in KEYPOINTS:
         if name not in points:
             continue
@@ -139,21 +129,18 @@ def _rail_fit(frame: np.ndarray):
     return h, model
 
 
-def prelabel_points(frame: np.ndarray):
-    """(points, stadium box) projected from the provisional template points through the
-    rail-only fit, in frame px; ({}, None) when the rail fit fails."""
+def prelabel_points(frame: np.ndarray) -> dict[str, tuple[float, float]]:
+    """Points projected from the provisional template points through the rail-only fit, in
+    frame px; {} when the rail fit fails."""
     from bxjudge.stadium_finder import _project
 
     got = _rail_fit(frame)
     if got is None:
-        return {}, None
-    h, model = got
+        return {}
+    h, _ = got
     names = list(PROVISIONAL_TEMPLATE_POINTS)
     pts = _project(h, np.array([PROVISIONAL_TEMPLATE_POINTS[n] for n in names], np.float64))
-    stadium = _project(h, np.array(model.calibration.stadium, np.float64))
-    box = (float(stadium[:, 0].min()), float(stadium[:, 1].min()),
-           float(stadium[:, 0].max()), float(stadium[:, 1].max()))
-    return {n: (float(x), float(y)) for n, (x, y) in zip(names, pts)}, box
+    return {n: (float(x), float(y)) for n, (x, y) in zip(names, pts)}
 
 
 def _sha256(path: Path) -> str:
@@ -198,14 +185,14 @@ def cmd_sample(seed: int) -> int:
     for stem, video, t, img, batch in entries:
         out = images / f"{stem}.jpg"
         cv2.imwrite(str(out), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        pts, box = prelabel_points(img)
+        pts = prelabel_points(img)
         h, w = img.shape[:2]
         rel = out.relative_to(PACKET).as_posix()
         task = {"data": {"image": f"/data/local-files/?d={rel}", "image_path": str(out), "batch": batch,
                          "video": video.path.name if video else f"{TEMPLATE}.png",
                          "time_s": t, "is_template": video is None}}
         if pts:
-            task["predictions"] = [prediction(pts, box, (w, h))]
+            task["predictions"] = [prediction(pts, (w, h))]
         tasks.append(task)
         manifest.append({"image": out.name, "image_sha256": _sha256(out), "batch": batch,
                          "source": str(video.path if video else template_png),
