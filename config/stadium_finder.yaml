@@ -82,3 +82,57 @@ edge_refinement: false
 agreement_px: 8.0
 # A pocket whose in-frame area share is below this gets zone_out_of_frame@<zone>.
 zone_visible_min: 0.8
+
+# --- keypoint path (plan docs/superpowers/plans/2026-11-11-stadium-keypoints.md, K4/K5)
+# Used only when a caller passes a KeypointFinder (scripts/eval_stadium_finder.py --keypoints).
+# Ensemble of 4 YOLO pose models (yolo26n, the final epoch of each run; best.pt is chosen by
+# a pose mAP that saturates early, so it is close to arbitrary). Trained 2026-11-12 on 123 of
+# the user's 147 labelled frames (Label Studio project 4), 24 held out; provenance in
+# weights/stadium-keypoints-20261112/manifest.json. Paths are relative to the project.
+keypoint_weights:
+  - weights/stadium-keypoints-20261112/run.pt
+  - weights/stadium-keypoints-20261112/run_aug.pt
+  - weights/stadium-keypoints-20261112/run_s1.pt
+  - weights/stadium-keypoints-20261112/run_s2.pt
+keypoint_imgsz: 960
+# Points the ensemble is less sure of (mean confidence, mirrored predictions included) are
+# not used; occluded and out-of-frame points come out low.
+keypoint_min_conf: 0.5
+# RANSAC inlier distance (inference px). The 10 points are not on one plane: with the user's
+# own labels a single homography leaves 8.7 px median residual (inference px), corner points
+# 7a/8a/8b up to 24-38 px; 8, 12 and 20 px gave the same zones on the validation images.
+keypoint_ransac_px: 15.0
+keypoint_min_inliers: 5
+# Provisional (2026-11-12): user-label homographies have mean residual p90 13 px, max 34 px.
+keypoint_max_error_px: 20.0
+# The keypoints pin perspective (user-label fits: median 0.00013, max 0.00134), so the limit
+# only catches gross errors.
+keypoint_max_perspective: 0.003
+# Per point, every confident prediction of the 8 (4 models x direct/mirrored) must lie within
+# this distance (inference px) of their mean position, or the point is not used. The same
+# measure (largest distance from the mean) on the 147 labelled frames: median 15, p90 37,
+# p99 106 px. Provisional.
+keypoint_max_spread_px: 60.0
+# Homography refinement on the rail, started from the keypoint fit, may move EACH judged zone
+# (battle area, both Over pockets, Xtreme) at most this far: per zone the mean vertex
+# distance, the worst zone counts (inference px). Codex re-review 2026-11-12 High: a
+# consistent 45 px shift passed the coverage checks; then one pocket 42 px off passed a
+# 32 px bound on the mean over all zones.
+# The rail is a coarse check, not the truth: on the labelled frames the rail-refined fit is
+# further from the user's labels than the keypoint fit (worst zone median 19 vs 13 px), and
+# refinement moves the worst zone of correct keypoint fits by a median 20, p95 41 px (val
+# max 38.5). So this bound catches gross errors only: an accepted fit has every zone within
+# this distance of where the rail pulls it, and finer accuracy rests on the keypoints
+# (worst zone vs labels: median 13, p95 ~29 px). Provisional.
+keypoint_max_rail_shift_px: 40.0
+# The rail is independent evidence for the view the points describe (Codex review 2026-11-12
+# High: consistent wrong points turned 180 degrees or shifted 50 px passed at coverage
+# 0.37-0.43, precision 0.31-0.33). Keypoint fits on the 147 labelled frames: coverage p5 0.47
+# p10 0.58 median 0.91, precision min 0.22 p5 0.42 median 0.64. Provisional (2026-11-12);
+# re-derive with independent zone truth. The turned fit is also checked (as the rail path).
+keypoint_min_rail_coverage: 0.45
+keypoint_min_rail_precision: 0.3
+# Two candidate frames' keypoint fits agree when their zones differ by at most this (mean,
+# inference px). Provisional, wider than agreement_px: points scatter more frame to frame
+# than the rail fit.
+keypoint_agreement_px: 12.0

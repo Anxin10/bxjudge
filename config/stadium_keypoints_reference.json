@@ -1,0 +1,53 @@
+{
+ "schema": "bxjudge-stadium-keypoints-reference-v2",
+ "template": "20261014_202713",
+ "image_size": [
+  1920,
+  1080
+ ],
+ "model_sha256": "493f2c5e109c1f200b8fed37466a6e56c2e6e992d7c2c95eb02dbdf5b09ec4ee",
+ "image_sha256": "ae89d0a9a7680d8f791fc97eb39e52404416b18d6382055e3c53cdc48b0d5b16",
+ "source": "Label Studio project 4, task 57 (template frame task0_template.jpg), user annotation as of 2026-11-12",
+ "points": {
+  "notch_left": [
+   950.27712,
+   839.01744
+  ],
+  "notch_right": [
+   1046.71488,
+   836.17488
+  ],
+  "xtreme_left": [
+   648.0038400000001,
+   307.0278
+  ],
+  "xtreme_right": [
+   1231.3056000000001,
+   307.95552000000004
+  ],
+  "over_left_inner": [
+   401.4816,
+   416.84436
+  ],
+  "over_right_inner": [
+   1476.77568,
+   407.91924
+  ],
+  "field_left_upper": [
+   288.88512000000003,
+   731.55204
+  ],
+  "field_left_lower": [
+   486.21119999999996,
+   926.3883599999999
+  ],
+  "field_right_upper": [
+   1630.9574400000001,
+   683.3484
+  ],
+  "field_right_lower": [
+   1499.48544,
+   914.4619200000001
+  ]
+ }
+}

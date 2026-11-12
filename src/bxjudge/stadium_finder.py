@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 import cv2
@@ -26,6 +27,8 @@ from bxjudge.calibration import ZONES
 from bxjudge.config import config_loader
 from bxjudge.geometry import polygon_mask
 from bxjudge.types import Calibration, Polygon
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_STADIUM_FINDER_CONFIG = PROJECT_ROOT / "config" / "stadium_finder.yaml"
 DEFAULT_STADIUM_MODEL = PROJECT_ROOT / "config" / "stadium_model.json"
@@ -72,14 +75,28 @@ class StadiumFinderConfig:
     edge_refinement: bool
     agreement_px: float
     zone_visible_min: float
+    # keypoint path (plan 2026-11-11-stadium-keypoints K4/K5)
+    keypoint_weights: tuple[str, ...]
+    keypoint_imgsz: int
+    keypoint_min_conf: float
+    keypoint_ransac_px: float
+    keypoint_min_inliers: int
+    keypoint_max_error_px: float
+    keypoint_max_perspective: float
+    keypoint_max_spread_px: float
+    keypoint_max_rail_shift_px: float
+    keypoint_min_rail_coverage: float
+    keypoint_min_rail_precision: float
+    keypoint_agreement_px: float
 
 
 _INT_FIELDS = ("model_points", "hue_halfwidth", "min_saturation", "min_value",
                "candidate_frames", "work_width", "coarse_scale_steps", "coarse_top_k",
-               "refine_iterations")
+               "refine_iterations", "keypoint_imgsz", "keypoint_min_inliers")
 _FRACTIONS = ("roi_margin_frac", "max_thickness_frac", "min_component_frac", "min_coverage",
               "min_precision", "min_rail_in_frame", "notch_halfwidth_frac", "min_notch_coverage",
-              "min_quadrant_coverage", "orientation_min_gain", "zone_visible_min")
+              "min_quadrant_coverage", "orientation_min_gain", "zone_visible_min",
+              "keypoint_min_conf", "keypoint_min_rail_coverage", "keypoint_min_rail_precision")
 
 
 @config_loader
@@ -104,6 +121,14 @@ def load_stadium_finder_config(path: Path = DEFAULT_STADIUM_FINDER_CONFIG) -> St
         elif name == "model_template":
             if not isinstance(v, str) or not v or "/" in v or "\\" in v:
                 raise ValueError(f"{path}: model_template must be a calibration name, got {v!r}")
+        elif name == "keypoint_weights":
+            # project-relative weight files; never absolute or leaving the project
+            if (not isinstance(v, list)
+                    or any(not isinstance(w, str) or not w or w.startswith(("/", "\\"))
+                           or ":" in w or ".." in Path(w.replace("\\", "/")).parts for w in v)):
+                raise ValueError(f"{path}: keypoint_weights must be a list of project-relative "
+                                 f"paths, got {v!r}")
+            v = tuple(v)
         elif name == "hue_search":
             if (not isinstance(v, list) or len(v) != 2 or any(type(h) is not int for h in v)
                     or not 0 <= v[0] < v[1] <= 179):
@@ -131,6 +156,12 @@ def load_stadium_finder_config(path: Path = DEFAULT_STADIUM_FINDER_CONFIG) -> St
         raise ValueError(f"{path}: coarse_rotation_step_deg must be <= 90")
     if c.work_width < 160:
         raise ValueError(f"{path}: work_width must be >= 160, got {c.work_width}")
+    if not 4 <= c.keypoint_min_inliers <= 10:
+        raise ValueError(f"{path}: keypoint_min_inliers must be 4..10 (a homography needs 4 "
+                         f"points, there are 10), got {c.keypoint_min_inliers}")
+    if c.keypoint_imgsz < 320 or c.keypoint_imgsz % 32:
+        raise ValueError(f"{path}: keypoint_imgsz must be a multiple of 32 and >= 320, "
+                         f"got {c.keypoint_imgsz}")
     return c
 
 
@@ -270,6 +301,11 @@ class StadiumFit:
     # and every side must be seen, or the zones are not determined.
     notch_coverage: float = 0.0
     quadrant_coverage: float = 0.0
+    # Keypoint fits only: RANSAC inliers among the 10 points and their mean reprojection
+    # error (inference px). 0 for rail fits.
+    keypoint_inliers: int = 0
+    keypoint_error_px: float = 0.0
+    keypoint_rail_shift_px: float = 0.0  # worst zone's move under rail refinement (inference px)
 
 
 def _rot(theta: float) -> np.ndarray:
@@ -600,6 +636,100 @@ def fit_stadium(mask: np.ndarray, model: StadiumModel, cfg: StadiumFinderConfig,
     return best
 
 
+def fit_from_keypoints(points: np.ndarray, reference, mask: np.ndarray, model: StadiumModel,
+                       cfg: StadiumFinderConfig) -> StadiumFit | None:
+    """Homography from the template's 10 reference points to the predicted ``points``
+    ((10, 3) [x, y, confidence] in frame px, ``stadium_keypoints.KEYPOINTS`` order), checked
+    against the rail ``mask`` (frame px), or ``None``.
+
+    Points below ``keypoint_min_conf`` are not used. RANSAC (``keypoint_ransac_px``) drops a
+    point placed on the wrong feature; the inliers (at least ``keypoint_min_inliers``) are then
+    fitted by least squares and must include points left and right of the rail centre and in
+    front of and behind it, or one side of the zones is not constrained. The fit is refused
+    when the inliers' mean reprojection error exceeds ``keypoint_max_error_px``, its
+    perspective ``keypoint_max_perspective``, when it mirrors the stadium (``_score``: X/B
+    would swap) or throws a zone towards the horizon.
+
+    The rail is independent evidence for the view the points describe: the placed model rail
+    must match at least ``keypoint_min_rail_coverage`` of its in-frame points and explain at
+    least ``keypoint_min_rail_precision`` of the frame's rail, and the fit turned 180 degrees,
+    refined on the rail, must explain it clearly worse (``_orientation_ambiguous``, as the rail
+    path): points that agree with each other but describe the stadium turned round (Xtreme at
+    the near end, the Over pockets swapped) are refused (Codex review 2026-11-12 High)."""
+    check_keypoint_reference(reference, model)
+    pts = np.asarray(points, np.float64).reshape(-1, 3)
+    ok = np.isfinite(pts).all(1) & (pts[:, 2] >= cfg.keypoint_min_conf)
+    if ok.sum() < cfg.keypoint_min_inliers or not (mask > 0).any():
+        return None
+    fh, fw = mask.shape[:2]
+    ref_scale = _REF_LONG_EDGE / max(fw, fh)
+    src, dst = reference.array()[ok], pts[ok, :2]
+    h, inl = cv2.findHomography(src, dst, cv2.RANSAC, cfg.keypoint_ransac_px / ref_scale)
+    if h is None or inl is None:
+        return None
+    inl = inl.ravel().astype(bool)
+    if inl.sum() < cfg.keypoint_min_inliers:
+        return None
+    h, _ = cv2.findHomography(src[inl], dst[inl], 0)  # least squares on the inliers
+    if h is None or not np.isfinite(h).all() or h[2, 2] == 0:
+        return None
+    h = h / h[2, 2]
+    cx, cy = model.rail.mean(0)
+    s = src[inl]
+    if not ((s[:, 0] < cx).any() and (s[:, 0] > cx).any()
+            and (s[:, 1] < cy).any() and (s[:, 1] > cy).any()):
+        return None
+    err = float(np.linalg.norm(_project(h, s) - dst[inl], axis=1).mean() * ref_scale)
+    if not np.isfinite(err) or err > cfg.keypoint_max_error_px:
+        return None
+    if _perspective(h, ref_scale, _REF_LONG_EDGE / max(model.image_size)) > \
+            cfg.keypoint_max_perspective:
+        return None
+    rw, rh = round(fw * ref_scale), round(fh * ref_scale)
+    mask_ref = cv2.resize(mask, (rw, rh), interpolation=cv2.INTER_AREA)
+    mask_ref = np.where(mask_ref > 0, 255, 0).astype(np.uint8)
+    def rail_supports(f: StadiumFit | None) -> bool:
+        return (f is not None and f.coverage >= cfg.keypoint_min_rail_coverage
+                and f.precision >= cfg.keypoint_min_rail_precision)
+
+    fit = _score(mask_ref, ref_scale, model, h, cfg)
+    if not rail_supports(fit):
+        return None
+    # The rail pulls the fit to the view it shows, and each judged zone must stay near where
+    # the rail puts it: a fit right on average can still have one pocket off (Codex re-review
+    # 2026-11-12 High). The rail is a coarse check, not the truth: on the labelled frames the
+    # refined fit is further from the labels than the keypoint fit (worst zone median 19 vs
+    # 13 px), so the keypoint fit is kept and only gross errors are caught (worst zone moved
+    # by refinement on correct fits: median 20, p95 41 px). A failed refinement gives no
+    # support.
+    hr = _refine(mask_ref, ref_scale, model, h, cfg, cv2.MOTION_HOMOGRAPHY)
+    if hr is None:
+        return None
+    shift = _worst_zone_shift(model, h, hr) * ref_scale
+    if not np.isfinite(shift) or shift > cfg.keypoint_max_rail_shift_px:
+        return None
+    # The turned view competes on the same standard as this one: when the rail supports both
+    # directions about as well, the points alone decide the direction, and that is refused.
+    if _orientation_ambiguous(mask_ref, ref_scale, model, fit, cfg, None, accept=rail_supports,
+                              max_perspective=cfg.keypoint_max_perspective):
+        return None
+    return replace(fit, keypoint_inliers=int(inl.sum()), keypoint_error_px=err,
+                   keypoint_rail_shift_px=shift)
+
+
+def check_keypoint_reference(reference, model: StadiumModel) -> None:
+    """The reference points must have been labelled on this model's template frame: same
+    template name, frame size and model identity (``StadiumModel.source_sha256``, which
+    covers the template calibration and its reference image). Raises ``ValueError``."""
+    if (reference.template != model.calibration.name
+            or tuple(reference.image_size) != tuple(model.image_size)
+            or reference.model_sha256 != model.source_sha256):
+        raise ValueError(f"keypoint reference ({reference.template} {reference.image_size} "
+                         f"model {reference.model_sha256[:12]}) does not belong to the stadium "
+                         f"model ({model.calibration.name} {model.image_size} "
+                         f"{model.source_sha256[:12]})")
+
+
 def _edge_refine(frame: np.ndarray, model: StadiumModel, h0: np.ndarray,
                  cfg: StadiumFinderConfig, acfg) -> np.ndarray | None:
     """Refine ``h0`` (model px -> frame px) with the stadium's own edges, or ``None``.
@@ -675,7 +805,8 @@ def _acceptable(fit: StadiumFit, cfg: StadiumFinderConfig) -> bool:
 
 def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: StadiumModel,
                            best: StadiumFit, cfg: StadiumFinderConfig,
-                           confirm=None) -> bool:
+                           confirm=None, *, accept=None,
+                           max_perspective: float | None = None) -> bool:
     """True when the fit turned 180 degrees about the rail centre is itself an acceptable fit
     explaining the rail almost as well: then the direction (X/B sides, which end holds the
     Xtreme pocket) is not determined.
@@ -684,7 +815,17 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
     refinement; a failed refinement never discards evidence the unrefined turn already has.
     An alternative failing the acceptance checks (coverage, notch, quadrants, ...) cannot
     veto a direction the rail shows clearly. With ``confirm`` (edge refinement of a
-    hypothesis), an alternative counts only when the stadium's edges confirm it too."""
+    hypothesis), an alternative counts only when the stadium's edges confirm it too.
+
+    ``accept`` (default ``_acceptable``) and ``max_perspective`` (default
+    ``cfg.max_perspective``) are the standard the alternative must meet: the same one the
+    candidate itself met, so both directions compete on equal terms (Codex re-review
+    2026-11-12 High: keypoint fits passed looser checks than their turned competitor had to)."""
+    if accept is None:
+        def accept(f):
+            return _acceptable(f, cfg)
+    if max_perspective is None:
+        max_perspective = cfg.max_perspective
     cx, cy = model.rail.mean(0)
     turn = np.array([[-1.0, 0.0, 2 * cx], [0.0, -1.0, 2 * cy], [0.0, 0.0, 1.0]])
     raw = np.asarray(best.homography) @ turn
@@ -696,11 +837,11 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
                   cv2.MOTION_HOMOGRAPHY)
     # The alternative obeys the same perspective limit as any accepted fit.
     if hom is not None and _perspective(hom, ref_scale, _REF_LONG_EDGE / max(model.image_size)) \
-            <= cfg.max_perspective:
+            <= max_perspective:
         hypotheses.append(hom)
     for h in hypotheses:
         alt = _score(mask_ref, ref_scale, model, h, cfg)
-        if (alt is None or not _acceptable(alt, cfg)
+        if (alt is None or not accept(alt)
                 or _quality(alt) <= _quality(best) - cfg.orientation_min_gain):
             continue
         if confirm is None:
@@ -708,7 +849,7 @@ def _orientation_ambiguous(mask_ref: np.ndarray, ref_scale: float, model: Stadiu
         # With the frame at hand the stadium's edges also judge the turned view: a turn they
         # cannot confirm (refinement fails or leaves the rail) is not a competitor.
         seen = confirm(h)
-        if seen is not None and _acceptable(seen, cfg):
+        if seen is not None and accept(seen):
             return True
     return False
 
@@ -816,12 +957,31 @@ class FoundStadium:
     frame: np.ndarray  # that frame (BGR, inference size)
     zone_visibility: dict[str, float]
     agreeing_frames: int  # candidate frames whose zones agree with the chosen one
+    method: str = "rail"  # "keypoints" or "rail"
 
 
 def _zones(model: StadiumModel, fit: StadiumFit) -> np.ndarray:
-    h = np.asarray(fit.homography, np.float64)
+    return _zones_h(model, np.asarray(fit.homography, np.float64))
+
+
+def _zones_h(model: StadiumModel, h: np.ndarray) -> np.ndarray:
+    """Vertices of the judged zones (``_AGREEMENT_ZONES``) through homography ``h``."""
     return np.concatenate([_project(h, np.array(getattr(model.calibration, z), np.float64))
                            for z in _AGREEMENT_ZONES])
+
+
+def _worst_zone_shift(model: StadiumModel, h1: np.ndarray, h2: np.ndarray) -> float:
+    """Largest per-zone mean vertex distance between the judged zones through ``h1`` and
+    ``h2`` (frame px): each zone on its own, so one pocket off is not averaged away by the
+    zones that are right."""
+    worst = 0.0
+    for z in _AGREEMENT_ZONES:
+        poly = np.array(getattr(model.calibration, z), np.float64)
+        d = float(np.linalg.norm(_project(h1, poly) - _project(h2, poly), axis=1).mean())
+        if not np.isfinite(d):
+            return float("inf")
+        worst = max(worst, d)
+    return worst
 
 
 def _alignment(fit: StadiumFit, model: StadiumModel, frame_size: tuple[int, int]):
@@ -844,14 +1004,27 @@ def _alignment(fit: StadiumFit, model: StadiumModel, frame_size: tuple[int, int]
 
 
 def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
-                 hwaccel: str = "cpu") -> FoundStadium | None:
+                 hwaccel: str = "cpu", keypoints=None,
+                 keypoint_errors: list[str] | None = None) -> FoundStadium | None:
     """Stadium zones for ``video`` from its clearest early frames, or ``None``.
 
     Frames are sampled every ``sample_step_s`` within the first ``sample_window_s`` (playback
     seconds until the physical time base lands, ledger ruling T4), ranked by rail pixels, and
     the best ``candidate_frames`` are fitted in that order. A result needs two fits whose zones
     agree within ``agreement_px`` (inference px); the better-ranked of them is returned. A
-    video without such a pair (no stadium, a moving camera, hands everywhere) gives ``None``."""
+    video without such a pair (no stadium, a moving camera, hands everywhere) gives ``None``.
+
+    With ``keypoints`` (a ``stadium_keypoints.KeypointFinder``, or anything with its
+    ``predict(frame)`` and ``reference``) the same candidate frames are first fitted from the
+    predicted keypoints (``fit_from_keypoints``); two keypoint fits agreeing within
+    ``keypoint_agreement_px`` give the result (the one with the lower keypoint error). Only
+    when they do not is the rail fitted as above. On the 24 validation images the keypoint
+    path placed the zone features at a median 6.6 px from the user's labels, the rail path
+    found 8 of the 24 at 21 px (inference px, ledger 2026-11-12).
+
+    A frame whose keypoint inference or fit raises is skipped (the rail path still runs); the
+    error is appended to ``keypoint_errors`` when given, so a caller can tell a resource
+    failure from a video without a stadium."""
     from bxjudge.autocalib import load_autocalib_config, warp_calibration
     from bxjudge.manifest import probe
     from bxjudge.video import VideoDecodeError, iter_frames
@@ -869,6 +1042,43 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
     except (VideoDecodeError, ValueError, OSError):
         return None
     samples.sort(key=lambda s: (-s[0], s[1]))
+
+    def found(idx: int, frame: np.ndarray, fit: StadiumFit, agreeing: int,
+              method: str) -> FoundStadium:
+        fh, fw = frame.shape[:2]
+        cal = warp_calibration(model.calibration, _alignment(fit, model, (fw, fh)), (fw, fh),
+                               f"found-{Path(video).stem}")
+        return FoundStadium(calibration=cal, fit=fit, frame_index=idx, frame=frame,
+                            zone_visibility=zone_visibility(cal), agreeing_frames=agreeing,
+                            method=method)
+
+    if keypoints is not None:
+        # A reference for another model is a setup error: raise, do not fall back silently.
+        check_keypoint_reference(keypoints.reference, model)
+        kfits: list[tuple[int, np.ndarray, StadiumFit, np.ndarray]] = []
+        for pixels, idx, frame, mask in samples[:cfg.candidate_frames]:
+            if pixels == 0:
+                break
+            try:
+                pts = keypoints.predict(frame)
+                fit = (None if pts is None
+                       else fit_from_keypoints(pts, keypoints.reference, mask, model, cfg))
+            except (RuntimeError, ValueError, cv2.error) as e:
+                # One frame's inference or fit failed: skip it, the rail path still runs.
+                _log.warning("%s frame %d: keypoint fit failed: %s: %s", Path(video).name, idx,
+                             type(e).__name__, e)
+                if keypoint_errors is not None:
+                    keypoint_errors.append(f"frame {idx}: {type(e).__name__}: {e}")
+                continue
+            if fit is None:
+                continue
+            zones = _zones(model, fit)
+            kfits.append((idx, frame, fit, zones))
+            agree = [f for f in kfits if float(np.linalg.norm(f[3] - zones, axis=1).mean())
+                     * (_REF_LONG_EDGE / max(frame.shape[:2])) <= cfg.keypoint_agreement_px]
+            if len(agree) >= 2:
+                idx, frame, fit, _ = min(agree, key=lambda f: (f[2].keypoint_error_px, f[0]))
+                return found(idx, frame, fit, len(agree), "keypoints")
     fits: list[tuple[int, np.ndarray, StadiumFit, np.ndarray]] = []
     for pixels, idx, frame, mask in samples[:cfg.candidate_frames]:
         if pixels == 0:
@@ -883,11 +1093,7 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
                  if float(np.linalg.norm(f[3] - zones, axis=1).mean()) <= cfg.agreement_px]
         if len(agree) >= 2:
             idx, frame, fit, _ = max(agree, key=lambda f: _rank(f[2]))
-            fh, fw = frame.shape[:2]
-            cal = warp_calibration(model.calibration, _alignment(fit, model, (fw, fh)), (fw, fh),
-                                   f"found-{Path(video).stem}")
-            return FoundStadium(calibration=cal, fit=fit, frame_index=idx, frame=frame,
-                                zone_visibility=zone_visibility(cal), agreeing_frames=len(agree))
+            return found(idx, frame, fit, len(agree), "rail")
     return None
 
 

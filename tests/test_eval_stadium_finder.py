@@ -63,7 +63,9 @@ def test_resume_from_another_source_folder_is_refused(tmp_path):
     # Codex round 3: an earlier run of archiveA/batch must not make archiveB/batch look done.
     out = tmp_path / "eval"
     out.mkdir()
-    old = {"batch": "batch", "video": "clip.mp4", "source": str((tmp_path / "archiveA" / "batch").resolve())}
+    (tmp_path / "archiveA" / "batch").mkdir(parents=True)
+    (tmp_path / "archiveA" / "batch" / "clip.mp4").write_bytes(b"clip")  # still there
+    old ={"batch": "batch", "video": "clip.mp4", "source": str((tmp_path / "archiveA" / "batch").resolve())}
     (out / "rows.jsonl").write_text(json.dumps(old) + "\n")
     with pytest.raises(SystemExit):
         ev.done_rows(out / "rows.jsonl", {"batch": (tmp_path / "archiveB" / "batch").resolve()})
@@ -171,6 +173,142 @@ def test_writes_through_a_symlinked_result_folder_are_refused(tmp_path):
     with pytest.raises(SystemExit):
         ev.ensure_safe(ev.result_path(out, "found", "videos", "clip.mp4", ".json"), protected)
     ev.ensure_safe(ev.result_path(out, "preview", "videos", "clip.mp4", ".jpg"), protected)
+
+
+def test_resuming_with_another_setup_is_refused(tmp_path):
+    # Codex review 2026-11-12 Medium: rail results then --keypoints, or new weights, in one --out
+    out = tmp_path / "eval"
+    rail = {"method": "rail", "stadium_finder_config_sha256": "a", "stadium_model_sha256": "b"}
+    ev.check_run_manifest(out, rail, False, [])
+    ev.check_run_manifest(out, rail, True, [])  # same setup: resumes
+    kp = {**rail, "method": "keypoints", "keypoint_weights_sha256": ["w1"]}
+    with pytest.raises(SystemExit):
+        ev.check_run_manifest(out, kp, True, [])
+    out2 = tmp_path / "eval2"
+    ev.check_run_manifest(out2, kp, False, [])
+    with pytest.raises(SystemExit):
+        ev.check_run_manifest(out2, {**kp, "keypoint_weights_sha256": ["w2"]}, True, [])
+
+
+def test_rows_without_a_manifest_are_not_resumed(tmp_path):
+    # Codex re-review 2026-11-12: results without run.json cannot be shown to share the setup
+    out = tmp_path / "eval"
+    out.mkdir()
+    rail = {"method": "rail", "stadium_finder_config_sha256": "a", "stadium_model_sha256": "b"}
+    for manifest in (rail, {**rail, "method": "keypoints"}):
+        with pytest.raises(SystemExit):
+            ev.check_run_manifest(out, manifest, True, [])
+    assert not (out / "run.json").exists()
+
+
+def test_manifest_records_device_and_reference_comparison():
+    a = ev.run_manifest(False, reference=True)
+    b = ev.run_manifest(False, reference=False)
+    assert a != b and a["reference"] is True
+
+
+def test_result_files_must_stay_inside_out(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out = tmp_path / "eval"
+    out.mkdir()
+    (out / "preview").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(SystemExit):
+        ev.ensure_inside(ev.result_path(out, "preview", "b", "clip.mp4", ".jpg"), out)
+    ev.ensure_inside(ev.result_path(out, "found", "b", "clip.mp4", ".json"), out)
+
+
+def test_resume_reruns_model_load_errors_and_refuses_changed_videos(tmp_path):
+    src = tmp_path / "batch"
+    src.mkdir()
+    (src / "a.mp4").write_bytes(b"one")
+    (src / "b.mp4").write_bytes(b"two")
+    out = tmp_path / "eval"
+    out.mkdir()
+    rows = [{"batch": "batch", "video": "a.mp4", "source": str(src.resolve()),
+             "video_sha256": ev._sha256(src / "a.mp4"), "found": True},
+            {"batch": "batch", "video": "b.mp4", "source": str(src.resolve()),
+             "video_sha256": ev._sha256(src / "b.mp4"), "found": False,
+             "error": f"{ev.RETRY_ERROR_PREFIX} OutOfMemoryError: CUDA"}]
+    (out / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()}) == {("batch", "a.mp4")}
+    (src / "a.mp4").write_bytes(b"another video, same name")
+    with pytest.raises(SystemExit):
+        ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()})
+
+
+def test_resume_reruns_videos_not_found_after_inference_errors(tmp_path):
+    # Codex re-review 2026-11-12 (round 2) Medium: a video not found while its frames' keypoint
+    # inference ran out of memory is not a result; one found despite an error is.
+    src = tmp_path / "batch"
+    src.mkdir()
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        (src / name).write_bytes(name.encode())
+    out = tmp_path / "eval"
+    out.mkdir()
+    base = {"batch": "batch", "source": str(src.resolve())}
+    rows = [{**base, "video": "a.mp4", "found": False, "keypoint_errors": ["frame 0: OOM"]},
+            {**base, "video": "b.mp4", "found": True, "keypoint_errors": ["frame 0: OOM"]},
+            {**base, "video": "c.mp4", "found": False, "keypoint_errors": []}]
+    (out / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()}) == {
+        ("batch", "b.mp4"), ("batch", "c.mp4")}
+
+
+def test_resume_refuses_a_recorded_video_that_is_gone(tmp_path):
+    src = tmp_path / "batch"
+    src.mkdir()
+    out = tmp_path / "eval"
+    out.mkdir()
+    row = {"batch": "batch", "video": "gone.mp4", "source": str(src.resolve()), "found": True,
+           "video_sha256": "0" * 64}
+    (out / "rows.jsonl").write_text(json.dumps(row) + "\n")
+    with pytest.raises(SystemExit, match="gone"):
+        ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()})
+
+
+@pytest.mark.parametrize("retry", [
+    {"error": f"{ev.RETRY_ERROR_PREFIX} OutOfMemoryError: CUDA"},
+    {"keypoint_errors": ["frame 0: OOM"]}])
+@pytest.mark.parametrize("change", ["gone", "changed"])
+def test_resume_checks_the_video_of_a_row_left_to_retry(tmp_path, retry, change):
+    # Codex re-review 2026-11-12 (round 3) Low: a row left to retry skipped the file and
+    # SHA-256 checks, so a gone video stayed in the summary and a changed one re-ran unseen.
+    src = tmp_path / "batch"
+    src.mkdir()
+    (src / "a.mp4").write_bytes(b"one")
+    out = tmp_path / "eval"
+    out.mkdir()
+    row = {"batch": "batch", "video": "a.mp4", "source": str(src.resolve()), "found": False,
+           "video_sha256": ev._sha256(src / "a.mp4"), **retry}
+    (out / "rows.jsonl").write_text(json.dumps(row) + "\n")
+    assert ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()}) == set()
+    if change == "gone":
+        (src / "a.mp4").unlink()
+    else:
+        (src / "a.mp4").write_bytes(b"another video, same name")
+    with pytest.raises(SystemExit, match=change):
+        ev.done_rows(out / "rows.jsonl", {"batch": src.resolve()})
+
+
+@pytest.mark.parametrize("name", ["rows.jsonl", "summary.json"])
+def test_rows_and_summary_links_out_of_out_are_refused(tmp_path, name):
+    # Codex re-review 2026-11-12 (round 2) Low: a link under --out must not carry the rows or
+    # the summary into another (unprotected) folder.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out = tmp_path / "eval"
+    out.mkdir()
+    (out / name).symlink_to(elsewhere / name)
+    with pytest.raises(SystemExit, match="outside"):
+        ev.main(["--out", str(out), "--only-truth"])
+    assert not (elsewhere / name).exists()
+
+
+def test_summary_counts_a_rerun_video_once():
+    rows = [{"batch": "b", "video": "a.mp4", "found": False, "error": "keypoint model: x"},
+            {"batch": "b", "video": "a.mp4", "found": True}]
+    assert ev.latest_rows(rows) == [rows[1]]
 
 
 def test_results_are_kept_per_batch(tmp_path):
