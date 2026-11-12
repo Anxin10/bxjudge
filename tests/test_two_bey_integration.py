@@ -379,3 +379,106 @@ def test_phase_excluded_held_observations_do_not_veto_later_finish(
         == (len(record["observations"]) + len(record["unassigned"]))
         == 120
     )
+
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [None, "late_anchor", "conflict", "no_direct_anchor", "unknown_history",
+     "third_box", "gap", "outside", "overlap", "anchor_alias_only"],
+)
+def test_opponent_side_needs_a_clean_pair_and_an_earlier_direct_anchor(blocker):
+    from bxjudge.identity import IdentityAnchors
+    from bxjudge.two_bey_integration import infer_opponent_side
+    from tests.helpers import make_calibration, make_track
+
+    # The directly anchored X is on the right during the battle.
+    raw = [make_track(i, "bey", {f: (x, 210) for f in range(10, 14)})
+           for i, x in [(1, 450), (2, 200)]]
+    calibration = make_calibration()
+    physical = reconstruct_round_tracks(
+        raw, 10, 13, 30, calibration.frame_size, {},
+        load_policy(Path("config/two_bey_tracking.yaml")), 100,
+    )
+    known, opponent = (t.track_id for t in physical.tracks)
+    hint = IdentityAnchors({1: "X"}, {1: [{"frame": 8}, {"frame": 9}]})
+    registered = copy.deepcopy(physical.tracks)
+    if blocker == "late_anchor":
+        hint.evidence[1][-1]["frame"] = 11
+    elif blocker == "conflict":
+        physical.members[opponent].append(3)
+        hint.sides.update({2: "B", 3: "X"})
+    elif blocker == "no_direct_anchor":
+        hint.sides.clear()
+    elif blocker == "unknown_history":
+        physical.record["identity_unknown_intervals"][str(opponent)] = [[10, 10]]
+    elif blocker == "third_box":
+        physical.record["unassigned"].append(
+            {"frame": 11, "reason": "unassigned_two_target_capacity_or_gate",
+             "adjudication_eligible": True}
+        )
+    elif blocker == "gap":
+        registered[1].dets.pop(1)
+    elif blocker == "outside":
+        registered[1] = make_track(opponent, "bey", {f: (100, 30) for f in range(10, 14)})
+    elif blocker == "overlap":
+        registered[1] = make_track(opponent, "bey", {f: (452, 210) for f in range(10, 14)})
+    elif blocker == "anchor_alias_only":
+        physical.members[known].append(3)
+        hint = IdentityAnchors({3: "X"}, {3: [{"frame": 8}, {"frame": 9}]})
+
+    result = infer_opponent_side(hint, physical, registered, calibration, required_frames=3)
+
+    if blocker is not None:
+        assert result is None
+    else:
+        assert result == {
+            "track_id": opponent, "side": "B", "opponent_track_id": known,
+            "launcher_anchor_native_id": 1, "launcher_anchor_last_frame": 9,
+            "frames": [10, 11, 12],
+        }
+
+
+@pytest.mark.parametrize("finish_frame", [37, 70])
+def test_pair_anchor_enters_pipeline_without_confirming_an_earlier_finish(
+    finish_frame, tmp_path, monkeypatch, th, rules,
+):
+    import json
+
+    from bxjudge import pipeline
+    from bxjudge.finish import FinishResult
+    from bxjudge.identity import IdentityAnchors
+    from tests.helpers import make_track
+
+    source = pipeline_setup(monkeypatch, tmp_path, [
+        make_track(tid, "bey", {f: (x, 360) for f in range(35, 75)})
+        for tid, x in [(1, 900), (2, 350)]
+    ])
+    monkeypatch.setattr(
+        pipeline, "anchor_sides",
+        lambda *args, **kwargs: IdentityAnchors({1: "X"}, {1: [{"frame": 34}]}),
+    )
+    received_sides = []
+    analyze = pipeline.analyze_launch
+
+    def capture(*args, **kwargs):
+        result = analyze(*args, **kwargs)
+        received_sides.append(set(result.sides.values()))
+        return result
+
+    monkeypatch.setattr(pipeline, "analyze_launch", capture)
+    monkeypatch.setattr(
+        pipeline, "detect_finish", lambda *a: FinishResult("over", "B", finish_frame, 0.95, [])
+    )
+    [r] = invoke_two_pipeline(source, tmp_path, rules, th)
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_bytes())
+    proof = data["identity"]["opponent_anchors"]["1"]
+    assert proof["side"] == "B"
+    assert proof["frames"] == list(range(35, 41))
+    assert received_sides == [{"X", "B"}]
+    assert r.needs_review
+    if finish_frame < proof["frames"][-1]:
+        assert r.winner is None
+        assert "identity_pair_evidence_after_candidate" in r.review_reasons
+    else:
+        assert r.winner == "X"

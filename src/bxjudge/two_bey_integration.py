@@ -6,8 +6,10 @@ from dataclasses import dataclass
 
 import cv2
 
+from .geometry import box_center, boxes_touch, zone_of
+from .identity import IdentityAnchors
 from .two_bey_tracking import TwoBeyTracker
-from .types import Detection, Track
+from .types import Calibration, Detection, Track
 
 
 def appearance_descriptor(image, box, bins):
@@ -32,6 +34,87 @@ class PhysicalRound:
     members: dict[int, list[int]]
     record: dict
 
+
+
+def infer_opponent_side(
+    anchors: IdentityAnchors,
+    physical: PhysicalRound,
+    registered: list[Track],
+    calibration: Calibration,
+    *,
+    required_frames: int,
+) -> dict | None:
+    """Infer the other player in a verified two-top prefix of this round.
+
+    The caller supplies observed, phase-eligible boxes registered to the
+    calibration. This evidence only assigns a player, never a release or landing.
+    """
+    record = physical.record
+    if len(registered) != 2 or record["pair_confirmed_at_frame"] is None:
+        return None
+    claims = {
+        track.track_id: {
+            anchors.sides[native_id]
+            for native_id in physical.members[track.track_id]
+            if native_id in anchors.sides
+        }
+        for track in registered
+    }
+    known, unknown = sorted(registered, key=lambda track: -len(claims[track.track_id]))
+    if len(claims[known.track_id]) != 1 or claims[unknown.track_id]:
+        return None
+    (side,) = claims[known.track_id]
+    blocked_frames = {
+        d["frame"] for d in record["unassigned"]
+        if d["adjudication_eligible"] and d["reason"] != "duplicate_box"
+    }
+    # Once a preceding identity was lost, two new boxes alone cannot recover it.
+    ambiguous_from = min(
+        [*record["identity_unknown_since"].values(),
+         *(start for spans in record["identity_unknown_intervals"].values() for start, _ in spans)],
+        default=math.inf,
+    )
+    known_boxes, unknown_boxes = ({d.frame: d.box for d in t.dets} for t in (known, unknown))
+    run = []
+    for frame in sorted(known_boxes.keys() & unknown_boxes.keys()):
+        if frame >= ambiguous_from:
+            return None
+        a, b = known_boxes[frame], unknown_boxes[frame]
+        if (frame in blocked_frames or boxes_touch(a, b)
+                or any(zone_of(box_center(box), calibration) != "battle_area" for box in (a, b))):
+            run.clear()
+            continue
+        if run and frame != run[-1] + 1:
+            run.clear()
+        run.append(frame)
+        if len(run) == required_frames:
+            break
+    if len(run) != required_frames:
+        return None
+
+    # A direct launcher anchor must predate the first clean pair and belong
+    # to a native track actually observed in this actor's prefix.
+    observed = {
+        d["native_id"] for d in record["observations"]
+        if d["identity_valid"] and d["frame"] <= run[0]
+    }
+    evidence = [
+        (anchors.evidence[native_id][-1]["frame"], native_id)
+        for native_id in physical.members[known.track_id]
+        if native_id in observed and anchors.evidence.get(native_id)
+        and anchors.evidence[native_id][-1]["frame"] <= run[0]
+    ]
+    if not evidence:
+        return None
+    last, native_id = min(evidence)
+    return {
+        "track_id": unknown.track_id,
+        "side": "B" if side == "X" else "X",
+        "opponent_track_id": known.track_id,
+        "launcher_anchor_native_id": native_id,
+        "launcher_anchor_last_frame": last,
+        "frames": run,
+    }
 
 def reconstruct_round_tracks(
     tracks, first, last, fps, frame_size, features, policy, id_offset

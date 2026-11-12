@@ -85,7 +85,11 @@ from .timebase import (
 )
 from .track import track_frames
 from .trajectory_video import load_video_policy
-from .two_bey_integration import appearance_descriptor, reconstruct_round_tracks
+from .two_bey_integration import (
+    appearance_descriptor,
+    infer_opponent_side,
+    reconstruct_round_tracks,
+)
 from .two_bey_tracking import identity_unknown_at
 from .two_bey_tracking import load_policy as load_two_bey_policy
 from .types import RoundResult, Track
@@ -321,14 +325,16 @@ def judge_video(
             raise ValueError(f"{info.path}: decoded frame count does not match PTS count")
         anomalies = changes.events(timing.timeline) if changes is not None else []
         phase = None
+        opponent_anchors = {}
         native_tracks=list(tracks)
         side_hints = {}
         geometry_evidence = None
         if geometry is not None:
             phase_policy = converted(load_launch_policy())
+            required_anchor_frames = launch_sample_count(phase_policy["held_s"], info.fps)
             anchors = anchor_sides(
                 tracks, normalize_tracks(tracks, geometry.samples), c,
-                required_frames=launch_sample_count(phase_policy["held_s"], info.fps),
+                required_frames=required_anchor_frames,
                 body_margin_px=phase_policy["body_margin_px"],
                 fps=info.fps,
                 **({"policy": converted(load_identity_policy())} if timing else {}),
@@ -377,11 +383,20 @@ def judge_video(
                     if (d.frame,tuple(d.box),d.score) in phase_keys
                     and not identity_unknown_at(physical.record, t.track_id, d.frame)])
                     for t in physical.tracks]
+                adjudication_rounds[number] = normalize_tracks(
+                    adjudication_rounds[number], geometry.samples
+                )
                 for track in physical.tracks:
-                    raw_by_id[track.track_id]=track
-                    known={anchors.sides[tid] for tid in physical.members[track.track_id] if tid in anchors.sides}
-                    if len(known)==1:
-                        side_hints[track.track_id]=next(iter(known))
+                    raw_by_id[track.track_id] = track
+                side_hints.update(inherited_sides(anchors.sides, physical.members))
+                proof = infer_opponent_side(
+                    anchors, physical, adjudication_rounds[number], c,
+                    required_frames=required_anchor_frames,
+                )
+                if proof is not None:
+                    side_hints[proof["track_id"]] = proof["side"]
+                    opponent_anchors[number] = proof
+            record["identity"]["opponent_anchors"] = opponent_anchors
             record['two_bey_tracking']={'policy':two_policy,'rounds':{str(n):p.record for n,p in physical_rounds.items()},
                 'raw_source_tracks':[asdict(t) for t in native_tracks], 'association_source':'native_tracks',
                 'adjudication_filter':'observed_phase_prepared_points_only'}
@@ -408,7 +423,7 @@ def judge_video(
             round_tracks=tracks
             if number in physical_rounds:
                 round_raw_tracks=[t for t in raw_tracks if t.cls!='bey']+physical_rounds[number].tracks
-                round_tracks=normalize_tracks([t for t in raw_tracks if t.cls!='bey']+adjudication_rounds[number],geometry.samples)
+                round_tracks = [t for t in tracks if t.cls != "bey"] + adjudication_rounds[number]
             next_start = (
                 rounds[number][0] if number < len(rounds) else last_decoded_frame + 1
             )
@@ -540,6 +555,14 @@ def judge_video(
                 )
                 if number in physical_rounds:
                     dynamic_notes.append('two_bey_tracking_requires_review')
+                    proof = opponent_anchors.get(number)
+                    if proof is not None:
+                        dynamic_notes.append("identity_inferred_from_observed_pair")
+                        if candidate.frame is not None and candidate.frame < proof["frames"][-1]:
+                            finish = type(finish)(
+                                None, None, None, 0.0,
+                                [*finish.reasons, "identity_pair_evidence_after_candidate"],
+                            )
                     unknown_since = physical_rounds[number].record['identity_unknown_since']
                     if any(e['decision'] == 'recovered' for e in physical_rounds[number].record['identity_merge_episodes']):
                         dynamic_notes.append('identity_recovered_after_merge')
