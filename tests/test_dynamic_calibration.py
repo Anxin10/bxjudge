@@ -138,3 +138,96 @@ def test_recorded_evidence_hash_and_source_are_required(tmp_path):
     path.write_bytes(path.read_bytes() + b" ")
     with pytest.raises(ValueError, match="SHA256"):
         read_geometry(tmp_path, row, "source")
+
+
+# ---- keypoint relocation (plan 2026-11-12-dynamic-calibration, Task 4) -----------------
+
+
+class FakeLocator:
+    """``KeypointLocator`` stand-in: every call gives ``h`` (calibration px -> frame px) or,
+    with ``h=None``, nothing and ``reason``."""
+
+    def __init__(self, c, h=None, reason="no_keypoints"):
+        self.c, self.h, self.reason = c, h, reason
+        self.calls = 0
+        self.last_reason = None
+
+    def locate(self, image):
+        from bxjudge.stadium_locator import LocatedStadium, alignment_from_homography
+
+        self.calls += 1
+        if self.h is None:
+            self.last_reason = self.reason
+            return None
+        self.last_reason = None
+        return LocatedStadium(self.h, alignment_from_homography(self.c, self.h, 0.9), None)
+
+
+def _translation(dx, dy):
+    return np.array([[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]])
+
+
+def _keypoint_tracker(c, ref, locator):
+    return DynamicCalibration(c, ref, 30, load_video_policy()["stadium_follow"],
+                              load_dynamic_policy(), keypoint_locator=locator)
+
+
+def test_keypoints_relocate_when_the_reference_relocator_cannot():
+    ref, c = stadium_scene(size=(640, 360))
+    moved, truth = stadium_scene(size=(640, 360), shift=(45, -4))
+    fake = FakeLocator(c, _translation(45, -4))
+    obj = _keypoint_tracker(c, ref, fake)
+    obj.relocator.align = lambda image: None  # the rim match against the reference fails
+    assert obj.update(0, ref).alignment is not None
+    samples = [obj.update(f, moved) for f in range(1, 65)]
+    assert fake.calls >= 2
+    kinds = [s["kind"] for s in obj.segments]
+    assert kinds == ["recorded_snapshot", "relocated_keypoints"]
+    start = obj.segments[-1]["start_frame"]
+    # Nothing before the confirming frame is backfilled.
+    assert all(obj.samples[f].alignment is None for f in range(1, start))
+    assert obj.samples[start].status == "relocated"
+    good = [s for s in samples if s.alignment is not None][-1]
+    assert mean_boundary_error(warp_calibration(c, good.alignment, c.frame_size, c.name),
+                               truth, 640) < 2
+    tried = [d["relocation"] for d in obj.diagnostics.values() if d["relocation"]]
+    assert tried and all(r["keypoints"] == "located" for r in tried)
+
+
+def test_keypoint_relocation_obeys_the_global_bounds():
+    ref, c = stadium_scene(size=(640, 360))
+    moved, _ = stadium_scene(size=(640, 360), shift=(45, -4))
+    far = FakeLocator(c, _translation(300, 0))  # shift 0.47 of the width > max_shift_frac
+    obj = _keypoint_tracker(c, ref, far)
+    obj.relocator.align = lambda image: None
+    obj.update(0, ref)
+    assert all(obj.update(f, moved).alignment is None for f in range(1, 65))
+    assert len(obj.segments) == 1 and far.calls >= 2
+    tried = [d["relocation"]["keypoints"] for d in obj.diagnostics.values() if d["relocation"]]
+    assert set(tried) == {"keypoints_out_of_bounds"}
+
+
+def test_keypoint_failure_is_recorded_and_tracking_goes_on():
+    ref, c = stadium_scene(size=(640, 360))
+    flat = np.full_like(ref, 128)
+    broken = FakeLocator(c, None, "keypoint_error: RuntimeError: CUDA out of memory")
+    obj = _keypoint_tracker(c, ref, broken)
+    obj.update(0, ref)
+    assert all(obj.update(f, flat).alignment is None for f in range(1, 40))
+    assert obj.update(40, ref).alignment is None  # recovery still needs resume_frames
+    assert [obj.update(f, ref).alignment is not None for f in (41, 42)][-1]
+    tried = [d["relocation"]["keypoints"] for d in obj.diagnostics.values() if d["relocation"]]
+    assert tried and set(tried) == {"keypoint_error: RuntimeError: CUDA out of memory"}
+
+
+def test_without_a_locator_behaviour_is_unchanged():
+    ref, c = stadium_scene(size=(640, 360))
+    moved, _ = stadium_scene(size=(640, 360), shift=(45, -4))
+    plain, none = tracker(c, ref), _keypoint_tracker(c, ref, None)
+    for f, img in enumerate([ref] + [moved] * 64):
+        plain.update(f, img)
+        none.update(f, img)
+    assert plain.record() == none.record()
+    assert [s["kind"] for s in plain.segments] == ["recorded_snapshot", "relocated"]
+    none.finish()  # a no-op in fixed mode
+    assert plain.record() == none.record()

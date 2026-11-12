@@ -72,9 +72,15 @@ class DynamicCalibration:
     A new anchor needs several spaced, consistent independently validated registrations.
     Relocation never backfills its rejected confirmation prefix. Source-observed
     flow chains gain geometry only after template closure; bridges stay ineligible.
+
+    With a ``keypoint_locator`` (``stadium_locator.KeypointLocator``), a relocation attempt
+    whose rim match against the reference fails tries one keypoint fit; the candidate must
+    lie within the same broad bounds relative to the original calibration and goes through
+    the same ``confirmations``. Without one, behaviour is unchanged.
     """
 
-    def __init__(self, c: Calibration, reference, fps, follow_policy, policy, *, temporal_policy=None):
+    def __init__(self, c: Calibration, reference, fps, follow_policy, policy, *,
+                 temporal_policy=None, keypoint_locator=None):
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("fps must be positive finite")
         self.c = c
@@ -126,6 +132,8 @@ class DynamicCalibration:
         )
         self.foreground_boxes = []
         self.last_verified = None
+        self.keypoint_locator = keypoint_locator
+        self._keypoint_frames = set()  # pending candidates that came from keypoints
 
     def _compose(self, a):
         h = np.array(a.homography) @ self.anchor_h
@@ -156,6 +164,25 @@ class DynamicCalibration:
 
     def set_foreground(self, detections):
         self.foreground_boxes = [d.box for d in detections]
+
+    def finish(self):
+        """End of the video: nothing to check in fixed mode (the handheld tracker re-finds
+        its tail here); the pipeline calls it for either mode."""
+
+    def _keypoint_candidate(self, image, diagnostic):
+        """One keypoint fit as a relocation candidate within the broad global bounds."""
+        located = self.keypoint_locator.locate(image)
+        if located is None:
+            diagnostic["relocation"]["keypoints"] = self.keypoint_locator.last_reason
+            return None
+        original = self.anchor_h
+        self.anchor_h = np.eye(3)
+        candidate = self._compose(located.alignment)
+        self.anchor_h = original
+        diagnostic["relocation"]["keypoints"] = (
+            "located" if candidate is not None else "keypoints_out_of_bounds"
+        )
+        return candidate
 
     def _temporal_sample(self, frame, a, segment):
         temporal = self.temporal
@@ -281,6 +308,10 @@ class DynamicCalibration:
                 self.last_retry = frame
                 candidate = self.relocator.align(image)
                 diagnostic["relocation"] = dict(self.relocator.last_diagnostic)
+                if candidate is None and self.keypoint_locator is not None:
+                    candidate = self._keypoint_candidate(image, diagnostic)
+                    if candidate is not None:
+                        self._keypoint_frames.add(frame)
                 if candidate is None:
                     self.pending.clear()
                 else:
@@ -312,13 +343,18 @@ class DynamicCalibration:
                             {
                                 "id": len(self.segments),
                                 "start_frame": frame,
-                                "kind": "relocated",
+                                "kind": (
+                                    "relocated_keypoints"
+                                    if any(f in self._keypoint_frames for f, _ in self.pending)
+                                    else "relocated"
+                                ),
                                 "homography": self.anchor_h.tolist(),
                                 "confirmed_frames": [f for f, _ in self.pending],
                                 "score": candidate.score,
                             }
                         )
                         self.pending.clear()
+                        self._keypoint_frames.clear()
                         self.rejected_at = None
                         self.lost = False
                         self.good_run = 0
