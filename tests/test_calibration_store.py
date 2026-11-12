@@ -151,6 +151,79 @@ def test_snapshot_id_is_content_addressed(tmp_path):
     assert auto_a.id != auto_b.id  # an auto snapshot's alignment score is part of its identity
 
 
+def test_keypoint_snapshot_round_trips_and_score_is_part_of_identity(tmp_path):
+    img, c = stadium_scene()
+    h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
+    a = save_snapshot(tmp_path, "keypoints", c, img, score=0.91, homography=h,
+                      autocalib=shipped_autocalib())
+    b = save_snapshot(tmp_path, "keypoints", c, img, score=0.92, homography=h,
+                      autocalib=shipped_autocalib())
+    assert a.kind == "keypoints" and a.homography == h and a.score == pytest.approx(0.91)
+    assert a.template_id is None and a.template_set is None and a.source_path is None
+    assert a.id != b.id
+    assert load_snapshot(tmp_path, a.id, autocalib=shipped_autocalib()) == a
+
+
+def test_keypoint_snapshot_keeps_the_exact_score_and_ids_follow_the_canonical_rounding(tmp_path):
+    img, c = stadium_scene()
+    h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
+    a = save_snapshot(tmp_path, "keypoints", c, img, score=0.91234567, homography=h,
+                      autocalib=shipped_autocalib())
+    stored = json.loads((tmp_path / "calibrations" / f"{a.id}.json").read_text())
+    assert stored["snapshot"]["score"] == 0.91234567 and a.score == 0.91234567
+    b = save_snapshot(tmp_path / "b", "keypoints", c, img, score=0.91234999, homography=h,
+                      autocalib=shipped_autocalib())
+    assert b.id == a.id  # the id rounds the score to 4 decimals, as for auto
+
+
+@pytest.mark.parametrize("kind", ["auto", "keypoints"])
+@pytest.mark.parametrize("bad", ["score", "homography"])
+def test_non_finite_score_or_homography_is_refused(tmp_path, kind, bad):
+    img, c = stadium_scene()
+    h = [[1.0, 0.0, 5.0], [0.0, 1.0, 7.0], [0.0, 0.0, 1.0]]
+    score = 0.9
+    if bad == "score":
+        score = float("nan")
+    else:
+        h[0][2] = float("inf")
+    with pytest.raises(ValueError):
+        save_snapshot(tmp_path, kind, c, img, score=score, homography=h,
+                      autocalib=shipped_autocalib())
+    # A stored file with the value broken by hand is refused on load as well.
+    good = save_snapshot(tmp_path, kind, c, img, score=0.9, homography=[[1.0, 0, 5], [0, 1, 7],
+                                                                        [0, 0, 1]],
+                         autocalib=shipped_autocalib())
+    path = tmp_path / "calibrations" / f"{good.id}.json"
+    doc = json.loads(path.read_text())
+    if bad == "score":
+        doc["snapshot"]["score"] = float("nan")
+    else:
+        doc["snapshot"]["homography"][0][2] = float("inf")
+    path.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(tmp_path, good.id, autocalib=shipped_autocalib())
+
+
+def test_keypoint_snapshot_requires_a_homography(tmp_path):
+    img, c = stadium_scene()
+    with pytest.raises(ValueError, match="homography"):
+        save_snapshot(tmp_path, "keypoints", c, img, score=0.9, autocalib=shipped_autocalib())
+    assert not (tmp_path / "calibrations").exists()
+
+
+def test_keypoint_snapshot_can_be_vetoed_without_barring_templates(tmp_path):
+    calib, out = make_calib_dir(tmp_path, stadium_scene())
+    img, c = stadium_scene(shift=(45, 20))
+    h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
+    kp = save_snapshot(out, "keypoints", c, img, score=0.9, homography=h,
+                       autocalib=shipped_autocalib())
+    veto_calibration(out, kp.id, autocalib=shipped_autocalib(), video="clip.mp4")
+    assert vetoed_ids(out) == {kp.id}
+    # The template route is unaffected by a vetoed keypoint snapshot of the same video.
+    assert select_snapshot(img, calib, out, th(), load_autocalib_config(), vetoed_ids(out),
+                           video="clip.mp4").kind == "auto"
+
+
 def test_load_unknown_snapshot_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_snapshot(tmp_path, "0123456789abcdef", autocalib=shipped_autocalib())

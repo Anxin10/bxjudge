@@ -11,7 +11,9 @@ score is fixed at creation, so it is part of its identity, as is its
 ``calib/`` when it was created. The JSON is a normal calibration file
 (``calibration.load_calibration`` reads it; ``ref_frame`` is stored relative to it so a moved
 results folder still loads) plus a ``snapshot`` block with the kind, score, template id,
-template set, manual source hash and homography.
+template set, manual source hash and homography. A keypoints snapshot (found by the stadium
+keypoint model, ``stadium_locator.keypoint_snapshot``) keeps its fit coverage as an identity
+score and its homography from stadium model px to its own reference image.
 
 ``select_snapshot`` picks the calibration for a video's first-second frame: a manual calibration
 with enough similarity first (used unrefined, spec §6.5c), else the auto snapshot made by
@@ -19,7 +21,7 @@ aligning every manual template to the frame and keeping the best (spec §6.1/§6
 reference image is the frame itself; spec §6.3: every video is aligned on its own frame, so its
 calibration never depends on the other videos in the batch), else ``None`` (``recalibrate``).
 
-A reviewer can veto an auto snapshot (``veto_calibration``; spec section 6.5, ruling T4-1): the
+A reviewer can veto an auto or keypoints snapshot (``veto_calibration``; spec section 6.5, ruling T4-1): the
 veto lives in ``<results>/calibration_vetoes.json``, keyed by snapshot id, and is honoured by
 selection and by every ``matches.csv`` rebuild; it never rewrites a judged row.
 """
@@ -54,7 +56,8 @@ log = logging.getLogger(__name__)
 _POLY_FIELDS = [z[0] for z in ZONES]
 _ID_LEN = 16
 _MANUAL_STORED_SCORE = 1.0  # stored in a manual snapshot's file: its own image vs itself
-_KINDS = ("manual", "auto")
+_KINDS = ("manual", "auto", "keypoints")
+_SCORED_KINDS = ("auto", "keypoints")  # score fixed at creation: part of the identity
 _LOAD_ERRORS = (OSError, ValueError, KeyError, TypeError, cv2.error)
 _PALETTE = [(0, 255, 255), (255, 255, 0), (0, 255, 0), (255, 0, 255),
             (0, 165, 255), (255, 128, 0), (0, 0, 255), (255, 0, 0)]  # one BGR colour per zone
@@ -63,13 +66,14 @@ _PALETTE = [(0, 255, 255), (255, 255, 0), (0, 255, 0), (255, 0, 255),
 @dataclass(frozen=True)
 class Snapshot:
     id: str
-    kind: str  # "manual" | "auto"
+    kind: str  # "manual" | "auto" | "keypoints"
     calibration: Calibration  # ref_frame = absolute path of <id>.png
-    score: float  # manual: similarity to the frame; auto: alignment score
+    score: float  # manual: similarity to the frame; auto: alignment score; keypoints: fit coverage
     template_id: str | None  # auto: snapshot id of the manual template it was derived from
     source_path: str | None  # manual: the calib/ JSON it was copied from
     source_sha256: str | None  # manual: SHA-256 of that JSON's bytes
-    homography: tuple | None  # auto: 3x3 template px -> frame px
+    # auto: 3x3 template px -> frame px; keypoints: stadium model px -> reference image px
+    homography: tuple | None
     # auto: sorted manual snapshot ids of all readable calib/ templates at creation (F-2)
     template_set: tuple[str, ...] | None = None
 
@@ -87,7 +91,7 @@ def _canonical(kind: str, c: Calibration, score: float, template_id: str | None,
         "frame_size": [int(c.frame_size[0]), int(c.frame_size[1])],
         "zones": {f: [[round(float(x), 2), round(float(y), 2)] for x, y in getattr(c, f)]
                   for f in _POLY_FIELDS},
-        "score": round(float(score), 4) if kind == "auto" else None,
+        "score": round(float(score), 4) if kind in _SCORED_KINDS else None,
         "template_id": template_id,
         "template_set": None if template_set is None else list(template_set),
         "source_sha256": source_sha256,
@@ -130,12 +134,18 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
         raise ValueError(f"snapshot kind must be one of {_KINDS}, got {kind!r}")
     if kind == "manual" and template_set is not None:
         raise ValueError("a manual snapshot has no template_set")
+    if kind == "keypoints" and homography is None:
+        raise ValueError("a keypoints snapshot needs its homography")
+    if not math.isfinite(float(score)):
+        raise ValueError("snapshot score must be finite")
     tset = None if template_set is None else tuple(sorted(set(template_set)))
     png = _encode_png(ref_image)
     sha = _sha256_file(source_path) if source_path is not None else None
     hom = None if homography is None else tuple(tuple(float(v) for v in row) for row in homography)
+    if hom is not None and not all(math.isfinite(v) for row in hom for v in row):
+        raise ValueError("snapshot homography must be finite")
     sid = _snapshot_id(kind, calibration, score, template_id, sha, hom, png, tset)
-    stored_score = float(score) if kind == "auto" else _MANUAL_STORED_SCORE
+    stored_score = float(score) if kind in _SCORED_KINDS else _MANUAL_STORED_SCORE
     d = _cal_dir(out_dir)
     jpath, ppath = d / f"{sid}.json", d / f"{sid}.png"
     if not jpath.is_file():
@@ -216,17 +226,20 @@ def _checked_meta(doc, cfg: AutoCalibConfig) -> dict:
         raise TypeError("snapshot id is not a string")
     if meta.get("kind") not in _KINDS:
         raise ValueError(f"unknown kind {meta.get('kind')!r}")
-    if not _is_number(meta.get("score")):
-        raise ValueError("score is not a number")
+    if not (_is_number(meta.get("score")) and math.isfinite(meta["score"])):
+        raise ValueError("score is not a finite number")
     for key in ("template_id", "source_path", "source_sha256"):
         if meta.get(key) is not None and not isinstance(meta[key], str):
             raise ValueError(f"{key} is not a string")
     hom = meta.get("homography")
     if hom is not None and not (
         isinstance(hom, list) and len(hom) == 3
-        and all(isinstance(r, list) and len(r) == 3 and all(map(_is_number, r)) for r in hom)
+        and all(isinstance(r, list) and len(r) == 3
+                and all(_is_number(v) and math.isfinite(v) for v in r) for r in hom)
     ):
         raise ValueError("homography is not a 3x3 matrix of numbers")
+    if meta["kind"] == "keypoints" and hom is None:
+        raise ValueError("a keypoints snapshot has no homography")
     tset = meta.get("template_set")
     if tset is not None and not (isinstance(tset, list) and all(isinstance(t, str) for t in tset)):
         raise ValueError("template_set is not a list of strings")
@@ -303,6 +316,8 @@ def _barred_templates(out_dir: Path, video: str | None,
         if video not in entries[sid]["videos"]:
             continue
         snap = load_snapshot(out_dir, sid, autocalib=cfg)
+        if snap.kind == "keypoints":
+            continue  # a keypoint snapshot has no template; its own route checks the veto
         if snap.kind != "auto":
             raise ValueError(f"vetoed calibration {sid} is not auto")
         if snap.template_id in template_ids:
@@ -430,7 +445,7 @@ def vetoed_ids(out_dir: Path) -> set[str]:
 
 def veto_calibration(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibConfig,
                      note: str = "", rules=None, video: str | None = None) -> None:
-    """「不採用此組校準」: record a veto of AUTO snapshot ``snapshot_id`` (ruling T4-1: a wrong
+    """「不採用此組校準」: record a veto of AUTO or KEYPOINTS snapshot ``snapshot_id`` (ruling T4-1: a wrong
     manual calibration is fixed in ``calib/``) as ``{id: {at, note, videos}}`` in
     ``<out_dir>/calibration_vetoes.json`` and rebuild the CSVs through ``save_rounds``.
     The group's unreviewed rounds stop scoring in ``matches.csv``; no row is changed.
@@ -441,9 +456,10 @@ def veto_calibration(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibCon
         snap = load_snapshot(out_dir, snapshot_id, autocalib=autocalib)
     except FileNotFoundError as e:
         raise ValueError(str(e)) from None
-    if snap.kind != "auto":
-        raise ValueError(f"calibration snapshot {snapshot_id} is {snap.kind}: only auto "
-                         "calibrations can be vetoed (edit the manual calibration in calib/)")
+    if snap.kind == "manual":
+        raise ValueError(f"calibration snapshot {snapshot_id} is manual: only auto and "
+                         "keypoints calibrations can be vetoed (edit the manual calibration "
+                         "in calib/)")
     vetoes = _read_vetoes(out_dir)
     names = set(vetoes[snapshot_id]["videos"]) if snapshot_id in vetoes else set()
     if video is not None:

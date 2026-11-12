@@ -84,7 +84,7 @@ def _calibration(row: dict, out: Path, rules, autocalib: AutoCalibConfig):
     if preview.is_file():
         with st.expander("校準組預覽圖"):
             st.image(str(preview), caption=preview.name, width="stretch")
-    if snap.kind == "auto":  # ruling T4-1: only auto calibrations can be vetoed
+    if snap.kind in ("auto", "keypoints"):  # ruling T4-1: manual calibrations are fixed in calib/
         try:
             vetoed = snap.id in vetoed_ids(out)
             if vetoed and st.button(ui.UNVETO_BUTTON, key=f"unveto-{snap.id}"):
