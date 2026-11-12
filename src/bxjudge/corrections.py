@@ -30,8 +30,8 @@ _ZONES = get_args(Zone)
 EDITABLE_FIELDS: dict[str, tuple | type] = {
     "x_touch": _TOUCH,
     "b_touch": _TOUCH,
-    "x_landed": bool,
-    "b_landed": bool,
+    "x_landed": (True, False, None),
+    "b_landed": (True, False, None),
     "x_land_zone": (*_ZONES, None),
     "b_land_zone": (*_ZONES, None),
     "x_spin_dir": _SPIN,
@@ -110,7 +110,9 @@ def _check_consistency(row: dict, changed: set[str]) -> None:
     for side in ("x", "b"):
         if changed & {f"{side}_landed", f"{side}_land_zone"}:
             landed, zone = eff[f"{side}_landed"], eff[f"{side}_land_zone"]
-            if landed != (zone == "battle_area"):
+            if (landed is None and zone is not None) or (
+                landed is not None and landed != (zone == "battle_area")
+            ):
                 raise CorrectionError(
                     f"{side}_landed={landed!r} contradicts {side}_land_zone={zone!r}: "
                     "landed means the first stable zone is battle_area"

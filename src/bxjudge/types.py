@@ -78,7 +78,7 @@ class Calibration:
 @dataclass
 class LaunchCheck:
     touch: dict[Side, TouchState]
-    landed: dict[Side, bool]
+    landed: dict[Side, bool | None]
     landing_frame: dict[Side, int | None]
     landing_zone: dict[Side, Zone | None]
     air_collision: AirState

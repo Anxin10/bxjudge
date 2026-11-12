@@ -220,15 +220,19 @@ class LaunchAnalysis:
     window: tuple[int, int]
     impacts: set[int]
     air_collision_frame: int | None = None
+    deadlines: dict[Side, int | None] | None = None
 
 
-def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float, *, sides_override: dict[int,Side] | None = None) -> LaunchAnalysis:
+def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float, *, sides_override: dict[int, Side] | None = None,
+                   release_frames: dict[int, int] | None = None) -> LaunchAnalysis:
     """Combine launch evidence without choosing between missing/duplicate side tracks.
 
     The missing-landing cap bounds the search for battle-area settling. Within that
     search, a battle-area episode takes precedence over an earlier lid/rim episode.
     Physical settle impacts and the first actual floor cutoff remain independent
-    of that eligibility deadline. The touch window is half-open [start, end).
+    of that eligibility deadline. In two-top judging each deadline starts at an
+    observed release; a missing clock leaves landing unknown. The touch window
+    is half-open [start, end), and empty if either release is unresolved.
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
@@ -238,29 +242,61 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
     first = min((t.first_frame() for t in bey_tracks if t.cls == 'bey' and t.dets), default=0)
     start = max(0, first - round(th.launch_pre_s * fps))
     cap = first + round(th.launch_missing_landing_s * fps)
+    clocked = release_frames is not None
+    deadlines = None
+    if clocked:
+        valid = [
+            Track(t.track_id, t.cls, [d for d in t.dets if d.frame >= release_frames[t.track_id]])
+            for t in valid if t.track_id in release_frames and len(by_side[sides[t.track_id]]) == 1
+        ]
+        valid = [t for t in valid if t.dets]
+        by_side = {side: [t for t in valid if sides[t.track_id] == side] for side in _SIDES}
+    span = round(th.launch_missing_landing_s * fps)
+    caps = {t.track_id: release_frames[t.track_id] + span if clocked else cap for t in valid}
+    if clocked:
+        deadlines = {side: caps[ts[0].track_id] if len(ts) == 1 else None
+                     for side, ts in by_side.items()}
+        known_releases = [release_frames[t.track_id] for t in valid]
+        if all(value is not None for value in deadlines.values()):
+            start = max(0, min(known_releases) - round(th.launch_pre_s * fps))
+            cap = max(caps.values())
+        else:
+            start = cap = 0
     all_episodes = {t.track_id: find_settles(t, c, th) for t in valid}
     eligible_episodes = {
-        tid: [(f, z) for f, z in settles if f + th.settle_frames - 1 <= cap]
+        tid: [(f, z) for f, z in settles if f + th.settle_frames - 1 <= caps[tid]]
         for tid, settles in all_episodes.items()
     }
     physical_floor = {tid: next((f for f, z in settles if z == 'battle_area'), None)
                       for tid, settles in all_episodes.items()}
     landing_frame = dict.fromkeys(_SIDES)
     landing_zone = dict.fromkeys(_SIDES)
-    landed = dict.fromkeys(_SIDES, False)
+    landed = dict.fromkeys(_SIDES, None if clocked else False)
     notes = []
     for side, tracks in by_side.items():
         if len(tracks) != 1:
-            notes.append(f'track_evidence_{"missing" if not tracks else "duplicate"}@{side}')
+            if clocked and not tracks:
+                notes.append(f"launch_timing_unknown@{side}")
+            else:
+                notes.append(f'track_evidence_{"missing" if not tracks else "duplicate"}@{side}')
             continue
-        settles = eligible_episodes[tracks[0].track_id]
-        late = next((f for f, z in all_episodes[tracks[0].track_id]
-                     if z == 'battle_area' and f + th.settle_frames - 1 > cap), None)
+        track = tracks[0]
+        deadline = caps[track.track_id]
+        settles = eligible_episodes[track.track_id]
+        late = next((f for f, z in all_episodes[track.track_id]
+                     if z == 'battle_area' and f + th.settle_frames - 1 > deadline), None)
         if late is not None and not any(z == 'battle_area' for _, z in settles):
             notes.append(f'landing_timing_unknown@{side}:{late}')
         selected = next(((f, z) for f, z in settles if z == 'battle_area'), settles[0] if settles else (None, None))
         landing_frame[side], landing_zone[side] = selected
         landed[side] = selected[1] == 'battle_area'
+        if clocked and not landed[side]:
+            # A partial observation window cannot prove that a launch missed.
+            frames = {d.frame for d in track.dets}
+            if any(f not in frames for f in range(release_frames[track.track_id], deadline + 1)):
+                landed[side] = None
+                landing_frame[side] = landing_zone[side] = None
+                notes.append(f"landing_observation_incomplete@{side}")
     end = max(landing_frame.values()) + round(th.launch_post_s * fps) if all(landed.values()) else cap
     impacts = impact_frames(valid, physical_floor, c, th)
     # Every physical settle can cause a shake, including post-deadline episodes.
@@ -272,8 +308,11 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
             side = _launch_side(t.center_at(t.first_frame()), c)
             if side is not None:
                 launcher_sides[t.track_id] = side
-    touch, touch_notes = detect_touch(disp, launchers, launcher_sides, impacts, (start, end), c, th)
-    notes.extend(touch_notes)
+    if clocked and end == 0:
+        touch = dict.fromkeys(_SIDES, "unknown")
+    else:
+        touch, touch_notes = detect_touch(disp, launchers, launcher_sides, impacts, (start, end), c, th)
+        notes.extend(touch_notes)
     if all(len(tracks) == 1 for tracks in by_side.values()):
         air, air_frame, air_notes = _air_collision_evidence(
             by_side['X'][0], by_side['B'][0],
@@ -285,7 +324,7 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
         for side in _SIDES:
             if touch[side] != 'yes':
                 touch[side] = 'unknown'
-    return LaunchAnalysis(LaunchCheck(touch, landed, landing_frame, landing_zone, air, notes), sides, (start, end), impacts, air_frame)
+    return LaunchAnalysis(LaunchCheck(touch, landed, landing_frame, landing_zone, air, notes), sides, (start, end), impacts, air_frame, deadlines)
 
 def check_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float) -> tuple[LaunchCheck, dict[int, Side]]:
     """Public launch verdict, sharing the exact analysis used by motion exports."""

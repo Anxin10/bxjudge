@@ -5,8 +5,9 @@ Unknown release/identity remains review-required instead of being silently resol
 """
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import supervision as sv
@@ -148,6 +149,84 @@ def launch_sample_count(playback_seconds: float, avg_fps: float) -> int:
     """Minimum consecutive samples for a launch hold or separation."""
     return max(2, math.ceil(playback_seconds * avg_fps - 1e-9))
 
+
+@dataclass(frozen=True)
+class LaunchSegment:
+    state: Literal["mounted", "separated", "unknown"]
+    first_frame: int
+    last_frame: int
+    launcher_id: int | None = None
+    confirmed_at_frame: int | None = None
+
+
+def _append_segment(segments, segment):
+    if segments:
+        last = segments[-1]
+        if (last.state == segment.state and last.launcher_id == segment.launcher_id
+                and last.last_frame + 1 == segment.first_frame):
+            segments[-1] = replace(last, last_frame=segment.last_frame)
+            return
+    segments.append(segment)
+
+
+def observe_launch_segments(tracks, fps, policy, frame_size):
+    """Classify observed launcher context without changing the tracking population."""
+    held_n = launch_sample_count(policy["held_s"], fps)
+    free_n = launch_sample_count(policy["separation_s"], fps)
+    margin = policy["body_margin_px"]
+    width, height = frame_size
+    bodies = {}
+    for track in tracks:
+        if track.cls == "launcher":
+            for detection in track.dets:
+                bodies.setdefault(detection.frame, []).append((track.track_id, detection.box))
+
+    result = {}
+    for track in tracks:
+        if track.cls != "bey" or not track.dets:
+            continue
+        raw = []
+        owner = previous = None
+        for d in sorted(track.dets, key=lambda d: d.frame):
+            if d.frame == previous:
+                raise ValueError(f"duplicate launch observation at source frame {d.frame}")
+            if previous is not None and d.frame > previous + 1:
+                _append_segment(raw, LaunchSegment("unknown", previous + 1, d.frame - 1))
+                owner = None
+            previous = d.frame
+            x0, y0, x1, y1 = d.box
+            visible = 0 < x0 < x1 < width and 0 < y0 < y1 < height
+            observed = bodies.get(d.frame, [])
+            close = [tid for tid, box in observed if _distance(d.box, box) <= margin] if visible else []
+            if len(close) == 1:
+                owner = close[0]
+                state = "mounted"
+            elif visible and not close and owner is not None and sum(tid == owner for tid, _ in observed) == 1:
+                state = "separated"
+            else:
+                owner = None
+                state = "unknown"
+            _append_segment(raw, LaunchSegment(state, d.frame, d.frame, owner))
+
+        confirmed = []
+        for segment in raw:
+            size = segment.last_frame - segment.first_frame + 1
+            required = None
+            if segment.state == "mounted" and size >= held_n:
+                required = held_n
+            elif segment.state == "separated" and size >= free_n and confirmed:
+                mount = confirmed[-1]
+                if (mount.state == "mounted" and mount.launcher_id == segment.launcher_id
+                        and mount.last_frame + 1 == segment.first_frame):
+                    required = free_n
+            _append_segment(
+                confirmed,
+                replace(segment, confirmed_at_frame=segment.first_frame + required - 1)
+                if required is not None
+                else LaunchSegment("unknown", segment.first_frame, segment.last_frame),
+            )
+        result[track.track_id] = confirmed
+    return result
 
 def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
     if not math.isfinite(fps) or fps <= 0:

@@ -52,7 +52,12 @@ from .finish import (
 )
 from .identity import anchor_sides, inherited_sides, load_identity_policy
 from .launch_check import analyze_launch
-from .launch_phase import launch_sample_count, load_launch_policy, prepare_launch_tracks
+from .launch_phase import (
+    launch_sample_count,
+    load_launch_policy,
+    observe_launch_segments,
+    prepare_launch_tracks,
+)
 from .manifest import (
     VideoInfo,
     forget_processed,
@@ -89,6 +94,7 @@ from .two_bey_integration import (
     appearance_descriptor,
     infer_opponent_side,
     reconstruct_round_tracks,
+    round_release_evidence,
 )
 from .two_bey_tracking import identity_unknown_at
 from .two_bey_tracking import load_policy as load_two_bey_policy
@@ -369,7 +375,10 @@ def judge_video(
         rounds = segment_rounds(bey_tracks, info.fps, th)
         physical_rounds={}
         adjudication_rounds={}
+        releases_by_round = {}
         if two_policy is not None:
+            native_segments = observe_launch_segments(native_tracks, info.fps, phase_policy, c.frame_size)
+            required_separation_frames = launch_sample_count(phase_policy["separation_s"], info.fps)
             offset=max((t.track_id for t in native_tracks),default=0)
             phase_keys={(d.frame,tuple(d.box),d.score) for t in raw_tracks if t.cls=='bey' for d in t.dets}
             for number,(start,end) in enumerate(rounds,1):
@@ -396,6 +405,15 @@ def judge_video(
                 if proof is not None:
                     side_hints[proof["track_id"]] = proof["side"]
                     opponent_anchors[number] = proof
+                releases_by_round[number] = round_release_evidence(
+                    physical, adjudication_rounds[number], side_hints, native_segments, c,
+                    required_frames=required_separation_frames,
+                )
+            record["launch_timing"] = {
+                "native_segments": {str(k): [asdict(segment) for segment in segments]
+                                    for k, segments in native_segments.items()},
+                "round_releases": releases_by_round,
+            }
             record["identity"]["opponent_anchors"] = opponent_anchors
             record['two_bey_tracking']={'policy':two_policy,'rounds':{str(n):p.record for n,p in physical_rounds.items()},
                 'raw_source_tracks':[asdict(t) for t in native_tracks], 'association_source':'native_tracks',
@@ -461,6 +479,11 @@ def judge_video(
                     judgment_tracks=[],unassigned=[])
                 continue
             launchers = [t for t in tracks if t.cls == "launcher"]
+            release_options = (
+                {"release_frames": {track_id: proof["frame"] for track_id, proof in
+                                    releases_by_round[number].items()}}
+                if number in releases_by_round else {}
+            )
             analysis = analyze_launch(
                 current,
                 launchers,
@@ -469,6 +492,7 @@ def judge_video(
                 th,
                 info.fps,
                 **({"sides_override": side_hints} if geometry is not None else {}),
+                **release_options,
             )
             launch, sides = analysis.check, analysis.sides
             counts = Counter(sides.values())
@@ -555,6 +579,13 @@ def judge_video(
                 )
                 if number in physical_rounds:
                     dynamic_notes.append('two_bey_tracking_requires_review')
+                    releases = releases_by_round[number]
+                    if (len(releases) == 2 and candidate.frame is not None
+                            and candidate.frame < max(p["confirmed_at_frame"] for p in releases.values())):
+                        finish = type(finish)(
+                            None, None, None, 0.0,
+                            [*finish.reasons, "finish_before_confirmed_launch"],
+                        )
                     proof = opponent_anchors.get(number)
                     if proof is not None:
                         dynamic_notes.append("identity_inferred_from_observed_pair")
@@ -669,6 +700,8 @@ def judge_video(
                 },
                 "impact_frames": sorted(analysis.impacts),
             }
+            if number in releases_by_round:
+                r.motion_evidence["landing_deadlines"] = analysis.deadlines
             if timing:
                 stop_windows = [
                     (

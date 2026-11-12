@@ -3,13 +3,15 @@
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import pairwise
 
 import cv2
 
 from .geometry import box_center, boxes_touch, zone_of
 from .identity import IdentityAnchors
+from .launch_phase import LaunchSegment
 from .two_bey_tracking import TwoBeyTracker
-from .types import Calibration, Detection, Track
+from .types import Calibration, Detection, Side, Track
 
 
 def appearance_descriptor(image, box, bins):
@@ -115,6 +117,75 @@ def infer_opponent_side(
         "launcher_anchor_last_frame": last,
         "frames": run,
     }
+
+
+def round_release_evidence(
+    physical: PhysicalRound,
+    registered: list[Track],
+    sides: dict[int, Side],
+    segments: dict[int, list[LaunchSegment]],
+    calibration: Calibration,
+    *,
+    required_frames: int,
+) -> dict[int, dict]:
+    """Use only release evidence assigned to this physical actor in this round."""
+    record = physical.record
+    if len(registered) != 2 or record["pair_confirmed_at_frame"] is None:
+        return {}
+    counts = Counter(sides[t.track_id] for t in registered if t.track_id in sides)
+    observed = {
+        (o["entity_id"], o["frame"]): o["native_id"]
+        for o in record["observations"] if o["identity_valid"]
+    }
+    candidates = defaultdict(list)
+    actor_ids = {t.track_id: actor for actor, t in enumerate(physical.tracks, 1)}
+    for track in registered:
+        actor = actor_ids[track.track_id]
+        if counts[sides.get(track.track_id)] != 1:
+            continue
+        for native_id in physical.members[track.track_id]:
+            states = segments.get(native_id, [])
+            for mount, release in pairwise(states):
+                if release.state != "separated":
+                    continue
+                first = release.first_frame
+                confirmed = release.confirmed_at_frame
+                if not record["first_frame"] <= first <= confirmed <= record["last_frame"]:
+                    continue
+                if any(observed.get((actor, f)) != native_id for f in range(first, confirmed + 1)):
+                    continue
+                candidates[track.track_id].append({
+                    "native_id": native_id, "launcher_id": release.launcher_id,
+                    "mounted": [mount.first_frame, mount.last_frame],
+                    "frame": first, "confirmed_at_frame": confirmed,
+                })
+    selected = {track_id: choices[0] for track_id, choices in candidates.items() if len(choices) == 1}
+    if not selected:
+        return {}
+
+    # A later pickup and relaunch cannot supply the clock of an already
+    # observed exchange. Projection is a veto only, never release evidence.
+    a, b = ({d.frame: d.box for d in t.dets} for t in registered)
+    before = max(proof["mounted"][0] for proof in selected.values())
+    previous = None
+    length = 0
+    for f in sorted(a.keys() & b.keys()):
+        if f >= before:
+            break
+        if boxes_touch(a[f], b[f]) or any(
+            zone_of(box_center(box), calibration) != "battle_area" for box in (a[f], b[f])
+        ):
+            previous = None
+            length = 0
+            continue
+        length = length + 1 if previous == f - 1 else 1
+        previous = f
+        if length >= required_frames:
+            return {
+                track_id: proof for track_id, proof in selected.items()
+                if proof["mounted"][0] <= f
+            }
+    return selected
 
 def reconstruct_round_tracks(
     tracks, first, last, fps, frame_size, features, policy, id_offset

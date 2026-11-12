@@ -40,6 +40,7 @@ UNVETO_BUTTON = "恢復採用此組校準"
 
 _TOUCH = {"yes": "有碰觸", "no": "沒有碰觸", "unknown": "不確定"}
 _LANDED = {True: "是", False: "否"}
+_LANDING_EVIDENCE = {**_LANDED, None: "不確定"}
 _ZONE = {
     None: "（未知）",
     "battle_area": "下盤戰鬥區",
@@ -64,11 +65,11 @@ _WINNER = {None: "（無）", "X": "X（左方）", "B": "B（右方）"}
 # field -> (Traditional Chinese label, value -> label); order = form order
 FIELDS: dict[str, tuple[str, dict]] = {
     "x_touch": ("X 方發射觸碰盤面", _TOUCH),
-    "x_landed": ("X 方落入戰鬥區", _LANDED),
+    "x_landed": ("X 方落入戰鬥區", _LANDING_EVIDENCE),
     "x_land_zone": ("X 方落地區域", _ZONE),
     "x_spin_dir": ("X 方旋轉方向", _SPIN),
     "b_touch": ("B 方發射觸碰盤面", _TOUCH),
-    "b_landed": ("B 方落入戰鬥區", _LANDED),
+    "b_landed": ("B 方落入戰鬥區", _LANDING_EVIDENCE),
     "b_land_zone": ("B 方落地區域", _ZONE),
     "b_spin_dir": ("B 方旋轉方向", _SPIN),
     "air_collision": ("空中碰撞（空判）", _AIR),

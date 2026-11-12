@@ -173,6 +173,8 @@ def decide_round(r: RoundResult, rules: Rules, misses: dict[Side, int]) -> Round
     missers: list[Side] = []  # sides at fault (an air collision blames nobody)
     lc, cfg = r.launch, rules.launch_check
     if lc is not None:
+        if any(lc.landed.get(side, True) is None for side in SIDES):
+            return RoundOutcome("redo", None, 0, ["launch_landing_unknown"])
         for side in SIDES:
             faults = []
             if lc.touch.get(side) == "yes" and cfg["stadium_touch"] == "redo":

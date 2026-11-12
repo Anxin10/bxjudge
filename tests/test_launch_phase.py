@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from bxjudge.launch_phase import load_launch_policy, prepare_launch_tracks
 from tests.helpers import make_track
 
@@ -305,3 +307,133 @@ def test_velocity_window_policy_requires_explicit_integer_budget(tmp_path):
         path.write_text(yaml.safe_dump({**base,"link_velocity_frames":invalid}))
         with pytest.raises(ValueError):
             load_launch_policy(path)
+
+
+
+def test_launch_segments_require_fresh_support_after_unknown_prefix():
+    from bxjudge.launch_phase import observe_launch_segments
+
+    bey = make_track(1, "bey", {f: (200, 50 if f < 17 else 100) for f in range(22)})
+    body = make_track(2, "launcher", {f: (200, 45) for f in range(10, 22)})
+    result = observe_launch_segments([bey, body], 30.01, load_launch_policy(), (640, 360))
+    segments = result[1]
+    assert [(s.state, s.first_frame, s.last_frame) for s in segments] == [
+        ("unknown", 0, 9), ("mounted", 10, 16), ("separated", 17, 21),
+    ]
+    assert segments[2].launcher_id == 2
+    assert segments[2].confirmed_at_frame == 20
+
+
+def test_launch_segments_keep_body_loss_and_track_gap_unknown():
+    from bxjudge.launch_phase import observe_launch_segments
+
+    bey = make_track(1, "bey", {f: (200, 50 if f < 17 else 100) for f in range(22) if f != 17})
+    body = make_track(2, "launcher", {f: (200, 45) for f in range(10, 22) if f != 16})
+    result = observe_launch_segments([bey, body], 30, load_launch_policy(), (640, 360))
+    assert [(s.state, s.first_frame, s.last_frame) for s in result[1]] == [
+        ("unknown", 0, 9), ("mounted", 10, 15), ("unknown", 16, 21),
+    ]
+
+
+def test_landing_clock_uses_each_released_track_and_unknown_has_no_deadline(th):
+    from dataclasses import replace
+
+    from bxjudge.launch_check import analyze_launch
+    from tests.helpers import make_calibration
+
+    # Both held prefixes already project inside battle_area. A short window
+    # makes the independent offsets observable even though the clock is synthetic.
+    th = replace(th, launch_missing_landing_s=0.3)
+    x = make_track(1, "bey", {f: (200, 110 if f < 100 else 170) for f in range(113)})
+    b = make_track(2, "bey", {f: (440, 110 if f < 120 else 170) for f in range(133)})
+    disp = dict.fromkeys(range(160), 0.0)
+    analysis = analyze_launch(
+        [x, b], [], disp, make_calibration(), th, 30, sides_override={1: "X", 2: "B"},
+        release_frames={1: 100, 2: 120},
+    )
+    assert analysis.deadlines == {"X": 109, "B": 129}
+    assert analysis.check.landed == {"X": True, "B": True}
+    assert analysis.check.landing_frame == {"X": 100, "B": 120}
+
+    partial = analyze_launch(
+        [x, b], [], disp, make_calibration(), th, 30, sides_override={1: "X", 2: "B"},
+        release_frames={2: 120},
+    )
+    assert partial.deadlines == {"X": None, "B": 129}
+    assert partial.check.landed == {"X": None, "B": True}
+    assert partial.check.landing_frame == {"X": None, "B": 120}
+    assert partial.check.touch == {"X": "unknown", "B": "unknown"}
+
+
+
+def test_later_relaunch_cannot_reset_an_earlier_observed_exchange():
+    from bxjudge.launch_phase import LaunchSegment
+    from bxjudge.two_bey_integration import (
+        reconstruct_round_tracks,
+        round_release_evidence,
+    )
+    from bxjudge.two_bey_tracking import load_policy
+    from tests.helpers import make_calibration
+
+    c = make_calibration()
+    raw = [make_track(i, "bey", {f: (x, 200) for f in range(30)})
+           for i, x in ((1, 200), (2, 440))]
+    physical = reconstruct_round_tracks(raw, 0, 29, 30, c.frame_size, {}, load_policy(Path('config/two_bey_tracking.yaml')), 10)
+    proof = {
+        1: [LaunchSegment("mounted", 10, 16, 3, 15),
+            LaunchSegment("separated", 17, 20, 3, 19)],
+        2: [LaunchSegment("mounted", 10, 16, 4, 15),
+            LaunchSegment("separated", 17, 20, 4, 19)],
+    }
+    assert round_release_evidence(
+        physical, physical.tracks, {11: "X", 12: "B"}, proof, c, required_frames=3,
+    ) == {}
+
+
+def test_release_needs_the_same_observed_native_actor_at_confirmation():
+    from bxjudge.launch_phase import LaunchSegment
+    from bxjudge.two_bey_integration import (
+        reconstruct_round_tracks,
+        round_release_evidence,
+    )
+    from bxjudge.two_bey_tracking import load_policy
+    from tests.helpers import make_calibration
+
+    c = make_calibration()
+    raw = [make_track(i, "bey", {f: (x, 200) for f in range(10, 18)})
+           for i, x in ((1, 200), (2, 440))]
+    physical = reconstruct_round_tracks(raw, 10, 17, 30, c.frame_size, {}, load_policy(Path('config/two_bey_tracking.yaml')), 10)
+    proof = {
+        1: [LaunchSegment("mounted", 4, 9, 3, 9), LaunchSegment("separated", 10, 17, 3, 12)],
+    }
+    args = physical, physical.tracks, {11: "X", 12: "B"}, proof, c
+    assert round_release_evidence(*args, required_frames=3)[11]["frame"] == 10
+    evidence = next(o for o in physical.record["observations"]
+                    if o["entity_id"] == 1 and o["frame"] == 11)
+    evidence["identity_valid"] = False
+    assert round_release_evidence(*args, required_frames=3) == {}
+
+
+def test_unknown_launch_landing_round_trips_and_never_charges_a_repeat_miss(rules):
+    from dataclasses import replace
+
+    from bxjudge.output import _result_row, row_to_result
+    from bxjudge.rules import decide_round
+    from bxjudge.types import LaunchCheck
+    from tests.helpers import rr
+
+    row = rr("spin", "X")
+    row.launch = LaunchCheck(
+        {"X": "unknown", "B": "unknown"}, {"X": None, "B": False},
+        {"X": None, "B": None}, {"X": None, "B": None}, "maybe", ["launch_timing_unknown@X"],
+    )
+    saved = _result_row(row)
+    assert saved["x_landed"] is None
+    reread = row_to_result(saved)
+    config = replace(rules, launch_check={
+        **rules.launch_check, "repeat_miss_penalty": "opponent_1pt_on_2nd_miss",
+    })
+    misses = {"X": 1, "B": 1}
+    outcome = decide_round(reread, config, misses)
+    assert (outcome.action, outcome.scorer, outcome.points) == ("redo", None, 0)
+    assert misses == {"X": 1, "B": 1}

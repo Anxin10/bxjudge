@@ -482,3 +482,38 @@ def test_pair_anchor_enters_pipeline_without_confirming_an_earlier_finish(
         assert "identity_pair_evidence_after_candidate" in r.review_reasons
     else:
         assert r.winner == "X"
+
+
+
+@pytest.mark.parametrize("candidate_frame", [82, 105])
+def test_observed_releases_supply_separate_landing_clocks_to_judging(
+    candidate_frame, tmp_path, monkeypatch, th, rules,
+):
+    import json
+
+    from bxjudge import pipeline
+    from bxjudge.finish import FinishResult
+    from tests.helpers import make_track
+
+    tracks = [
+        make_track(tid, "bey", {f: (x, 100 if f < release else 360) for f in range(115)})
+        for tid, x, release in ((1, 350, 80), (2, 900, 84))
+    ] + [
+        make_track(tid, "launcher", {f: (x, 90) for f in range(115)})
+        for tid, x in ((3, 350), (4, 900))
+    ]
+    source = pipeline_setup(monkeypatch, tmp_path, tracks)
+    monkeypatch.setattr(
+        pipeline, "detect_finish", lambda *a: FinishResult("over", "B", candidate_frame, 0.95, []),
+    )
+    [row] = invoke_two_pipeline(source, tmp_path, rules, th)
+    record = json.loads((tmp_path / "out" / row.geometry_evidence["path"]).read_bytes())
+    proof = record["launch_timing"]["round_releases"]["1"]
+    assert [(p["frame"], p["confirmed_at_frame"]) for p in proof.values()] == [(80, 82), (84, 86)]
+    assert row.motion_evidence["landing_deadlines"] == {"X": 170, "B": 174}
+    assert row.launch.landing_frame == {"X": 80, "B": 84}
+    if candidate_frame == 82:
+        assert row.winner is None
+        assert "finish_before_confirmed_launch" in row.review_reasons
+    else:
+        assert row.winner == "X"

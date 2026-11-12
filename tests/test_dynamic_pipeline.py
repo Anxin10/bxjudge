@@ -83,11 +83,20 @@ def test_dynamic_pipeline_uses_reference_coordinates_and_keeps_raw_evidence(
         assert len(observed)==2
         assert 'two_bey_tracking_requires_review' in r.review_reasons
     assert r.needs_review and r.finish is None and r.winner is None
-    # Missing identity extends the launch window to its configured cap. Frames
-    # beyond the decoded clip remain unknown, never manufactured as no motion.
     values = r.motion_evidence["displacements"]
-    assert all(v == (5.0 if int(f) < 80 else None) for f, v in values.items())
-    assert 5.0 in values.values()
+    if two_bey:
+        # Observations without confirmed releases preserve their source boxes
+        # but do not define an evidentiary touch window or a landing deadline.
+        assert data["launch_timing"]["round_releases"]["1"] == {}
+        assert len(data["two_bey_tracking"]["raw_source_tracks"]) == 2
+        assert r.motion_evidence["landing_deadlines"] == {"X": None, "B": None}
+        assert r.motion_evidence["window"] == [0, 0] and values == {}
+        assert r.launch.landed == {"X": None, "B": None}
+    else:
+        # This mode measures a provisional launch window; undecoded frames
+        # remain unknown.
+        assert all(v == (5.0 if int(f) < 80 else None) for f, v in values.items())
+        assert 5.0 in values.values()
     csv = next((tmp_path / "out/trajectories").glob("*.csv")).read_text()
     assert "262.0,212.0" in csv
 
