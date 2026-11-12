@@ -390,6 +390,16 @@ def test_raw_motion_stage_closes_its_measurement_explicitly(tmp_path, monkeypatc
 # ---- keypoint stadiums and camera modes (plan 2026-11-12-dynamic-calibration, Task 6) ----
 
 
+def _camera_policy():
+    """The shipped camera policy with a 1 s refind interval (these tests count refind frames;
+    the shipped interval is a calibrated value)."""
+    from bxjudge.camera_motion import load_camera_policy
+
+    policy = load_camera_policy()
+    policy["handheld"] = {**policy["handheld"], "refind_s": 1.0, "max_unchecked_s": 3.0}
+    return policy
+
+
 class _FakeLocator:
     """Locates the stadium exactly where the calibration puts it, every time."""
 
@@ -538,7 +548,7 @@ def test_handheld_round_marks_touch_unknown_and_notes_camera(tmp_path, monkeypat
 
     monkeypatch.setattr(pipeline, "iter_stadium_displacement", no_motion)
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     assert r.launch.touch == {"X": "unknown", "B": "unknown"}
     assert "camera_handheld" in r.review_reasons
     assert "stadium_motion_unknown@camera_handheld" in r.review_reasons and r.needs_review
@@ -560,7 +570,7 @@ def test_fixed_camera_keeps_the_dynamic_tracker(tmp_path, monkeypatch, th, rules
     monkeypatch.setattr(pipeline.KeypointLocator, "for_snapshot", classmethod(
         lambda cls, tools, snap, c, ref: made.append(_FakeLocator(c)) or made[-1]))
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     assert "camera_handheld" not in r.review_reasons
     assert r.motion_evidence["camera"]["mode"] == "fixed"
     data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
@@ -574,7 +584,7 @@ def test_handheld_without_locatable_reference_is_recalibrate(tmp_path, monkeypat
     _, source = _scene_setup(tmp_path, monkeypatch)
     _handheld(monkeypatch, locator=False)
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     assert r.review_reasons == ["recalibrate", "handheld_reference_unlocated"]
     assert r.geometry_evidence is None
 
@@ -585,7 +595,7 @@ def test_handheld_without_dynamic_calibration_is_recalibrate(tmp_path, monkeypat
     _, source = _scene_setup(tmp_path, monkeypatch)
     _handheld(monkeypatch)
     [r] = _judge(source, tmp_path, th, rules, stadium_tools=_tools(),
-                 camera_policy=load_camera_policy())
+                 camera_policy=_camera_policy())
     assert r.review_reasons == ["recalibrate", "handheld_requires_dynamic_calibration"]
 
 
@@ -607,7 +617,7 @@ def test_handheld_single_fit_start_is_confirmed_before_any_zone(tmp_path, monkey
 
     monkeypatch.setattr(pipeline, "keypoint_snapshot", fake_snapshot)
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     assert calls[0]["allow_single"] is True
     data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
     assert data["segments"][0]["kind"] == "unconfirmed_snapshot"
@@ -677,7 +687,7 @@ def test_a_preselected_single_fit_snapshot_still_needs_confirmation(tmp_path, mo
     monkeypatch.setattr(pipeline, "keypoint_snapshot",
                         lambda *a, **k: pytest.fail("a preselected snapshot is not re-found"))
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy(), snapshot=kp)
+                 stadium_tools=_tools(), camera_policy=_camera_policy(), snapshot=kp)
     data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
     assert data["segments"][0]["kind"] == "unconfirmed_snapshot"
     assert all(s["alignment"] is None for s in data["samples"] if s["frame"] < 30)
@@ -699,7 +709,7 @@ def test_a_failed_camera_measurement_is_unmeasured_not_an_analysis_error(tmp_pat
 
     monkeypatch.setattr(pipeline, "measure_video_motion", broken)
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     camera = r.motion_evidence["camera"]
     assert (camera["mode"], camera["source"], camera["px_per_s"]) == \
         ("handheld", "unmeasured", None)
@@ -854,7 +864,7 @@ def test_unknown_geometry_reaches_the_launch_analysis(tmp_path, monkeypatch, th,
 
     monkeypatch.setattr(pipeline, "analyze_launch", analyze)
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy(), snapshot=kp)
+                 stadium_tools=_tools(), camera_policy=_camera_policy(), snapshot=kp)
     assert set(range(30)) <= seen["unobserved_frames"]
     assert seen["round_start"] == 35  # the round's own start frame
     assert not set(range(30, 80)) & seen["unobserved_frames"]
@@ -882,7 +892,7 @@ def test_a_handheld_video_without_any_stadium_says_so(tmp_path, monkeypatch, th,
     _handheld(monkeypatch)
     monkeypatch.setattr(pipeline, "keypoint_snapshot", lambda *a, **k: (None, None))
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
-                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+                 stadium_tools=_tools(), camera_policy=_camera_policy())
     assert r.review_reasons == ["recalibrate", "stadium_unlocated", "camera_handheld"]
     # The camera measurement that led there is kept with the row.
     assert r.motion_evidence == {"camera": {"mode": "handheld", "source": "measured",

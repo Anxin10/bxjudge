@@ -80,7 +80,9 @@ def test_geometry_reports_coverage_and_refind_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "keypoint_snapshot", lambda *a, **k: (snap, found))
     monkeypatch.setattr(ev.KeypointLocator, "for_snapshot",
                         classmethod(lambda cls, tools, s, cal, ref_image: _IdentityLocator(cal)))
-    row = ev.geometry_row("20261101", folder / "clip.mp4", None, ev.load_camera_policy(),
+    policy = ev.load_camera_policy()
+    policy["handheld"] = {**policy["handheld"], "refind_s": 1.0, "max_unchecked_s": 3.0}
+    row = ev.geometry_row("20261101", folder / "clip.mp4", None, policy,
                           tmp_path / "eval", "cpu")
     assert row["result"] == "tracked" and row["mode"] == "handheld"
     assert row["frames"] == 75 and row["coverage"] == 1.0 and row["invalidated"] == 0

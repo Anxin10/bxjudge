@@ -1,14 +1,16 @@
 # Camera mode (spec 2026-11-12-dynamic-calibration-design.md). Lengths in inference px (long
 # edge 1280), times in playback seconds. Measured 2026-11-12: fixed ~5.7 px/s, handheld 56-74.
+# Calibrated 2026-11-13 (434 videos; 10 handheld videos at refind 1.0 vs 0.5 s: coverage
+# 0.248 -> 0.299, time +25 %): see the plan ledger.
 detection:
   window_s: 10.0
   step_s: 1.0
   min_pairs: 3
   handheld_px_per_s: 20.0
 handheld:
-  refind_s: 1.0
+  refind_s: 0.5
   confirm_px: 12.0
-  max_unchecked_s: 3.0
+  max_unchecked_s: 2.0
 # Per batch folder name or per video file name: fixed | handheld | auto (auto = measure).
 # A video's own entry wins over its batch.
 overrides:

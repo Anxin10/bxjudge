@@ -39,7 +39,7 @@ def policy():
 
 def test_shipped_policy_loads_with_its_initial_values(policy):
     assert policy["detection"]["handheld_px_per_s"] == 20.0
-    assert policy["handheld"] == {"refind_s": 1.0, "confirm_px": 12.0, "max_unchecked_s": 3.0}
+    assert policy["handheld"] == {"refind_s": 0.5, "confirm_px": 12.0, "max_unchecked_s": 2.0}
     assert policy["overrides"] == {"batches": {}, "videos": {}}
 
 
