@@ -70,6 +70,8 @@ class Thresholds:
     burst_part_window_s: float
     burst_part_overlap_s: float
     pocket_confirm_s: float
+    pocket_corner_jitter_frames: int
+    pocket_corner_jitter_frac: float
     id_swap_overlap_frames: int
     round_gap_s: float
     calibration_min_similarity: float
@@ -116,4 +118,8 @@ def load_thresholds(path: str | Path = "config/thresholds.yaml") -> Thresholds:
         values[name] = v
     if values["decode_hwaccel"] not in _HWACCEL:
         raise ValueError(f"{path}: decode_hwaccel must be one of {_HWACCEL}")
+    if not 0 <= values["pocket_corner_jitter_frac"] < 0.5:
+        raise ValueError(f"{path}: pocket_corner_jitter_frac must be in [0, 0.5)")
+    if values["pocket_corner_jitter_frames"] < 0:
+        raise ValueError(f"{path}: pocket_corner_jitter_frames must be nonnegative")
     return Thresholds(**values)

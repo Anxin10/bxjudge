@@ -800,6 +800,8 @@ def _load_selection(path: Path, th: Thresholds) -> dict:
 
 
 def _validate_thresholds(th: Thresholds) -> None:
+    if not 0 <= th.pocket_corner_jitter_frac < 0.5:
+        raise ValueError("pocket_corner_jitter_frac must be in [0, 0.5)")
     for name, value in asdict(th).items():
         if isinstance(value, (int, float)) and (not math.isfinite(value) or value < 0):
             raise ValueError(f"threshold {name} must be finite and nonnegative")

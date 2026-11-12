@@ -31,7 +31,9 @@ still_frames: 30
 simultaneous_stop_frames: 3
 burst_part_window_s: 0.3
 burst_part_overlap_s: 0.1     # a part may start this long before the top's last frame (split, R55)
-pocket_confirm_s: 0.5         # whole-pocket stay confirming entry; later removal no longer cancels (R25/R55)
+pocket_confirm_s: 0.5         # whole-pocket observations confirming entry (R25/R55)
+pocket_corner_jitter_frames: 2  # legacy source samples; production derives this from physical_time.yaml
+pocket_corner_jitter_frac: 0.10 # fraction of each edge of the single corner that can cross the line
 id_swap_overlap_frames: 3
 round_gap_s: 2.0
 calibration_min_similarity: 0.8

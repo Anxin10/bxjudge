@@ -18,6 +18,7 @@ durations_ms:
   merge_observation_max_gap_s: 18.75
   pair_confirmation_frames: 8.333333333333334
   pocket_confirm_s: 62.5
+  pocket_corner_jitter_frames: 8.333333333333334
   reacquire_confirm_frames: 20.833333333333332
   reacquire_min_gap_s: 125.0
   reanchor_motion_max_gap_s: 25.0

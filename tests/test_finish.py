@@ -570,3 +570,43 @@ def test_burst_overlap_tolerance_is_configured(th):
     same = [make_track(3, 'bey_part', {79: (455, 185)})]
     assert detect_finish(bey, same, stops, c, replace(th, burst_part_overlap_s=0), 60).finish == 'burst'
     assert detect_finish(bey, edge, stops, c, replace(th, burst_part_overlap_s=0), 60).finish is None
+
+
+
+@pytest.mark.parametrize("mode", ["corner", "missing", "edge", "deep", "long", "return", "too_few"])
+def test_pocket_corner_jitter_joins_only_a_bracketed_small_observed_corner(mode, th):
+    c = make_calibration()
+    c.over_right = [(520, 200), (560, 160), (600, 200), (560, 240)]
+    hold = 7 if mode == "too_few" else 10
+    gap = 3 if mode == "long" else 2
+    start, gap_start = 40, 40 + hold
+    second = gap_start + gap
+    tail = second + hold
+    partial = {"edge": (582, 200), "deep": (578, 211)}.get(mode, (578.5, 203))
+    b = {f: (400, 180) for f in range(start)}
+    b.update({f: (560, 200) for f in [*range(start, gap_start), *range(second, tail)]})
+    b.update({f: partial for f in range(gap_start, second) if mode != "missing" or f != gap_start})
+    b.update({f: (400, 180) if mode == "return" else (578, 211) for f in range(tail, tail + 4)})
+    bey = {"X": make_track(1, "bey", {f: (180, 180) for f in range(tail + 4)}),
+           "B": make_track(2, "bey", b)}
+    result = detect_finish(bey, [], {"X": None, "B": None}, c, th, 30)
+    if mode == "corner":
+        assert (result.finish, result.loser, result.frame) == ("over", "B", start)
+        assert "pocket_corner_jitter@B" in result.reasons
+    else:
+        assert result.finish is None and result.loser is None
+        assert "pocket_corner_jitter@B" not in result.reasons
+        if mode == "return":
+            assert "exit_returned@B" in result.reasons
+
+
+def test_short_jitter_stay_cannot_move_the_last_whole_frame_exception_earlier(th):
+    c = make_calibration()
+    c.over_right = [(520, 200), (560, 160), (600, 200), (560, 240)]
+    bey = {
+        "X": make_track(1, "bey", {f: (180, 180) for f in range(4)}),
+        "B": make_track(2, "bey", {0: (400, 180), 1: (560, 200), 2: (578.5, 203), 3: (560, 200)}),
+    }
+    result = detect_finish(bey, [], {"X": None, "B": None}, c, th, 30)
+    assert (result.finish, result.loser, result.frame) == ("over", "B", 3)
+    assert "pocket_corner_jitter@B" not in result.reasons

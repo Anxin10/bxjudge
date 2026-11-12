@@ -146,7 +146,11 @@ def round_release_evidence(
         for native_id in physical.members[track.track_id]:
             states = segments.get(native_id, [])
             for mount, release in pairwise(states):
-                if release.state != "separated":
+                if (
+                    mount.state != "mounted" or release.state != "separated"
+                    or mount.launcher_id != release.launcher_id
+                    or mount.last_frame + 1 != release.first_frame
+                ):
                     continue
                 first = release.first_frame
                 confirmed = release.confirmed_at_frame

@@ -72,12 +72,12 @@ def test_video_anomaly_note_preserves_decision_and_records_stop_overlap():
     ]
 
 
-@pytest.mark.parametrize("avg_fps,capture,playback,held,settle", [
-    (30, 240, 30, 6, 6),
-    (23.976, 240, 30, 5, 6),
-    (120, 120, 120, 3, 3),
+@pytest.mark.parametrize("avg_fps,capture,playback,held,settle,jitter", [
+    (30, 240, 30, 6, 6, 2),
+    (23.976, 240, 30, 5, 6, 2),
+    (120, 120, 120, 3, 3, 1),
 ])
-def test_video_policy_converts_sample_counts(avg_fps, capture, playback, held, settle):
+def test_video_policy_converts_sample_counts(avg_fps, capture, playback, held, settle, jitter):
     from bxjudge.launch_phase import launch_sample_count
     from bxjudge.timebase import JudgmentTime, load_physical_time
 
@@ -85,4 +85,5 @@ def test_video_policy_converts_sample_counts(avg_fps, capture, playback, held, s
     timing = JudgmentTime(clock, **load_physical_time())
     assert launch_sample_count(timing.values["held_s"], avg_fps) == held
     assert timing.values["settle_frames"] == settle
+    assert timing.values["pocket_corner_jitter_frames"] == jitter
     assert timing.values["fall_speed_px"] == 1440 / capture

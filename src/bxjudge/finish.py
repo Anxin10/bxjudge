@@ -236,14 +236,67 @@ def _score(dets: list[Detection]) -> float:
     return float(np.mean(scores)) if scores and all(math.isfinite(s) for s in scores) else 0.0
 
 
+def _single_corner_overhang(box, polygon, fraction: float) -> bool:
+    """The whole box, except for one small corner rectangle, must be in the pocket."""
+    x0, y0, x1, y1 = box
+    if not (x0 < x1 and y0 < y1 and fraction > 0):
+        return False
+    contour = np.asarray(polygon, dtype=np.float32).reshape(-1, 1, 2)
+    outside = [
+        (x, y) for x in (x0, x1) for y in (y0, y1)
+        if cv2.pointPolygonTest(contour, (float(x), float(y)), False) < 0
+    ]
+    if len(outside) != 1:
+        return False
+    [(x, y)] = outside
+    dx, dy = (x1 - x0) * fraction, (y1 - y0) * fraction
+    across_x = (x0 + dx, y0, x1, y1) if x == x0 else (x0, y0, x1 - dx, y1)
+    across_y = (x0, y0 + dy, x1, y1) if y == y0 else (x0, y0, x1, y1 - dy)
+    return _whole_box_inside(across_x, polygon) and _whole_box_inside(across_y, polygon)
+
+
+def _join_corner_jitter(runs, dets, centers, pockets, calibration, th, confirm):
+    """Join observed short holes while retaining the original whole-box count."""
+    result = []
+    jitter_entries = set()
+    index = 0
+    while index < len(runs):
+        start, end, pocket = runs[index]
+        zone, polygon = pockets[pocket]
+        strict = end - start + 1
+        last = index
+        while last + 1 < len(runs):
+            next_start, next_end, next_pocket = runs[last + 1]
+            gap = next_start - end - 1
+            if next_pocket != pocket or not 0 < gap <= th.pocket_corner_jitter_frames:
+                break
+            if not all(
+                f in dets and zone_of(centers[f], calibration) == zone
+                and _single_corner_overhang(dets[f].box, polygon, th.pocket_corner_jitter_frac)
+                for f in range(end + 1, next_start)
+            ):
+                break
+            strict += next_end - next_start + 1
+            end = next_end
+            last += 1
+        if last > index and strict >= confirm and strict * 2 > end - start + 1:
+            result.append([start, end, pocket])
+            jitter_entries.add(start)
+        else:
+            result.extend(runs[index:last + 1])
+        index = last + 1
+    return result, jitter_entries
+
+
 def detect_finish(bey: dict[Side, Track], parts: list[Track],
                   stops: dict[Side, int | None], c: Calibration,
                   th: Thresholds, fps: float) -> FinishResult:
     """Earliest evidenced finish; stop reasons are propagated by Task13 (R21).
 
     Evidence is judged up to the decisive event (R55). A whole-box pocket run
-    is an entry when it is the final observation, or lasts ``pocket_confirm_s``
-    and is not followed by a return to the battle floor. This API has no crop
+    is an entry when it is the final observation, or supplies the configured
+    whole-box sample count without a return to the battle floor. Short observed
+    corner-overhang holes can join runs but do not count as whole samples. This API has no crop
     rates, so any floor return counts as a possibly rotating return and
     cancels the run (R25/R58), unless the top's stop was observed inside the
     pocket (or immediately on the return); ``exit_returned`` always remains a
@@ -272,7 +325,7 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         return FinishResult(None, None, None, 0.0, [n.reason for n in notes])
 
     centers = {side: t.centers() for side, t in bey.items()}
-    pockets = [('xtreme', c.xtreme), ('over', c.over_left), ('over', c.over_right)]
+    pockets = [('xtreme', c.xtreme), ('over_left', c.over_left), ('over_right', c.over_right)]
     confirm = round(th.pocket_confirm_s * fps)
     window = round(th.burst_part_window_s * fps)
     events: list[tuple[FinishResult, int]] = []  # (event, earliest possible frame)
@@ -291,6 +344,7 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
                 runs[-1][1] = f
             else:
                 runs.append([f, f, whole[f]])
+        runs, jitter_entries = _join_corner_jitter(runs, dets, centers[side], pockets, c, th, confirm)
         stop = stops.get(side)
 
         def is_entry(i: int, frames=frames, runs=runs, stop=stop, side=side) -> bool:
@@ -338,8 +392,10 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         notes.extend(_Note(g, r, side, True) for r, g in pending.items())
         if entry is not None:
             start, end, pocket = entry
-            events.append((FinishResult(pockets[pocket][0], side, start,
-                                        _score([dets[f] for f in frames if start <= f <= end]), []),
+            finish = "xtreme" if pockets[pocket][0] == "xtreme" else "over"
+            review = [f"pocket_corner_jitter@{side}"] if start in jitter_entries else []
+            events.append((FinishResult(finish, side, start,
+                                        _score([dets[f] for f in frames if start <= f <= end]), review),
                            earliest))
 
     overlap = round(th.burst_part_overlap_s * fps)
@@ -397,10 +453,14 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         else:
             result = FinishResult(first.finish, first.loser, first.frame, first.confidence, [])
             result.reasons = [
-                AFTER_FINISH_PREFIX + n.reason
-                if n.deferrable and n.frame is not None
-                and is_after_finish(result, n.side, n.frame, th) else n.reason
-                for n in notes if n.owner != first.loser]
+                *first.reasons,
+                *(
+                    AFTER_FINISH_PREFIX + n.reason
+                    if n.deferrable and n.frame is not None
+                    and is_after_finish(result, n.side, n.frame, th) else n.reason
+                    for n in notes if n.owner != first.loser
+                ),
+            ]
     result.reasons = list(dict.fromkeys(result.reasons))
     if any(r.startswith('track_evidence_gap@') for r in result.reasons):
         result.confidence *= th.track_gap_confidence_factor

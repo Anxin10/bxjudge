@@ -408,6 +408,11 @@ def test_release_needs_the_same_observed_native_actor_at_confirmation():
     }
     args = physical, physical.tracks, {11: "X", 12: "B"}, proof, c
     assert round_release_evidence(*args, required_frames=3)[11]["frame"] == 10
+    valid_mount = proof[1][0]
+    for invalid in (LaunchSegment("unknown", 4, 9), LaunchSegment("mounted", 4, 9, 4, 9)):
+        proof[1][0] = invalid
+        assert round_release_evidence(*args, required_frames=3) == {}
+    proof[1][0] = valid_mount
     evidence = next(o for o in physical.record["observations"]
                     if o["entity_id"] == 1 and o["frame"] == 11)
     evidence["identity_valid"] = False
@@ -424,7 +429,7 @@ def test_unknown_launch_landing_round_trips_and_never_charges_a_repeat_miss(rule
 
     row = rr("spin", "X")
     row.launch = LaunchCheck(
-        {"X": "unknown", "B": "unknown"}, {"X": None, "B": False},
+        {"X": "unknown", "B": "yes"}, {"X": None, "B": False},
         {"X": None, "B": None}, {"X": None, "B": None}, "maybe", ["launch_timing_unknown@X"],
     )
     saved = _result_row(row)
@@ -436,4 +441,5 @@ def test_unknown_launch_landing_round_trips_and_never_charges_a_repeat_miss(rule
     misses = {"X": 1, "B": 1}
     outcome = decide_round(reread, config, misses)
     assert (outcome.action, outcome.scorer, outcome.points) == ("redo", None, 0)
+    assert outcome.reasons == ["launch_landing_unknown", "touch_B", "not_landed_B"]
     assert misses == {"X": 1, "B": 1}

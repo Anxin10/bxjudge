@@ -121,6 +121,7 @@ _FRAME_MINIMA = {
     "impact_coincide_frames": 1,
     "link_velocity_frames": 2,
     "pair_confirmation_frames": 2,
+    "pocket_corner_jitter_frames": 0,
     "reacquire_confirm_frames": 1,
     "resume_frames": 2,
     "reverse_frames": 1,
