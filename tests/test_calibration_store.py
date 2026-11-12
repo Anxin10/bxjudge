@@ -22,6 +22,9 @@ from bxjudge.config import load_thresholds
 from tests.helpers import results_with_two_positions, shipped_autocalib, stadium_scene
 
 
+KP = {"source_frame": 12, "agreeing_frames": 2}  # a keypoints snapshot's origin
+
+
 def th():
     return load_thresholds("config/thresholds.yaml")
 
@@ -154,9 +157,9 @@ def test_snapshot_id_is_content_addressed(tmp_path):
 def test_keypoint_snapshot_round_trips_and_score_is_part_of_identity(tmp_path):
     img, c = stadium_scene()
     h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
-    a = save_snapshot(tmp_path, "keypoints", c, img, score=0.91, homography=h,
+    a = save_snapshot(tmp_path, "keypoints", c, img, **KP, score=0.91, homography=h,
                       autocalib=shipped_autocalib())
-    b = save_snapshot(tmp_path, "keypoints", c, img, score=0.92, homography=h,
+    b = save_snapshot(tmp_path, "keypoints", c, img, **KP, score=0.92, homography=h,
                       autocalib=shipped_autocalib())
     assert a.kind == "keypoints" and a.homography == h and a.score == pytest.approx(0.91)
     assert a.template_id is None and a.template_set is None and a.source_path is None
@@ -167,11 +170,11 @@ def test_keypoint_snapshot_round_trips_and_score_is_part_of_identity(tmp_path):
 def test_keypoint_snapshot_keeps_the_exact_score_and_ids_follow_the_canonical_rounding(tmp_path):
     img, c = stadium_scene()
     h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
-    a = save_snapshot(tmp_path, "keypoints", c, img, score=0.91234567, homography=h,
+    a = save_snapshot(tmp_path, "keypoints", c, img, **KP, score=0.91234567, homography=h,
                       autocalib=shipped_autocalib())
     stored = json.loads((tmp_path / "calibrations" / f"{a.id}.json").read_text())
     assert stored["snapshot"]["score"] == 0.91234567 and a.score == 0.91234567
-    b = save_snapshot(tmp_path / "b", "keypoints", c, img, score=0.91234999, homography=h,
+    b = save_snapshot(tmp_path / "b", "keypoints", c, img, **KP, score=0.91234999, homography=h,
                       autocalib=shipped_autocalib())
     assert b.id == a.id  # the id rounds the score to 4 decimals, as for auto
 
@@ -188,11 +191,11 @@ def test_non_finite_score_or_homography_is_refused(tmp_path, kind, bad):
         h[0][2] = float("inf")
     with pytest.raises(ValueError):
         save_snapshot(tmp_path, kind, c, img, score=score, homography=h,
-                      autocalib=shipped_autocalib())
+                      autocalib=shipped_autocalib(), **(KP if kind == "keypoints" else {}))
     # A stored file with the value broken by hand is refused on load as well.
     good = save_snapshot(tmp_path, kind, c, img, score=0.9, homography=[[1.0, 0, 5], [0, 1, 7],
                                                                         [0, 0, 1]],
-                         autocalib=shipped_autocalib())
+                         autocalib=shipped_autocalib(), **(KP if kind == "keypoints" else {}))
     path = tmp_path / "calibrations" / f"{good.id}.json"
     doc = json.loads(path.read_text())
     if bad == "score":
@@ -204,10 +207,44 @@ def test_non_finite_score_or_homography_is_refused(tmp_path, kind, bad):
         load_snapshot(tmp_path, good.id, autocalib=shipped_autocalib())
 
 
+def test_keypoint_snapshot_records_its_source_frame_and_agreement(tmp_path):
+    """A handheld start from one fit must be confirmed by a re-find of another frame, also
+    when the snapshot is reused later (Codex Task 6 review M4): its origin is stored."""
+    img, c = stadium_scene()
+    h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
+    single = save_snapshot(tmp_path, "keypoints", c, img, score=0.9, homography=h,
+                           source_frame=40, agreeing_frames=1, autocalib=shipped_autocalib())
+    again = load_snapshot(tmp_path, single.id, autocalib=shipped_autocalib())
+    assert (again.source_frame, again.agreeing_frames) == (40, 1)
+    pair = save_snapshot(tmp_path, "keypoints", c, img, score=0.9, homography=h,
+                         source_frame=40, agreeing_frames=2, autocalib=shipped_autocalib())
+    assert pair.id != single.id
+    for bad in ({}, {"source_frame": 40}, {"source_frame": -1, "agreeing_frames": 1},
+                {"source_frame": 40, "agreeing_frames": 0}, {"source_frame": 4.0,
+                                                             "agreeing_frames": 1}):
+        with pytest.raises(ValueError, match="source_frame|agreeing_frames"):
+            save_snapshot(tmp_path / "bad", "keypoints", c, img, score=0.9, homography=h,
+                          autocalib=shipped_autocalib(), **bad)
+    with pytest.raises(ValueError, match="source_frame"):
+        save_snapshot(tmp_path / "bad", "auto", c, img, score=0.9, homography=h,
+                      source_frame=40, agreeing_frames=1, autocalib=shipped_autocalib())
+    auto = save_snapshot(tmp_path, "auto", c, img, score=0.9, homography=h,
+                         autocalib=shipped_autocalib())
+    assert (auto.source_frame, auto.agreeing_frames) == (None, None)
+    path = tmp_path / "calibrations" / f"{single.id}.json"
+    doc = json.loads(path.read_text())
+    assert "source_frame" not in json.loads(
+        (tmp_path / "calibrations" / f"{auto.id}.json").read_text())["snapshot"]
+    del doc["snapshot"]["agreeing_frames"]
+    path.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="malformed"):
+        load_snapshot(tmp_path, single.id, autocalib=shipped_autocalib())
+
+
 def test_keypoint_snapshot_requires_a_homography(tmp_path):
     img, c = stadium_scene()
     with pytest.raises(ValueError, match="homography"):
-        save_snapshot(tmp_path, "keypoints", c, img, score=0.9, autocalib=shipped_autocalib())
+        save_snapshot(tmp_path, "keypoints", c, img, **KP, score=0.9, autocalib=shipped_autocalib())
     assert not (tmp_path / "calibrations").exists()
 
 
@@ -215,7 +252,7 @@ def test_keypoint_snapshot_can_be_vetoed_without_barring_templates(tmp_path):
     calib, out = make_calib_dir(tmp_path, stadium_scene())
     img, c = stadium_scene(shift=(45, 20))
     h = ((1.0, 0.0, 5.0), (0.0, 1.0, 7.0), (0.0, 0.0, 1.0))
-    kp = save_snapshot(out, "keypoints", c, img, score=0.9, homography=h,
+    kp = save_snapshot(out, "keypoints", c, img, **KP, score=0.9, homography=h,
                        autocalib=shipped_autocalib())
     veto_calibration(out, kp.id, autocalib=shipped_autocalib(), video="clip.mp4")
     assert vetoed_ids(out) == {kp.id}

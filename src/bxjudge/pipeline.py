@@ -27,6 +27,7 @@ from .autocalib import AutoCalibConfig, load_autocalib_config
 from .calibration import scale_calibration
 from .calibration_store import (
     Snapshot,
+    load_snapshot,
     select_snapshot,
     validate_output_paths,
     vetoed_ids,
@@ -80,6 +81,15 @@ from .output import (
 )
 from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
+from .camera_motion import (
+    DEFAULT_CAMERA_MODE_CONFIG,
+    decide_camera_mode,
+    load_camera_policy,
+    measure_video_motion,
+)
+from .handheld_calibration import HandheldCalibration
+from .stadium_finder import zone_visibility
+from .stadium_locator import KeypointLocator, keypoint_snapshot, load_stadium_tools
 from .stadium_motion import RAW_MOTION_WORKERS, iter_stadium_displacement
 from .temporal_geometry import load_temporal_policy
 from .timebase import (
@@ -191,6 +201,8 @@ def judge_video(
     vetoed: set[str] | frozenset[str] = frozenset(),
     timing: JudgmentTime | None = None,
     anomaly_policy: AnomalyPolicy | None = None,
+    stadium_tools=None,
+    camera_policy: dict | None = None,
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
@@ -204,6 +216,15 @@ def judge_video(
     every result carries the snapshot id and its preview is written. Subsequent frames
     flow through motion measurement, detection and tracking once; only crops and
     compact observations survive. Short clips use their final available frame.
+
+    ``stadium_tools`` (``stadium_locator.StadiumTools``; plan 2026-11-12-dynamic-calibration):
+    when no snapshot is selected, the stadium keypoints give a third choice
+    (``keypoint_snapshot``), and the dynamic trackers may relocate from keypoints.
+    ``camera_policy`` (``camera_motion.load_camera_policy``): the camera is judged fixed or
+    handheld from early motion. A handheld camera needs ``dynamic_config`` and a keypoint
+    locator, else the video is ``recalibrate``; its geometry is ``HandheldCalibration``,
+    its stadium displacement is not measured (camera motion would read as shake) and launch
+    touch is unknown (``camera_handheld``). Without either argument nothing changes.
     """
     if two_bey_config is not None and dynamic_config is None:
         raise ValueError('two-bey tracking requires dynamic calibration')
@@ -235,18 +256,68 @@ def judge_video(
             if not prefix:
                 raise VideoDecodeError(f"{info.path}: no frames decoded")
             first = prefix[-1][1]
+            camera = motion = motion_error = None
+            if camera_policy is not None:
+                try:
+                    motion = measure_video_motion(
+                        info.path, info.fps, camera_policy, long_edge=th.infer_long_edge,
+                        hwaccel=th.decode_hwaccel,
+                    )
+                except (VideoDecodeError, ValueError, OSError, RuntimeError, MemoryError,
+                        cv2.error) as e:
+                    # Unmeasured: decide_camera_mode treats it as handheld (cautious).
+                    motion, motion_error = None, f"{type(e).__name__}: {e}"
+                camera = decide_camera_mode(info.path, info.path.parent.name, motion,
+                                            camera_policy)
+            handheld = camera is not None and camera.mode == "handheld"
+            camera_record = None if camera is None else {
+                "mode": camera.mode,
+                "source": camera.source,
+                "px_per_s": None if motion is None else motion.px_per_s,
+                "pairs": 0 if motion is None else motion.pairs,
+                **({"error": motion_error} if motion_error is not None else {}),
+            }
             snap = (
                 select_snapshot(first, calib_dir, out_dir, th, autocalib, vetoed,
                                 video=info.path.name)
                 if snapshot is _SELECT
                 else snapshot
             )
+            found = None
+            if snap is None and stadium_tools is not None:
+                # Third choice. A handheld camera may start from one keypoint fit, which
+                # its tracker confirms before emitting any zone.
+                snap, found = keypoint_snapshot(info.path, out_dir, stadium_tools, autocalib,
+                                                vetoed, hwaccel=th.decode_hwaccel,
+                                                allow_single=handheld)
+                if snap is None:
+                    found = None
             if on_snapshot is not None:
                 on_snapshot(snap)
             if snap is None:
                 return _provenance(
                     [_review(info.path.name, info.duration, "recalibrate")], provenance
                 )
+            if handheld and dynamic_config is None:
+                placeholder = _review(info.path.name, info.duration, "recalibrate")
+                placeholder.review_reasons.append("handheld_requires_dynamic_calibration")
+                return _provenance([placeholder], provenance)
+            keypoint_record = None
+            if snap.kind == "keypoints":
+                # Its stored origin decides, whether found now or handed over by the batch.
+                fit = None if found is None else found.fit
+                keypoint_record = {
+                    "snapshot_id": snap.id,
+                    "method": "keypoints" if snap.agreeing_frames >= 2 else "keypoints_single",
+                    "frame_index": snap.source_frame,
+                    "agreeing_frames": snap.agreeing_frames,
+                    "coverage": float(snap.score if fit is None else fit.coverage),
+                    "precision": None if fit is None else float(fit.precision),
+                    "keypoint_error_px": None if fit is None else float(fit.keypoint_error_px),
+                    "keypoint_rail_shift_px": (
+                        None if fit is None else float(fit.keypoint_rail_shift_px)
+                    ),
+                }
             write_preview(out_dir, snap)
             # Ruling F-1: an accepted but loosely aligned auto snapshot (min_score <= score <
             # auto_review_score) is never scored silently. Manual snapshots are unaffected.
@@ -255,6 +326,17 @@ def judge_video(
                 if snap.kind == "auto" and snap.score < autocalib.auto_review_score
                 else []
             )
+            if snap.kind == "keypoints" and stadium_tools is not None:
+                # A pocket mostly outside the frame cannot show a finish (auto-stadium spec).
+                visibility = (found.zone_visibility if found is not None
+                              else zone_visibility(snap.calibration))
+                calibration_notes += [
+                    f"zone_out_of_frame@{zone}"
+                    for zone in ("over_left", "over_right", "xtreme")
+                    if visibility.get(zone, 0.0) < stadium_tools.cfg.zone_visible_min
+                ]
+            if handheld:
+                calibration_notes.append("camera_handheld")
             c = scale_calibration(snap.calibration, (first.shape[1], first.shape[0]))
             # Ruling T3-1 (spec 6.2b): shake is measured against this video's own camera view,
             # never the snapshot's reference image (another video's frame, or the manual
@@ -262,19 +344,62 @@ def judge_video(
             ref = first
             geometry = None
             if dynamic_config is not None:
-                geometry = DynamicCalibration(
-                    c,
-                    cv2.imread(snap.calibration.ref_frame),
-                    info.fps,
-                    load_video_policy()["stadium_follow"],
-                    converted(load_dynamic_policy(dynamic_config)),
-                    **({"temporal_policy": converted(load_temporal_policy())} if timing else {}),
-                )
+                reference = cv2.imread(snap.calibration.ref_frame)
+                locator = None
+                if stadium_tools is not None:
+                    locator = KeypointLocator.for_snapshot(
+                        stadium_tools, snap, c,
+                        cv2.resize(reference, c.frame_size, interpolation=cv2.INTER_AREA),
+                    )
+                if handheld and locator is None:
+                    placeholder = _review(info.path.name, info.duration, "recalibrate")
+                    placeholder.review_reasons.append("handheld_reference_unlocated")
+                    return _provenance([placeholder], provenance)
+                if handheld:
+                    temporal = (converted(load_temporal_policy()) if timing
+                                else load_temporal_policy())
+                    single = snap.kind == "keypoints" and snap.agreeing_frames < 2
+                    start_frame = (
+                        snap.source_frame if snap.kind == "keypoints"
+                        else prefix[-1][0] if snap.kind == "auto" else None
+                    )
+                    geometry = HandheldCalibration(
+                        c,
+                        reference,
+                        info.fps,
+                        load_video_policy()["stadium_follow"],
+                        converted(camera_policy["handheld"]),
+                        locator,
+                        minimum_visible=temporal["min_visible_fraction"],
+                        foreground_margin_px=temporal["foreground_margin_px"],
+                        start_confirmed=not single,
+                        start_frame=start_frame,
+                    )
+                else:
+                    geometry = DynamicCalibration(
+                        c,
+                        reference,
+                        info.fps,
+                        load_video_policy()["stadium_follow"],
+                        converted(load_dynamic_policy(dynamic_config)),
+                        **({"temporal_policy": converted(load_temporal_policy())}
+                           if timing else {}),
+                        keypoint_locator=locator,
+                    )
             disp = {}
             crops = {}
             appearances={}
 
             def measured():
+                if handheld:
+                    # Camera motion would read as stadium shake: displacement is unknown.
+                    for f, image in chain(prefix, frames):
+                        disp[f] = math.nan
+                        if changes is not None:
+                            changes.observe(f, image)
+                        yield f, image
+                    prefix.clear()
+                    return
                 displacements = iter_stadium_displacement(
                     chain(prefix, frames), c, ref, workers=RAW_MOTION_WORKERS
                 )
@@ -327,6 +452,8 @@ def judge_video(
                     (lambda image, f: frame_detections.pop(f)) if geometry is not None else detecting,
                     info.fps, config=detection_config
                 )
+        if geometry is not None:
+            geometry.finish()  # the handheld tracker re-finds its tail; fixed: nothing
         if timing and len(disp) != len(timing.timeline.pts_s):
             raise ValueError(f"{info.path}: decoded frame count does not match PTS count")
         anomalies = changes.events(timing.timeline) if changes is not None else []
@@ -359,6 +486,9 @@ def judge_video(
                 "calibration_id": snap.id,
                 "source": str(info.path.resolve()),
                 "source_sha256": source_sha,
+                **({"camera": camera_record} if camera_record is not None else {}),
+                **({"stadium_keypoints": keypoint_record}
+                   if keypoint_record is not None else {}),
                 "follow_policy": load_video_policy()["stadium_follow"],
                 "phase_policy": phase_policy,
                 "phase": phase.record(),
@@ -493,6 +623,7 @@ def judge_video(
                 info.fps,
                 **({"sides_override": side_hints} if geometry is not None else {}),
                 **release_options,
+                **({"motion_unknown_reason": "camera_handheld"} if handheld else {}),
             )
             launch, sides = analysis.check, analysis.sides
             counts = Counter(sides.values())
@@ -700,6 +831,10 @@ def judge_video(
                 },
                 "impact_frames": sorted(analysis.impacts),
             }
+            if camera_record is not None:
+                r.motion_evidence["camera"] = camera_record
+            if keypoint_record is not None:
+                r.motion_evidence["stadium_keypoints"] = keypoint_record
             if number in releases_by_round:
                 r.motion_evidence["landing_deadlines"] = analysis.deadlines
             if timing:
@@ -836,6 +971,53 @@ def analysis_status(results: list[RoundResult]) -> str:
     return "ok"
 
 
+def _keypoint_signature(tools, camera_policy: dict) -> dict:
+    """JSON-normal identity of the keypoint route for the analysis signature."""
+    from dataclasses import is_dataclass
+
+    cfg = getattr(tools, "cfg", None)
+    finder = getattr(tools, "finder", None)
+    reference = getattr(finder, "reference", None)
+    signature = {
+        "camera": camera_policy,
+        "finder_config": asdict(cfg) if is_dataclass(cfg) else None,
+        "weights_sha256": getattr(finder, "weights_sha256", None),
+        "model_sha256": getattr(getattr(tools, "model", None), "source_sha256", None),
+        "reference": asdict(reference) if is_dataclass(reference) else None,
+        "implementation_sha256": {
+            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in ("camera_motion.py", "handheld_calibration.py", "stadium_locator.py",
+                         "stadium_finder.py", "stadium_keypoints.py")
+        },
+    }
+    return json.loads(json.dumps(signature))  # tuples as lists, as read back from disk
+
+
+def _keypoint_preselection(out_dir: Path, recorded: str | None, vetoed: set[str],
+                           info: VideoInfo, tools, autocalib: AutoCalibConfig,
+                           th: Thresholds, *, reuse: bool) -> Snapshot | None:
+    """The batch's current keypoint choice for a video no template matches (Codex Task 6 M2).
+    A recorded, non-vetoed keypoints snapshot stays current: it is a function of the
+    unchanged video and of the keypoint route, whose identity is in the analysis signature,
+    so the video is not re-judged on every run; ``reuse`` says that signature is unchanged
+    (otherwise the stored snapshot may no longer be what the route finds, and judge_video
+    selects afresh). A vetoed recorded snapshot gets a fresh find (a veto may now have an
+    alternative); anything else has no keypoint choice here."""
+    if recorded is None:
+        return None
+    if recorded in vetoed:
+        snap, _ = keypoint_snapshot(info.path, out_dir, tools, autocalib, vetoed,
+                                    hwaccel=th.decode_hwaccel)
+        return snap
+    if not reuse:
+        return None
+    try:
+        snap = load_snapshot(out_dir, recorded, autocalib=autocalib)
+    except (FileNotFoundError, ValueError):
+        return None
+    return snap if snap.kind == "keypoints" else None
+
+
 def needs_reanalysis(
     recorded: str | None, current: str | None, vetoed: set[str]
 ) -> bool:
@@ -917,6 +1099,8 @@ def run_batch(
     rejudge: bool = False,
     dynamic_config: Path | None = None,
     two_bey_config: Path | None = None,
+    stadium_keypoints: bool = False,
+    camera_config: Path = DEFAULT_CAMERA_MODE_CONFIG,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -950,6 +1134,10 @@ def run_batch(
         if dynamic_config is None:
             raise ValueError('two-bey tracking requires dynamic calibration')
         load_two_bey_policy(two_bey_config)
+    # Plan 2026-11-12-dynamic-calibration: keypoint stadiums and camera modes are opt-in.
+    camera_policy = (
+        load_camera_policy(Path(camera_config).expanduser()) if stadium_keypoints else None
+    )
     # Configuration and model initialization fail globally, before any result/cache writes.
     injected_thresholds = th is not None
     th = load_thresholds(thresholds) if th is None else th
@@ -1001,6 +1189,17 @@ def run_batch(
             provenance["runtime"]["detector"] = detector.runtime
         else:
             provenance["runtime"]["detector"] = {"backend": "pytorch"}
+    stadium_tools = None
+    if stadium_keypoints:
+        # Loaded once for the whole batch, next to the detector on the GPU (check nvidia-smi
+        # first: the GPU may be shared).
+        log.info("loading the stadium keypoint ensemble on device %s", policy["device"])
+        stadium_tools = load_stadium_tools(device=policy["device"])
+        if provenance is not None:
+            provenance["runtime"]["stadium_keypoints"] = {
+                "weights_sha256": getattr(stadium_tools.finder, "weights_sha256", None),
+                "camera_policy": camera_policy,
+            }
     # Framework imports may reset OpenCV's global thread count. Apply the requested
     # budget once after initialization and before any decoding/prefetch worker starts.
     cv2.setNumThreads(policy["opencv_threads"])
@@ -1040,6 +1239,13 @@ def run_batch(
         if video_records_path.exists()
         else {}
     )
+    if stadium_keypoints:
+        # The keypoint route changes judgments with or without dynamic geometry: its
+        # policy, model, weights, reference and code are part of the analysis signature.
+        dynamic_signature = {
+            **(dynamic_signature or {}),
+            "stadium_keypoints": _keypoint_signature(stadium_tools, camera_policy),
+        }
     old_analysis_policies = {
         name: entry.get("analysis_policy") for name, entry in video_records.items()
     }
@@ -1082,6 +1288,7 @@ def run_batch(
     # own speed scope), and the videos only kept (never judged) by the T4-3 veto rule.
     real: dict[str, bool] = {}
     kept_only: set[str] = set()
+    kept_after_judging: set[str] = set()  # judged, rows kept (veto rule): no VLM pass
     for path, info, cached in candidates:
         # C-X9: veto-kept videos (no judging) never use up --limit; once it is reached, only
         # veto candidates still get their attempt recorded (nothing else is judged).
@@ -1115,6 +1322,11 @@ def run_batch(
                 snap = select_snapshot(
                     frame, calib_dir, out_dir, th, autocalib, vetoed, video=info.path.name
                 )
+                if snap is None and stadium_tools is not None:
+                    snap = _keypoint_preselection(
+                        out_dir, recorded, vetoed, info, stadium_tools, autocalib, th,
+                        reuse=old_analysis_policies.get(path.name) == dynamic_signature,
+                    )
             except Exception as error:
                 if recorded in vetoed and path.name in judged_before:
                     # C-X7(b): a vetoed, previously judged video whose selection failed is
@@ -1220,6 +1432,11 @@ def run_batch(
                     ),
                     **preselected,
                     **timing_options,
+                    **(
+                        {"stadium_tools": stadium_tools, "camera_policy": camera_policy}
+                        if stadium_keypoints
+                        else {}
+                    ),
                     **({'two_bey_config':two_bey_config} if two_bey_config is not None else {}),
                 )
             except Exception:
@@ -1229,6 +1446,21 @@ def run_batch(
                 )
         snap = chosen[-1] if chosen else None
         status = analysis_status(results)
+        if vetoed_before and status == "recalibrate":
+            # T4-3: a veto alone never turns judged rows into a recalibrate placeholder, also
+            # when the alternative found for it (a keypoint stadium) still gives none (e.g. a
+            # handheld camera without dynamic calibration). Rows, calibration and judged wall
+            # stay; this judged attempt counts toward --limit (C-X9) and its recalibrate is
+            # the latest analysis status (R68), but the VLM has nothing new to look at.
+            log.warning("%s: the alternative to its vetoed calibration gives no round "
+                        "(%s); keeping its vetoed rows", path.name,
+                        "、".join(results[0].review_reasons) if results else "")
+            kept_after_judging.add(path.name)
+            wall = time.perf_counter() - began
+            record_video_status(out_dir, path.name, status, wall_s=wall,
+                                duration_s=info.duration, run_id=run_id)
+            work[path.name], real[path.name] = wall, True
+            continue
         if status in TRANSIENT_FAILURES and path.name in judged_before:
             # Ruling R68: a transient failure (decode, probe, analysis) of a previously judged
             # video is no replacement analysis. Its rows (predictions, audit flags, calibration
@@ -1285,10 +1517,11 @@ def run_batch(
             info.duration if info else 0.0,
         )
     vlm_wall_s = None
-    if vlm is not None and {path.name for path, _ in entries} - kept_only:
+    if vlm is not None and {path.name for path, _ in entries} - kept_only - kept_after_judging:
         # The detector must be gone before the ~18-20 GB VLM loads (spec section 5).
         vlm_began = time.perf_counter()
         del detector
+        stadium_tools = None  # the keypoint ensemble leaves the GPU with the detector
         _release_gpu_memory()
         vlm_before = _read_vlm_seconds(out_dir)
         summary = review_results_dir(
@@ -1297,7 +1530,7 @@ def run_batch(
             rules=rules,
             config=vlm,
             # veto-kept videos were not judged in this run: their rows are left alone
-            videos={path.name for path, _ in entries} - kept_only,
+            videos={path.name for path, _ in entries} - kept_only - kept_after_judging,
             autocalib=autocalib,  # C-X3(b): run's --autocalib, never the cwd file
             run_id=run_id,
         )

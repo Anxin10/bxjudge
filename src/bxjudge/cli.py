@@ -150,6 +150,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   rejudge=args.rejudge,
                   dynamic_config=Path(args.dynamic_calibration).expanduser() if args.dynamic_calibration else None,
                   two_bey_config=Path(args.two_bey_tracking).expanduser() if args.two_bey_tracking else None,
+                  stadium_keypoints=args.stadium_keypoints,
+                  camera_config=Path(args.camera_mode).expanduser(),
                   trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
     except (ValueError, OSError, RuntimeError) as error:
         if args.debug:
@@ -168,6 +170,13 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
                    help="explicit selected detector manifest; synthetic output requires review")
     p.add_argument("--dynamic-calibration", metavar="YAML", help="record moving-stadium geometry, observed launch release and conservative identity evidence")
     p.add_argument('--two-bey-tracking',metavar='YAML',help='reconstruct at most two physical top identities per round; requires dynamic calibration; no interpolation in adjudication')
+    p.add_argument("--stadium-keypoints", action="store_true",
+                   help="find stadiums no calibration matches from the keypoint model, relocate "
+                        "and re-find from keypoints, and judge each camera as fixed or handheld "
+                        "(loads the keypoint ensemble on the GPU once; check nvidia-smi first)")
+    p.add_argument("--camera-mode", metavar="YAML", default="config/camera_mode.yaml",
+                   help="camera-mode detection, handheld re-find policy and per-batch/video "
+                        "overrides (read only with --stadium-keypoints)")
     p.add_argument("--trt-manifest", help="verified RF-DETR TensorRT export manifest (no fallback)")
     p.add_argument("--thresholds", default="config/thresholds.yaml")
     p.add_argument("--rules", default="config/rules.yaml")

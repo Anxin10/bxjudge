@@ -108,7 +108,8 @@ def test_for_snapshot_fits_the_reference_of_a_manual_snapshot_and_gives_none_whe
 def test_for_snapshot_uses_a_keypoints_snapshot_homography_without_inference(
         tools_fake, calib, tmp_path):
     ref = _frame_for(H_BASE)
-    snap = save_snapshot(tmp_path, "keypoints", calib, ref, score=0.9,
+    snap = save_snapshot(tmp_path, "keypoints", calib, ref, score=0.9, source_frame=0,
+                         agreeing_frames=2,
                          homography=tuple(map(tuple, H_BASE)), autocalib=shipped_autocalib())
     loc = KeypointLocator.for_snapshot(tools_fake, snap, calib, ref)
     assert loc is not None and tools_fake.finder.calls == 0
@@ -123,7 +124,8 @@ def test_for_snapshot_scales_a_keypoints_snapshot_to_the_decoded_size(tools_fake
     from bxjudge.calibration import scale_calibration
 
     ref = _frame_for(H_BASE)
-    snap = save_snapshot(tmp_path, "keypoints", calib, ref, score=0.9,
+    snap = save_snapshot(tmp_path, "keypoints", calib, ref, score=0.9, source_frame=0,
+                         agreeing_frames=2,
                          homography=tuple(map(tuple, H_BASE)), autocalib=shipped_autocalib())
     small = scale_calibration(calib, (640, 360))
     loc = KeypointLocator.for_snapshot(tools_fake, snap, small, cv2.resize(ref, (640, 360)))
@@ -160,6 +162,7 @@ def test_keypoint_snapshot_rejects_rail_results_and_vetoed_ids(tmp_path, monkeyp
     assert got is found and snap.kind == "keypoints"
     assert snap.homography == tuple(tuple(float(v) for v in r) for r in found.fit.homography)
     assert snap.score == pytest.approx(found.fit.coverage)
+    assert (snap.source_frame, snap.agreeing_frames) == (12, 2)
     # The same snapshot, vetoed, is refused.
     again, got = keypoint_snapshot(tmp_path / "clip.mp4", tmp_path / "a", tools_fake,
                                    shipped_autocalib(), {snap.id})
@@ -195,6 +198,7 @@ def test_single_keypoint_fit_is_offered_only_when_asked(tmp_path, monkeypatch, t
                                   shipped_autocalib(), set(), allow_single=True)
     assert snap.kind == "keypoints" and got.method == "keypoints_single"
     assert got.frame_index == 80 and got.agreeing_frames == 1
+    assert (snap.source_frame, snap.agreeing_frames) == (80, 1)
 
 
 def test_zone_disagreement_is_the_worst_zone_not_the_mean(calib):

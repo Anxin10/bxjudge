@@ -1,3 +1,4 @@
+import math
 from dataclasses import replace
 
 import pytest
@@ -407,3 +408,26 @@ def test_late_physical_floor_still_cuts_off_ground_collision(th):
     assert 'landing_timing_unknown@X:191' in lc.notes
     assert 'landing_timing_unknown@B:191' in lc.notes
     assert lc.air_collision == 'maybe'
+
+def test_motion_unknown_reason_makes_touch_unknown_without_scanning(th, monkeypatch):
+    """A handheld camera moves the rim the shake detector measures: touch is unknown, with
+    one note naming why, and the shake scan never runs (plan 2026-11-12 Task 6)."""
+    import bxjudge.launch_check as lc_mod
+    from bxjudge.launch_check import analyze_launch
+
+    tracks = pair()
+    baseline = analyze_launch(tracks, [], {f: 0.0 for f in range(200)}, make_calibration(),
+                              th, 60).check
+    assert baseline.touch == {"X": "no", "B": "no"}
+
+    def no_scan(*a, **k):
+        raise AssertionError("detect_touch must not run")
+
+    monkeypatch.setattr(lc_mod, "detect_touch", no_scan)
+    got = analyze_launch(tracks, [], {f: math.nan for f in range(200)}, make_calibration(), th,
+                         60, motion_unknown_reason="camera_handheld").check
+    assert got.touch == {"X": "unknown", "B": "unknown"}
+    assert [n for n in got.notes if n.startswith("stadium_motion")] == \
+        ["stadium_motion_unknown@camera_handheld"]
+    assert (got.landed, got.landing_frame, got.landing_zone) == \
+        (baseline.landed, baseline.landing_frame, baseline.landing_zone)

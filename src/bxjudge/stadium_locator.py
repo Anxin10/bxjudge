@@ -209,7 +209,8 @@ def keypoint_snapshot(video: Path, out_dir: Path, tools: StadiumTools, autocalib
         found = _single_fit_stadium(video, tools.model, idx, frame, fit)
     snap = save_snapshot(out_dir, "keypoints", found.calibration, found.frame,
                          score=found.fit.coverage, homography=found.fit.homography,
-                         autocalib=autocalib)
+                         source_frame=int(found.frame_index),
+                         agreeing_frames=int(found.agreeing_frames), autocalib=autocalib)
     if snap.id in vetoed:
         return None, found
     return snap, found

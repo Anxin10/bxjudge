@@ -224,7 +224,8 @@ class LaunchAnalysis:
 
 
 def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float, *, sides_override: dict[int, Side] | None = None,
-                   release_frames: dict[int, int] | None = None) -> LaunchAnalysis:
+                   release_frames: dict[int, int] | None = None,
+                   motion_unknown_reason: str | None = None) -> LaunchAnalysis:
     """Combine launch evidence without choosing between missing/duplicate side tracks.
 
     The missing-landing cap bounds the search for battle-area settling. Within that
@@ -233,6 +234,10 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
     of that eligibility deadline. In two-top judging each deadline starts at an
     observed release; a missing clock leaves landing unknown. The touch window
     is half-open [start, end), and empty if either release is unresolved.
+
+    ``motion_unknown_reason`` (e.g. ``camera_handheld``): stadium motion cannot be measured
+    for this video, so touch is ``unknown`` on both sides with one note
+    ``stadium_motion_unknown@<reason>``, and the shake scan is not run.
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
@@ -308,7 +313,10 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
             side = _launch_side(t.center_at(t.first_frame()), c)
             if side is not None:
                 launcher_sides[t.track_id] = side
-    if clocked and end == 0:
+    if motion_unknown_reason is not None:
+        touch = dict.fromkeys(_SIDES, "unknown")
+        notes.append(f"stadium_motion_unknown@{motion_unknown_reason}")
+    elif clocked and end == 0:
         touch = dict.fromkeys(_SIDES, "unknown")
     else:
         touch, touch_notes = detect_touch(disp, launchers, launcher_sides, impacts, (start, end), c, th)

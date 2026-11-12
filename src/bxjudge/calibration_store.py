@@ -76,6 +76,10 @@ class Snapshot:
     homography: tuple | None
     # auto: sorted manual snapshot ids of all readable calib/ templates at creation (F-2)
     template_set: tuple[str, ...] | None = None
+    # keypoints: the video frame the stadium was found on and how many early frames agreed
+    # (1: a single fit, which a handheld tracker must confirm on another frame)
+    source_frame: int | None = None
+    agreeing_frames: int | None = None
 
 
 def _cal_dir(out_dir: Path) -> Path:
@@ -84,7 +88,8 @@ def _cal_dir(out_dir: Path) -> Path:
 
 def _canonical(kind: str, c: Calibration, score: float, template_id: str | None,
                source_sha256: str | None, homography: tuple | None,
-               template_set: tuple[str, ...] | None) -> str:
+               template_set: tuple[str, ...] | None,
+               origin: tuple[int, int] | None = None) -> str:
     d = {
         "kind": kind,
         "name": c.name,
@@ -98,6 +103,8 @@ def _canonical(kind: str, c: Calibration, score: float, template_id: str | None,
         "homography": None if homography is None
         else [[round(float(v), 9) for v in row] for row in homography],
     }
+    if origin is not None:  # keypoints only: manual and auto ids are unchanged
+        d["source_frame"], d["agreeing_frames"] = origin
     return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -114,8 +121,10 @@ def _sha256_file(path: Path) -> str:
 
 def _snapshot_id(kind: str, c: Calibration, score: float, template_id: str | None,
                  source_sha256: str | None, homography: tuple | None, png: bytes,
-                 template_set: tuple[str, ...] | None = None) -> str:
-    canon = _canonical(kind, c, score, template_id, source_sha256, homography, template_set)
+                 template_set: tuple[str, ...] | None = None,
+                 origin: tuple[int, int] | None = None) -> str:
+    canon = _canonical(kind, c, score, template_id, source_sha256, homography, template_set,
+                       origin)
     return hashlib.sha256(canon.encode("utf-8") + png).hexdigest()[:_ID_LEN]
 
 
@@ -123,6 +132,7 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
                   score: float, template_id: str | None = None, source_path: Path | None = None,
                   homography: tuple | None = None,
                   template_set: Iterable[str] | None = None,
+                  source_frame: int | None = None, agreeing_frames: int | None = None,
                   autocalib: AutoCalibConfig) -> Snapshot:
     """Write the snapshot of ``calibration`` with reference image ``ref_image`` and return it.
     Idempotent: identical content gives the same id and an existing snapshot is never rewritten.
@@ -136,6 +146,14 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
         raise ValueError("a manual snapshot has no template_set")
     if kind == "keypoints" and homography is None:
         raise ValueError("a keypoints snapshot needs its homography")
+    origin = None
+    if kind == "keypoints":
+        if not _is_origin(source_frame, agreeing_frames):
+            raise ValueError("a keypoints snapshot needs its source_frame (>= 0) and "
+                             "agreeing_frames (>= 1)")
+        origin = (source_frame, agreeing_frames)
+    elif source_frame is not None or agreeing_frames is not None:
+        raise ValueError("only a keypoints snapshot has a source_frame and agreeing_frames")
     if not math.isfinite(float(score)):
         raise ValueError("snapshot score must be finite")
     tset = None if template_set is None else tuple(sorted(set(template_set)))
@@ -144,7 +162,7 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
     hom = None if homography is None else tuple(tuple(float(v) for v in row) for row in homography)
     if hom is not None and not all(math.isfinite(v) for row in hom for v in row):
         raise ValueError("snapshot homography must be finite")
-    sid = _snapshot_id(kind, calibration, score, template_id, sha, hom, png, tset)
+    sid = _snapshot_id(kind, calibration, score, template_id, sha, hom, png, tset, origin)
     stored_score = float(score) if kind in _SCORED_KINDS else _MANUAL_STORED_SCORE
     d = _cal_dir(out_dir)
     jpath, ppath = d / f"{sid}.json", d / f"{sid}.png"
@@ -162,6 +180,8 @@ def save_snapshot(out_dir: Path, kind: str, calibration: Calibration, ref_image:
                 "source_path": None if source_path is None else str(source_path),
                 "source_sha256": sha,
                 "homography": None if hom is None else [list(r) for r in hom],
+                **({} if origin is None
+                   else {"source_frame": origin[0], "agreeing_frames": origin[1]}),
             },
         }
         tmp = d / f"{sid}.json.tmp"  # the JSON appears last, so a snapshot is never half-written
@@ -197,6 +217,8 @@ def load_snapshot(out_dir: Path, snapshot_id: str, *, autocalib: AutoCalibConfig
             source_path=meta.get("source_path"), source_sha256=meta.get("source_sha256"),
             homography=None if hom is None else tuple(tuple(float(v) for v in r) for r in hom),
             template_set=None if tset is None else tuple(str(t) for t in tset),
+            source_frame=meta.get("source_frame"),
+            agreeing_frames=meta.get("agreeing_frames"),
         )
     except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
         raise ValueError(f"{jpath}: malformed calibration snapshot ({e!r})") from None
@@ -209,6 +231,11 @@ def _is_number(v) -> bool:
 def _is_frame_side(v, limit: int) -> bool:
     """A finite whole number in ``1..limit`` (safe for ``int()``)."""
     return _is_number(v) and math.isfinite(v) and 1 <= v <= limit and v == int(v)
+
+
+def _is_origin(source_frame, agreeing_frames) -> bool:
+    return (type(source_frame) is int and source_frame >= 0
+            and type(agreeing_frames) is int and agreeing_frames >= 1)
 
 
 def _is_coord(v, limit: float) -> bool:
@@ -240,6 +267,9 @@ def _checked_meta(doc, cfg: AutoCalibConfig) -> dict:
         raise ValueError("homography is not a 3x3 matrix of numbers")
     if meta["kind"] == "keypoints" and hom is None:
         raise ValueError("a keypoints snapshot has no homography")
+    if meta["kind"] == "keypoints" and not _is_origin(meta.get("source_frame"),
+                                                      meta.get("agreeing_frames")):
+        raise ValueError("a keypoints snapshot has no valid source_frame/agreeing_frames")
     tset = meta.get("template_set")
     if tset is not None and not (isinstance(tset, list) and all(isinstance(t, str) for t in tset)):
         raise ValueError("template_set is not a list of strings")
