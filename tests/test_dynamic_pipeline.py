@@ -497,16 +497,25 @@ def test_keypoint_snapshot_is_the_third_choice(tmp_path, monkeypatch, th, rules)
     chosen = []
     [r] = _judge(source, tmp_path, th, rules, stadium_tools=_tools(), on_snapshot=chosen.append)
     assert chosen == [kp] and r.calibration_id == kp.id
-    assert calls == [{"hwaccel": th.decode_hwaccel, "allow_single": False}]
+    assert calls == [{"hwaccel": th.decode_hwaccel, "allow_single": False,
+                      "keypoint_errors": []}]
     assert "zone_out_of_frame@xtreme" in r.review_reasons and r.needs_review
     assert r.motion_evidence["stadium_keypoints"] == {
         "snapshot_id": kp.id, "method": "keypoints", "frame_index": 42, "agreeing_frames": 2,
         "coverage": 0.9, "precision": 0.8, "keypoint_error_px": 3.0,
         "keypoint_rail_shift_px": 9.0}
-    # Neither route finds a stadium: recalibrate, as before.
+    # Neither route finds a stadium: recalibrate, saying the keypoints failed too.
     monkeypatch.setattr(pipeline, "keypoint_snapshot", lambda *a, **k: (None, None))
     [r] = _judge(source, tmp_path, th, rules, stadium_tools=_tools())
-    assert r.review_reasons == ["recalibrate"]
+    assert r.review_reasons == ["recalibrate", "stadium_unlocated"]
+
+    def failing(*a, keypoint_errors=None, **k):
+        keypoint_errors.append("frame 0: RuntimeError: CUDA out of memory")
+        return None, None
+
+    monkeypatch.setattr(pipeline, "keypoint_snapshot", failing)
+    [r] = _judge(source, tmp_path, th, rules, stadium_tools=_tools())
+    assert r.review_reasons == ["recalibrate", "stadium_unlocated", "keypoint_inference_error"]
 
 
 def _handheld(monkeypatch, *, locator=True):
@@ -819,3 +828,62 @@ def test_a_vetoed_video_keeps_its_rows_when_the_alternative_gives_no_round(tmp_p
             if r["video"] == "a.mp4"] == before
     # R68: its latest analysis is the recalibrate it just gave (the review page warns).
     assert batch.timings()["a.mp4"]["analysis_status"] == "recalibrate"
+
+
+
+# ---- final whole-branch review ----------------------------------------------------------
+
+
+def test_unknown_geometry_reaches_the_launch_analysis(tmp_path, monkeypatch, th, rules):
+    """Frames without geometry are handed to analyze_launch so a top not seen landing there
+    is not a launch miss (final review High)."""
+    from dataclasses import replace as dc_replace
+
+    from bxjudge.camera_motion import load_camera_policy
+
+    c, source = _scene_setup(tmp_path, monkeypatch, select=False)
+    _handheld(monkeypatch)
+    kp = dc_replace(_snapshot(c, sid="feedfacefeedface"), kind="keypoints", source_frame=12,
+                    agreeing_frames=1)
+    seen = {}
+    original = pipeline.analyze_launch
+
+    def analyze(*a, **k):
+        seen.update(k)
+        return original(*a, **k)
+
+    monkeypatch.setattr(pipeline, "analyze_launch", analyze)
+    [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
+                 stadium_tools=_tools(), camera_policy=load_camera_policy(), snapshot=kp)
+    assert set(range(30)) <= seen["unobserved_frames"]
+    assert seen["round_start"] == 35  # the round's own start frame
+    assert not set(range(30, 80)) & seen["unobserved_frames"]
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
+    assert data["fps"] == 30  # the review page can place unknown spans without motion evidence
+
+
+def test_without_the_flag_launch_analysis_gets_no_unobserved_frames(tmp_path, monkeypatch, th,
+                                                                    rules):
+    _, source = _scene_setup(tmp_path, monkeypatch)
+    seen = {}
+    original = pipeline.analyze_launch
+    monkeypatch.setattr(pipeline, "analyze_launch",
+                        lambda *a, **k: seen.update(k) or original(*a, **k))
+    [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    assert "unobserved_frames" not in seen
+    data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
+    assert "fps" not in data
+
+
+def test_a_handheld_video_without_any_stadium_says_so(tmp_path, monkeypatch, th, rules):
+    from bxjudge.camera_motion import load_camera_policy
+
+    _, source = _scene_setup(tmp_path, monkeypatch, select=False)
+    _handheld(monkeypatch)
+    monkeypatch.setattr(pipeline, "keypoint_snapshot", lambda *a, **k: (None, None))
+    [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG,
+                 stadium_tools=_tools(), camera_policy=load_camera_policy())
+    assert r.review_reasons == ["recalibrate", "stadium_unlocated", "camera_handheld"]
+    # The camera measurement that led there is kept with the row.
+    assert r.motion_evidence == {"camera": {"mode": "handheld", "source": "measured",
+                                            "px_per_s": 60.0, "pairs": 9}}

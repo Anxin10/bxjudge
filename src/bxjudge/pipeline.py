@@ -284,20 +284,30 @@ def judge_video(
                 else snapshot
             )
             found = None
+            keypoint_errors: list[str] = []
             if snap is None and stadium_tools is not None:
                 # Third choice. A handheld camera may start from one keypoint fit, which
                 # its tracker confirms before emitting any zone.
                 snap, found = keypoint_snapshot(info.path, out_dir, stadium_tools, autocalib,
                                                 vetoed, hwaccel=th.decode_hwaccel,
-                                                allow_single=handheld)
+                                                allow_single=handheld,
+                                                keypoint_errors=keypoint_errors)
                 if snap is None:
                     found = None
             if on_snapshot is not None:
                 on_snapshot(snap)
             if snap is None:
-                return _provenance(
-                    [_review(info.path.name, info.duration, "recalibrate")], provenance
-                )
+                placeholder = _review(info.path.name, info.duration, "recalibrate")
+                if stadium_tools is not None:
+                    # Say which routes failed: the keypoints too, by inference error or not.
+                    placeholder.review_reasons.append("stadium_unlocated")
+                    if keypoint_errors:
+                        placeholder.review_reasons.append("keypoint_inference_error")
+                    if handheld:
+                        placeholder.review_reasons.append("camera_handheld")
+                if camera_record is not None:
+                    placeholder.motion_evidence = {"camera": camera_record}
+                return _provenance([placeholder], provenance)
             if handheld and dynamic_config is None:
                 placeholder = _review(info.path.name, info.duration, "recalibrate")
                 placeholder.review_reasons.append("handheld_requires_dynamic_calibration")
@@ -454,6 +464,11 @@ def judge_video(
                 )
         if geometry is not None:
             geometry.finish()  # the handheld tracker re-finds its tail; fixed: nothing
+        unobserved = None
+        if geometry is not None and (stadium_tools is not None or camera_policy is not None):
+            # Observations there were dropped: they cannot prove a launch miss.
+            unobserved = {f for f, sample in geometry.samples.items()
+                          if sample.alignment is None or sample.status == "bridged"}
         if timing and len(disp) != len(timing.timeline.pts_s):
             raise ValueError(f"{info.path}: decoded frame count does not match PTS count")
         anomalies = changes.events(timing.timeline) if changes is not None else []
@@ -486,7 +501,8 @@ def judge_video(
                 "calibration_id": snap.id,
                 "source": str(info.path.resolve()),
                 "source_sha256": source_sha,
-                **({"camera": camera_record} if camera_record is not None else {}),
+                **({"camera": camera_record, "fps": info.fps}
+                   if camera_record is not None else {}),
                 **({"stadium_keypoints": keypoint_record}
                    if keypoint_record is not None else {}),
                 "follow_policy": load_video_policy()["stadium_follow"],
@@ -624,6 +640,8 @@ def judge_video(
                 **({"sides_override": side_hints} if geometry is not None else {}),
                 **release_options,
                 **({"motion_unknown_reason": "camera_handheld"} if handheld else {}),
+                **({"unobserved_frames": unobserved, "round_start": start}
+                   if unobserved is not None else {}),
             )
             launch, sides = analysis.check, analysis.sides
             counts = Counter(sides.values())

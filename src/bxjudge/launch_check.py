@@ -225,7 +225,9 @@ class LaunchAnalysis:
 
 def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[int, float], c: Calibration, th: Thresholds, fps: float, *, sides_override: dict[int, Side] | None = None,
                    release_frames: dict[int, int] | None = None,
-                   motion_unknown_reason: str | None = None) -> LaunchAnalysis:
+                   motion_unknown_reason: str | None = None,
+                   unobserved_frames: set[int] | None = None,
+                   round_start: int | None = None) -> LaunchAnalysis:
     """Combine launch evidence without choosing between missing/duplicate side tracks.
 
     The missing-landing cap bounds the search for battle-area settling. Within that
@@ -238,16 +240,24 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
     ``motion_unknown_reason`` (e.g. ``camera_handheld``): stadium motion cannot be measured
     for this video, so touch is ``unknown`` on both sides with one note
     ``stadium_motion_unknown@<reason>``, and the shake scan is not run.
+
+    ``unobserved_frames`` (frames without stadium geometry, whose observations were dropped):
+    a side not seen landing while any frame of its landing window was unobserved has an
+    unknown landing (``landing_observation_incomplete@<side>``), never a launch miss. The
+    window starts at ``round_start`` (the round's start frame, before any filtering) when
+    given, else at the first observation.
     """
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
     sides = assign_sides(bey_tracks, c) if sides_override is None else {t.track_id:sides_override[t.track_id] for t in bey_tracks if t.track_id in sides_override}
     valid = [t for t in bey_tracks if t.track_id in sides]
     by_side = {side: [t for t in valid if sides[t.track_id] == side] for side in _SIDES}
-    first = min((t.first_frame() for t in bey_tracks if t.cls == 'bey' and t.dets), default=0)
+    first = min((t.first_frame() for t in bey_tracks if t.cls == 'bey' and t.dets),
+                default=0 if round_start is None else round_start)
     start = max(0, first - round(th.launch_pre_s * fps))
     cap = first + round(th.launch_missing_landing_s * fps)
     clocked = release_frames is not None
+    window_start = min(first, round_start) if round_start is not None else first
     deadlines = None
     if clocked:
         valid = [
@@ -284,6 +294,11 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
                 notes.append(f"launch_timing_unknown@{side}")
             else:
                 notes.append(f'track_evidence_{"missing" if not tracks else "duplicate"}@{side}')
+                if (not tracks and not clocked and unobserved_frames
+                        and any(f in unobserved_frames for f in range(window_start, cap + 1))):
+                    # Its observations may all have fallen where the geometry was unknown.
+                    landed[side] = None
+                    notes.append(f"landing_observation_incomplete@{side}")
             continue
         track = tracks[0]
         deadline = caps[track.track_id]
@@ -302,6 +317,12 @@ def analyze_launch(bey_tracks: list[Track], launchers: list[Track], disp: dict[i
                 landed[side] = None
                 landing_frame[side] = landing_zone[side] = None
                 notes.append(f"landing_observation_incomplete@{side}")
+        elif unobserved_frames and landed[side] is False and any(
+                f in unobserved_frames for f in range(window_start, deadline + 1)):
+            # Unknown stadium geometry hid part of the window: a miss is not proven.
+            landed[side] = None
+            landing_frame[side] = landing_zone[side] = None
+            notes.append(f"landing_observation_incomplete@{side}")
     end = max(landing_frame.values()) + round(th.launch_post_s * fps) if all(landed.values()) else cap
     impacts = impact_frames(valid, physical_floor, c, th)
     # Every physical settle can cause a shake, including post-deadline episodes.

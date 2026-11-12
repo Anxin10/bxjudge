@@ -189,8 +189,9 @@ def _single_fit_stadium(video: Path, model: StadiumModel, idx: int, frame: np.nd
 
 
 def keypoint_snapshot(video: Path, out_dir: Path, tools: StadiumTools, autocalib, vetoed, *,
-                      hwaccel: str = "cpu",
-                      allow_single: bool = False) -> tuple[Snapshot | None, FoundStadium | None]:
+                      hwaccel: str = "cpu", allow_single: bool = False,
+                      keypoint_errors: list[str] | None = None,
+                      ) -> tuple[Snapshot | None, FoundStadium | None]:
     """``find_stadium`` with the keypoint ensemble, stored as a ``keypoints`` snapshot
     (reference image = the found frame, score = fit coverage, homography = model px ->
     that frame's px). Only a keypoint result is stored: a rail result comes back as
@@ -198,10 +199,12 @@ def keypoint_snapshot(video: Path, out_dir: Path, tools: StadiumTools, autocalib
 
     ``allow_single`` (handheld cameras only): when no two early keypoint fits agree, the one
     with the lowest keypoint error is used (``method="keypoints_single"``,
-    ``agreeing_frames=1``). The handheld tracker must confirm it before emitting any zone."""
+    ``agreeing_frames=1``). The handheld tracker must confirm it before emitting any zone.
+    Keypoint inference errors are appended to ``keypoint_errors`` when given."""
     fits: list = []
     found = find_stadium(Path(video), tools.model, tools.cfg, hwaccel=hwaccel,
-                         keypoints=tools.finder, keypoint_fits=fits)
+                         keypoints=tools.finder, keypoint_fits=fits,
+                         keypoint_errors=keypoint_errors)
     if found is None or found.method != "keypoints":
         if not (allow_single and fits):
             return None, found

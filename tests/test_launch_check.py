@@ -431,3 +431,66 @@ def test_motion_unknown_reason_makes_touch_unknown_without_scanning(th, monkeypa
         ["stadium_motion_unknown@camera_handheld"]
     assert (got.landed, got.landing_frame, got.landing_zone) == \
         (baseline.landed, baseline.landing_frame, baseline.landing_zone)
+
+
+def test_unobserved_frames_in_the_landing_window_make_a_miss_unknown(th):
+    """A top not seen landing while the stadium geometry was unknown is not a launch miss:
+    landing is unknown (redo without a penalty), never not_landed (final review High)."""
+    from bxjudge.launch_check import analyze_launch
+
+    tracks = pair()
+    tracks[1] = make_track(2, "bey", fall_then_rest(32, (560, 60), (500, -200)))  # B on the lid
+    disp = {f: 0.0 for f in range(200)}
+    plain = analyze_launch(tracks, [], disp, make_calibration(), th, 60).check
+    assert plain.landed == {"X": True, "B": False}
+    seen = analyze_launch(tracks, [], disp, make_calibration(), th, 60,
+                          unobserved_frames={round(th.launch_missing_landing_s * 60) + 5}).check
+    assert seen.landed == plain.landed  # gap outside the landing window: unchanged
+    gap = analyze_launch(tracks, [], disp, make_calibration(), th, 60,
+                         unobserved_frames={20, 21, 22}).check
+    assert gap.landed == {"X": True, "B": None}
+    assert "landing_observation_incomplete@B" in gap.notes
+
+
+def test_a_side_whose_observations_were_all_dropped_is_unknown_not_a_miss(th):
+    """Every observation of B fell in frames without geometry: no track at all is left for B.
+    Its landing is unknown (redo, no miss counted), never not_landed (final re-review High)."""
+    from bxjudge.launch_check import analyze_launch
+
+    x_only = [pair()[0]]
+    disp = {f: 0.0 for f in range(200)}
+    plain = analyze_launch(x_only, [], disp, make_calibration(), th, 60).check
+    assert plain.landed["B"] is False  # without geometry information: as before
+    gap = analyze_launch(x_only, [], disp, make_calibration(), th, 60,
+                         unobserved_frames=set(range(5, 40))).check
+    assert gap.landed["B"] is None and "landing_observation_incomplete@B" in gap.notes
+
+
+def test_unknown_frames_before_the_first_kept_observation_still_count(th):
+    """The round starts at frame 5; frames 5-39 had no geometry, so every B observation and
+    X's early frames were dropped and X's first kept observation is at 40. The landing window
+    starts at the round start, not at that first kept observation (final re-review High)."""
+    from bxjudge.launch_check import analyze_launch
+
+    x = make_track(1, "bey", {f + 40: c for f, c in pair()[0].centers().items()})
+    disp = {f: 0.0 for f in range(300)}
+    unknown = set(range(5, 40))
+    late = analyze_launch([x], [], disp, make_calibration(), th, 60,
+                          unobserved_frames=unknown).check
+    assert late.landed["B"] is False  # the window measured from frame 40 misses the gap
+    got = analyze_launch([x], [], disp, make_calibration(), th, 60,
+                         unobserved_frames=unknown, round_start=5).check
+    assert got.landed["B"] is None and "landing_observation_incomplete@B" in got.notes
+
+
+def test_a_round_with_every_observation_dropped_is_unknown_on_both_sides(th):
+    from bxjudge.launch_check import analyze_launch
+
+    start = round(th.launch_missing_landing_s * 60) + 100
+    disp = {f: 0.0 for f in range(start + 400)}
+    got = analyze_launch([], [], disp, make_calibration(), th, 60,
+                         unobserved_frames=set(range(start, start + 50)),
+                         round_start=start).check
+    assert got.landed == {"X": None, "B": None}
+    assert {"landing_observation_incomplete@X", "landing_observation_incomplete@B"} <= set(
+        got.notes)

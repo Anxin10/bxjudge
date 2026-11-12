@@ -201,6 +201,15 @@ def repair_steps(row: dict, source: Path | str, results_dir: Path) -> list[str]:
             ("確認影片開頭拍到完整場地；或為這個鏡頭人工校準："
              f"`bxjudge calibrate {video} --name <新校準名稱> --out calib`"),
         ]
+    elif "stadium_unlocated" in reasons:
+        steps += [
+            ("影片開頭與 calib/ 的校準都不相符，場地關鍵點也找不到可信的場地（開頭沒拍到"
+             "完整場地、場地被大幅遮住，或鏡頭一直在移動）。"),
+            f"為這個鏡頭人工校準：`bxjudge calibrate {video} --name <新校準名稱> --out calib`",
+        ]
+        if "keypoint_inference_error" in reasons:
+            steps.append("關鍵點推論曾發生錯誤（例如顯示卡記憶體不足）：先用 `nvidia-smi` "
+                         "確認 GPU 沒有被其他工作占滿，再重跑。")
     elif "recalibrate" in reasons:
         steps += [
             ("影片第一秒的畫面與 calib/ 內所有校準都不相符，也無法自動對齊（鏡頭或場地位置"
@@ -232,6 +241,8 @@ _REASON_LABELS = {
     "stadium_motion_unknown@camera_handheld": "手持鏡頭：盤面位移無法量測，觸碰不確定",
     "handheld_requires_dynamic_calibration": "手持鏡頭需要動態校準",
     "handheld_reference_unlocated": "手持鏡頭：參考畫面找不到場地",
+    "stadium_unlocated": "範本與場地關鍵點都找不到場地",
+    "keypoint_inference_error": "場地關鍵點推論發生錯誤",
 }
 
 
@@ -302,7 +313,7 @@ def round_geometry_gaps(out_dir: Path, row: dict, source_sha256: str | None = No
             isinstance(x, dict) and type(x.get("frame")) is int
             and isinstance(x.get("status"), str) and "alignment" in x for x in samples):
         raise ValueError("invalid geometry evidence samples")
-    fps = (row.get("motion_evidence") or {}).get("fps")
+    fps = (row.get("motion_evidence") or {}).get("fps") or data.get("fps")
     if not fps:
         return []
     first, last = round(row["t_launch"] * fps), round(row["t_end"] * fps)

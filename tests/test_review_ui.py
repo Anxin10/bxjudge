@@ -814,3 +814,21 @@ def test_app_hides_unknown_spans_of_evidence_for_a_changed_video(batch):
     assert not at.exception, at.exception
     assert "場地區域未知的區間" not in " ".join(m.value for m in at.markdown)
     assert any("source mismatch" in w.value for w in at.warning)
+
+
+
+@pytest.mark.parametrize("reasons, needle", [
+    (["recalibrate", "stadium_unlocated"], "bxjudge calibrate"),
+    (["recalibrate", "stadium_unlocated", "keypoint_inference_error"], "nvidia-smi"),
+])
+def test_repair_steps_explain_a_stadium_no_route_found(tmp_path, reasons, needle):
+    steps = review_ui.repair_steps(row(review_reasons=reasons), Path("/v/a.mp4"), tmp_path)
+    assert any("關鍵點" in s for s in steps) and any(needle in s for s in steps)
+
+
+def test_round_geometry_gaps_use_the_evidence_fps_without_motion_evidence(tmp_path):
+    evidence = _gap_evidence(tmp_path, fps=30)
+    r = row(video="a.mp4", calibration_id="abc", geometry_evidence=evidence, t_launch=1.0,
+            t_end=2.0)  # a pair_not_confirmed round: no motion evidence
+    assert review_ui.round_geometry_gaps(tmp_path, r) == [
+        {"start": 40, "end": 60, "status": "lost", "reason": None}]
