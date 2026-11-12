@@ -1005,7 +1005,8 @@ def _alignment(fit: StadiumFit, model: StadiumModel, frame_size: tuple[int, int]
 
 def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
                  hwaccel: str = "cpu", keypoints=None,
-                 keypoint_errors: list[str] | None = None) -> FoundStadium | None:
+                 keypoint_errors: list[str] | None = None,
+                 keypoint_fits: list | None = None) -> FoundStadium | None:
     """Stadium zones for ``video`` from its clearest early frames, or ``None``.
 
     Frames are sampled every ``sample_step_s`` within the first ``sample_window_s`` (playback
@@ -1024,7 +1025,10 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
 
     A frame whose keypoint inference or fit raises is skipped (the rail path still runs); the
     error is appended to ``keypoint_errors`` when given, so a caller can tell a resource
-    failure from a video without a stadium."""
+    failure from a video without a stadium. Every accepted keypoint fit is appended to
+    ``keypoint_fits`` as ``(frame_index, frame, fit)`` when given: a handheld camera rarely
+    holds still for two agreeing frames, and its tracker may start from one fit and confirm
+    it later (plan 2026-11-12-dynamic-calibration)."""
     from bxjudge.autocalib import load_autocalib_config, warp_calibration
     from bxjudge.manifest import probe
     from bxjudge.video import VideoDecodeError, iter_frames
@@ -1063,7 +1067,7 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
                 pts = keypoints.predict(frame)
                 fit = (None if pts is None
                        else fit_from_keypoints(pts, keypoints.reference, mask, model, cfg))
-            except (RuntimeError, ValueError, cv2.error) as e:
+            except (RuntimeError, ValueError, MemoryError, cv2.error) as e:
                 # One frame's inference or fit failed: skip it, the rail path still runs.
                 _log.warning("%s frame %d: keypoint fit failed: %s: %s", Path(video).name, idx,
                              type(e).__name__, e)
@@ -1072,6 +1076,8 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
                 continue
             if fit is None:
                 continue
+            if keypoint_fits is not None:
+                keypoint_fits.append((idx, frame, fit))
             zones = _zones(model, fit)
             kfits.append((idx, frame, fit, zones))
             agree = [f for f in kfits if float(np.linalg.norm(f[3] - zones, axis=1).mean())

@@ -392,14 +392,55 @@ def test_find_stadium_falls_back_to_the_rail_when_points_disagree(tmp_path, synt
     assert found.calibration == rail.calibration
 
 
-def test_find_stadium_falls_back_to_the_rail_when_inference_fails(tmp_path, synth_model):
+def test_find_stadium_hands_out_every_keypoint_fit_when_none_agree(tmp_path, synth_model):
+    """A handheld camera gives single fits that never agree; the caller may start from one
+    (plan 2026-11-12-dynamic-calibration, ledger ruling), so each accepted fit is handed out."""
+    cfg, model = synth_model
+
+    class OneFrame(_FakeFinder):
+        def predict(self, frame):
+            self.calls += 1
+            return _points(H_RAIL) if self.calls == 1 else None
+
+    clip, _ = _rail_only(tmp_path, cfg, model)
+    fits: list = []
+    found = find_stadium(clip, model, cfg, keypoints=OneFrame(None, _ref(model)),
+                         keypoint_fits=fits)
+    assert found is not None and found.method == "rail"
+    assert len(fits) == 1
+    idx, frame, fit = fits[0]
+    assert isinstance(idx, int) and frame.shape[:2] == (720, 1280)
+    assert zone_error(fit.homography, H_RAIL) < 1.0
+
+
+def test_find_stadium_hands_out_each_accepted_fit(tmp_path, synth_model):
+    cfg, model = synth_model
+
+    class TwoFrames(_FakeFinder):
+        def predict(self, frame):
+            self.calls += 1
+            return _points(H_RAIL) if self.calls <= 2 else None
+
+    clip, _ = _rail_only(tmp_path, cfg, model)
+    fits: list = []
+    found = find_stadium(clip, model, cfg, keypoints=TwoFrames(None, _ref(model)),
+                         keypoint_fits=fits)
+    assert found is not None and found.method == "keypoints" and found.agreeing_frames == 2
+    assert len(fits) == 2 and fits[0][0] != fits[1][0]
+    assert found.frame_index in {fits[0][0], fits[1][0]}
+
+
+@pytest.mark.parametrize("error", [RuntimeError("CUDA error: out of memory"),
+                                   MemoryError("Unable to allocate array: out of memory")])
+def test_find_stadium_falls_back_to_the_rail_when_inference_fails(tmp_path, synth_model,
+                                                                   error):
     # Codex review 2026-11-12 Medium: an exception in the keypoint path skipped the rail.
     cfg, model = synth_model
 
     class Broken(_FakeFinder):
         def predict(self, frame):
             self.calls += 1
-            raise RuntimeError("CUDA error: out of memory")
+            raise error
 
     clip, rail = _rail_only(tmp_path, cfg, model)
     finder = Broken(None, _ref(model))
