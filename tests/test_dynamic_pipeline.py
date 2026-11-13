@@ -872,17 +872,102 @@ def test_unknown_geometry_reaches_the_launch_analysis(tmp_path, monkeypatch, th,
     assert data["fps"] == 30  # the review page can place unknown spans without motion evidence
 
 
-def test_without_the_flag_launch_analysis_gets_no_unobserved_frames(tmp_path, monkeypatch, th,
-                                                                    rules):
+def test_without_the_flag_unknown_geometry_still_reaches_the_launch_analysis(
+        tmp_path, monkeypatch, th, rules):
+    """Fixed-camera dynamic judging without --stadium-keypoints: frames the tracker could not
+    place are unobserved too, so a top not seen landing there is not a launch miss (the
+    pre-existing gap the keypoint work left for a follow-up)."""
+    from dataclasses import replace as dc_replace
+
+    from bxjudge.dynamic_calibration import DynamicCalibration
+
     _, source = _scene_setup(tmp_path, monkeypatch)
+    original_finish = DynamicCalibration.finish
+
+    def finish(self):  # the tracker never placed frames 0-29 (after any backfill)
+        original_finish(self)
+        for f in range(30):
+            self.samples[f] = dc_replace(self.samples[f], alignment=None, status="lost")
+
+    monkeypatch.setattr(DynamicCalibration, "finish", finish)
     seen = {}
     original = pipeline.analyze_launch
     monkeypatch.setattr(pipeline, "analyze_launch",
                         lambda *a, **k: seen.update(k) or original(*a, **k))
     [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG)
-    assert "unobserved_frames" not in seen
+    assert set(range(30)) <= seen["unobserved_frames"]
+    assert not set(range(30, 80)) & seen["unobserved_frames"]
+    assert seen["round_start"] == 35
     data = json.loads((tmp_path / "out" / r.geometry_evidence["path"]).read_text())
-    assert "fps" not in data
+    assert "fps" not in data  # the geometry record itself is unchanged without the flag
+
+
+@pytest.mark.parametrize("gap", [None, "lost", "bridged"])
+def test_without_the_flag_unknown_geometry_in_the_landing_window_is_not_a_miss(
+        tmp_path, monkeypatch, th, rules, gap):
+    """No --stadium-keypoints: the scene's tops give no usable side evidence, so neither side
+    is seen landing. With frames 40-50 of the landing window unknown (no alignment, or a
+    bridged one) that is unknown landing, not a launch miss; with full geometry it stays a
+    miss."""
+    from dataclasses import replace as dc_replace
+
+    from bxjudge.dynamic_calibration import DynamicCalibration
+
+    _, source = _scene_setup(tmp_path, monkeypatch)
+    if gap is not None:
+        original_finish = DynamicCalibration.finish
+
+        def finish(self):
+            original_finish(self)
+            for f in range(40, 51):
+                sample = self.samples[f]
+                self.samples[f] = dc_replace(
+                    sample, alignment=None if gap == "lost" else sample.alignment, status=gap)
+
+        monkeypatch.setattr(DynamicCalibration, "finish", finish)
+    [r] = _judge(source, tmp_path, th, rules, dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    if gap is None:
+        assert r.launch.landed == {"X": False, "B": False}
+        assert not any(n.startswith("landing_observation_incomplete") for n in r.launch.notes)
+    else:
+        assert r.launch.landed == {"X": None, "B": None}
+        assert {"landing_observation_incomplete@X",
+                "landing_observation_incomplete@B"} <= set(r.launch.notes)
+
+
+def test_cached_dynamic_analyses_are_redone_when_the_launch_judging_changes(
+        tmp_path, monkeypatch, th, rules):
+    """A change to launch_check.py, or to what judge_video hands it (the revision marker),
+    rejudges videos cached under dynamic calibration (Codex Medium: the unobserved-landing
+    fix would otherwise keep old not-landed rows)."""
+    batch = _batch_judged(tmp_path, monkeypatch, th, rules)
+    batch.run(dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    assert len(batch.judged) == 2
+    batch.run(dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    assert batch.judged == []  # cached
+    monkeypatch.setattr(pipeline, "_DYNAMIC_JUDGING_REVISION",
+                        pipeline._DYNAMIC_JUDGING_REVISION + 1)
+    batch.run(dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    assert len(batch.judged) == 2
+    real = Path.read_bytes
+
+    def read_bytes(self):
+        data = real(self)
+        return data + b"# changed" if self.name == "launch_check.py" else data
+
+    monkeypatch.setattr(pipeline.Path, "read_bytes", read_bytes)
+    batch.run(dynamic_config=DEFAULT_DYNAMIC_CONFIG)
+    assert len(batch.judged) == 2
+
+
+def test_static_calibration_hands_no_unobserved_frames(tmp_path, monkeypatch, th, rules):
+    _, source = _scene_setup(tmp_path, monkeypatch)
+    seen = {}
+    original = pipeline.analyze_launch
+    monkeypatch.setattr(pipeline, "analyze_launch",
+                        lambda *a, **k: seen.update(k) or original(*a, **k))
+    _judge(source, tmp_path, th, rules)
+    assert "unobserved_frames" not in seen and "round_start" not in seen
 
 
 def test_a_handheld_video_without_any_stadium_says_so(tmp_path, monkeypatch, th, rules):

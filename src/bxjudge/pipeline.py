@@ -465,7 +465,7 @@ def judge_video(
         if geometry is not None:
             geometry.finish()  # the handheld tracker re-finds its tail; fixed: nothing
         unobserved = None
-        if geometry is not None and (stadium_tools is not None or camera_policy is not None):
+        if geometry is not None:
             # Observations there were dropped: they cannot prove a launch miss.
             unobserved = {f for f, sample in geometry.samples.items()
                           if sample.alignment is None or sample.status == "bridged"}
@@ -989,6 +989,12 @@ def analysis_status(results: list[RoundResult]) -> str:
     return "ok"
 
 
+# Bump when judge_video changes what dynamic judging hands the launch analysis, so cached
+# dynamic analyses are redone (pipeline.py itself is not hashed: every edit would rejudge all).
+# 1: unknown-geometry frames reach analyze_launch without --stadium-keypoints too.
+_DYNAMIC_JUDGING_REVISION = 1
+
+
 def _keypoint_signature(tools, camera_policy: dict) -> dict:
     """JSON-normal identity of the keypoint route for the analysis signature."""
     from dataclasses import is_dataclass
@@ -1235,7 +1241,9 @@ def run_batch(
             "identity": load_identity_policy(),
             "temporal": load_temporal_policy(),
             "implementation_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                for name in ("identity.py", "dynamic_calibration.py", "temporal_geometry.py", "stadium_follow.py")},
+                for name in ("identity.py", "dynamic_calibration.py", "temporal_geometry.py", "stadium_follow.py",
+                             "launch_check.py")},
+            "judging_revision": _DYNAMIC_JUDGING_REVISION,
         }
         if two_bey_config is not None:
             dynamic_signature['two_bey_tracking']={
