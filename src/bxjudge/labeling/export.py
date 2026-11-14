@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from .config import load_config
-from .sam3_prelabel import CLASSES
+from .prelabel import CLASSES
 
 
 def _cover_every_class(videos, val_n, reviewed):

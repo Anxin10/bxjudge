@@ -21,9 +21,8 @@ def load_config(path: str | Path = "config/labeling.yaml") -> dict:
         "min_gap_s",
         "launcher_max_aspect",
         "val_ratio",
-        "window_frames",
-        "batched_grounding_batch_size",
-        "checkpoint",
+        "max_new_tokens",
+        "model_dir",
         "prompts",
     }
     if not isinstance(cfg, dict) or set(cfg) != required:
@@ -31,8 +30,7 @@ def load_config(path: str | Path = "config/labeling.yaml") -> dict:
     for key in [
         "per_video",
         "energy_long_edge",
-        "window_frames",
-        "batched_grounding_batch_size",
+        "max_new_tokens",
     ]:
         if type(cfg[key]) is not int or cfg[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
@@ -46,8 +44,17 @@ def load_config(path: str | Path = "config/labeling.yaml") -> dict:
         or cfg["launcher_max_aspect"] < 1
     ):
         raise ValueError("invalid labeling ratios")
-    if set(cfg["prompts"]) != {"bey", "bey_part", "launcher"} or any(
-        not isinstance(p, str) or not p.strip() for p in cfg["prompts"].values()
+    if not isinstance(cfg["model_dir"], str) or not cfg["model_dir"].strip():
+        raise ValueError("model_dir must name the pinned local snapshot")
+    prompts = cfg["prompts"]
+    if not isinstance(prompts, dict):
+        raise TypeError("prompts must be a mapping")
+    if set(prompts) != {"bey", "bey_part", "launcher"} or any(
+        not isinstance(p, str) or not p.strip() or "<" in p or ">" in p
+        for p in prompts.values()
     ):
-        raise ValueError("prompts must name all three classes")
+        raise ValueError("prompts must name all three classes without markup")
+    cfg["prompts"] = {cls: prompts[cls].strip() for cls in ("bey", "bey_part", "launcher")}
+    if len({p.casefold() for p in cfg["prompts"].values()}) != len(prompts):
+        raise ValueError("class prompts must be distinct")
     return cfg

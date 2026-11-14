@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from bxjudge.labeling.export import label_studio_to_coco
-from bxjudge.labeling.sam3_prelabel import to_label_studio
+from bxjudge.labeling.prelabel import to_label_studio
 
 
 def task(folder, video, frame, *, reviewed=True, background=False):

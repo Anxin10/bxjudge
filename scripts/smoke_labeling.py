@@ -1,10 +1,11 @@
-"""Opt-in real SAM GPU smoke, outside pytest; no external footage or accuracy claim.
+"""Opt-in real LocateAnything GPU smoke, outside pytest; no external footage or accuracy claim.
 Run: uv run python scripts/smoke_labeling.py --out <scratch directory>
 """
 
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import cv2
@@ -25,13 +26,13 @@ for index in range(4):
 writer.release()
 cfg = yaml.safe_load(Path("config/labeling.yaml").read_text())
 cfg.update(
-    input_folder=str(out), output_dir=str(out / "labels"), window_frames=2, per_video=4
+    input_folder=str(out), output_dir=str(out / "labels"), per_video=4
 )
 config = out / "labeling.yaml"
 config.write_text(yaml.safe_dump(cfg))
 for action in ["sample", "prelabel"]:
     subprocess.run(
-        ["uv", "run", "--locked", "bxjudge", "label", action, "--config", str(config)],
+        [sys.executable, "-m", "bxjudge.cli", "label", action, "--config", str(config)],
         check=True,
     )
 tasks = json.loads((out / "labels/tasks.json").read_text())

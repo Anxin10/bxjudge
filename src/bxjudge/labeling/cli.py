@@ -24,7 +24,7 @@ def command(args):
     cfg = load_config(args.config)
     out = Path(args.out or cfg["output_dir"]).expanduser().resolve()
     if args.label_command == "sample":
-        from .sam3_prelabel import video_digest
+        from .prelabel import video_digest
         from .sample_frames import change_energy, select_frames
 
         folder = Path(args.folder or cfg["input_folder"]).expanduser()
@@ -58,7 +58,7 @@ def command(args):
             f"{len(entries)} videos, {sum(len(v['frames']) for v in entries)} selected frames; {out}/samples.json"
         )
     elif args.label_command == "prelabel":
-        from .sam3_prelabel import run_prelabel_jobs, video_digest
+        from .prelabel import run_prelabel_jobs, video_digest, write_json
 
         manifest = Path(args.samples) if args.samples else out / "samples.json"
         entries = json.loads(manifest.read_text(encoding="utf-8"))["videos"]
@@ -69,7 +69,8 @@ def command(args):
                 raise ValueError("source video changed since sampling")
             jobs.append(
                 {
-                    "video": entry["video"],
+                    "video": str(Path(entry["video"]).resolve()),
+                    "video_sha256": entry["video_sha256"],
                     "frames": entry["frames"],
                     "out_json": str(out / (entry["video_sha256"] + ".json")),
                 }
@@ -78,7 +79,8 @@ def command(args):
         tasks = []
         for job in jobs:
             tasks.extend(json.loads(Path(job["out_json"]).read_text(encoding="utf-8")))
-        (out / "tasks.json").write_text(json.dumps(tasks, indent=2), encoding="utf-8")
+        out.mkdir(parents=True, exist_ok=True)
+        write_json(out / "tasks.json", tasks)
         print(f"Import {out}/tasks.json into Label Studio")
     elif args.label_command == "export":
         from .export import label_studio_to_coco
@@ -99,7 +101,7 @@ def command(args):
 
 def add_label(sub):
     p = sub.add_parser(
-        "label", help="sample videos, SAM 3.1 prelabel, or export reviewed COCO"
+        "label", help="sample videos, LocateAnything prelabel, or export reviewed COCO"
     )
     actions = p.add_subparsers(dest="label_command", required=True)
     for name in ["sample", "prelabel", "export", "extend-training"]:

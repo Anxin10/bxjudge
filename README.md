@@ -450,7 +450,7 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
    uv run bxjudge calibrate ~/bx/videos/20261001/<任一支影片>.mp4 --name 20261001 --at 1.0
    ```
 
-3. **標註**（見下方「本機標註」）：抽格 → SAM 3.1 預標 → Label Studio 人工修正 → 匯出 COCO：
+3. **標註**（見下方「本機標註」）：抽格 → LocateAnything 預標 → Label Studio 人工修正 → 匯出 COCO：
 
    ```bash
    bash scripts/setup_labeling.sh
@@ -635,51 +635,29 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
 注意：同一個結果資料夾一次只跑一個 `bxjudge run` / `bxjudge vlm`；試不同設定時每次用新的
 `--out`，再以 `bxjudge eval <新資料夾> --truth results/20261001` 比較。
 
-## 本機標註：抽格 → SAM 3.1 → 人工修正 → COCO
+## 本機標註：抽格 → LocateAnything → 人工修正 → COCO
 
-先在 WSL 執行 `bash scripts/setup_labeling.sh`。主程式保留 NumPy 2 / OpenCV 5；
-SAM 官方目前要求 NumPy < 2，因此使用 `scripts/sam-runtime/pyproject.toml` 與獨立
-`uv.lock` 中固定的受支援環境（NumPy 1.26 / OpenCV 4.11）。不會在主環境安裝 SAM。
-SAM SDK 固定為官方 commit `7f473cfd983d5eb43040ff608f66bff0d7bdcb53`，實際使用
-**SAM 3.1 multiplex video**，RTX 3090 上 `use_fa3=False`、`compile=False`，並使用
-checkpoint 原生 complex RoPE (`use_rope_real=False`)。每次 prelabel 指令只啟動一個
-工作程序、載入一次模型；工作程序結束是模型記憶體與 SDK autocast 狀態的清理邊界。
+在 WSL 執行 `bash scripts/setup_labeling.sh`。安裝會建立獨立的 `scripts/locateanything-runtime/.venv`，
+依 lockfile 固定 CUDA、PyTorch、Transformers 等套件版本，並取得
+[NVIDIA LocateAnything-3B](https://huggingface.co/nvidia/LocateAnything-3B/tree/c32291ca5e996f5a7a485845b4f57a233936bba0)
+固定版本。權重預設放在 `weights/locateanything/LocateAnything-3B`。若已有同版本副本，可以用
+`bash scripts/setup_labeling.sh --from-snapshot /path/to/LocateAnything-3B` 匯入。
+模型載入前核對本機檔案雜湊，每次預標只啟動一個離線工作程序，模型只載入一次。
 
-權重為 gated 模型：先在 [facebook/sam3.1](https://huggingface.co/facebook/sam3.1)
-申請／接受存取條款，必要時自行執行 `uv run --project scripts/sam-runtime hf auth login`
-（舊文件稱 `huggingface-cli login`）。預設權重位置為
-`weights/sam3.1/sam3.1_multiplex.pt`；以 `config/labeling.yaml` 修改路徑。
-本機已驗證的檔案 SHA256：`0567debeec80ba4ac6369540c6c248025283cb3ff2b92827509e57e2b3541cb6`，
-來源 HF revision `daa63191845a41281374e725f4c9e51c7a824460`。檔案不進 Git。
-
-所有抽格與標註政策預設值位於 `config/labeling.yaml`；可另存一份並用 `--config` 指定。
+所有抽格與標註設定在 `config/labeling.yaml`，可以另存一份並以 `--config` 指定。
 預設 10/1 批次，每支 8 張，30% 均勻取樣、其餘優先能量峰值，最小間隔 0.1 秒：
 
 ```bash
 uv run bxjudge label sample --per-video 8
-# 或指定本機影片資料夾與輸出資料夾
 uv run bxjudge label sample ~/bx/videos/20261001 --out data/labeling
 uv run bxjudge label prelabel --out data/labeling
 ```
 
-抽格先寫出 `samples.json`（影片絕對路徑、內容 SHA256、fps、原始格號），prelabel
-重驗來源內容後產生可匯入的 `tasks.json`、各影片 JSON／`.report.json`，以及穩定的
-`images/<video_sha256>/<原始格號>.jpg`。不要在標註或匯出前移動／刪除這個資料夾。
-預標採每段最多 120 張**連續原始格**的實際暫存資源；只處理有選定格的區段，區段內
-不降幀。每區段各類別重新提示並傳播，區段間物件 ID 重設。只保存選定格的框和分數，
-不保存所有全解析遮罩。每區段在 finally 關閉迭代器、reset 並清空 state，再刪除暫存格；
-CPU offload 或 async loading 本身不代表有界記憶體。這是靜態圖片標註，不提供跨區段軌跡。
-
-`config/labeling.yaml` 的 `batched_grounding_batch_size: 4`（R47 實測）：固定版本的 SDK
-builder 寫死 16，在真實 1080p 的 120 格窗口於第 17/120 格已達約 23.4 GiB 而中止；只把
-grounding batch 改為 4（`window_frames` 120 與 SDK `postprocess_batch_size` 16 不變），同一
-窗口 126.93 s 完成，全卡峰值 12381 MiB（含桌面約 2.2 GB）。這是資源量測，不代表框的品質：
-該次 5 個 `bey_part` 框都錯把整顆陀螺或發射器框入，必須人工修正。
-
-本版繞過官方 `start_session` 的不支援參數錯誤，使用固定版本的 `predictor.model`
-直接 API。傳播不傳 optional `max_frame_num_to_track`，避免該版本兩層不同的結尾定義；
-傳播範圍就是已限制張數的實際資源。官方組裝模型時會印出中途 tracker-only 的
-missing/unexpected keys；最終完整模型會額外核對 checkpoint key 集合，任何缺漏直接失敗。
+抽格先寫 `samples.json`（影片絕對路徑、內容 SHA256、fps、原始格號）。預標重驗來源，
+只對選定格做單圖推論，輸出 `tasks.json`、各影片 JSON／`.report.json` 與
+`images/<video_sha256>/<原始格號>.jpg`。報告記錄模型版本、提示詞、框數與推論時間。
+模型輸出沒有校準過的框置信分數。匯入 Label Studio 後，請核對陀螺、碎片與發射器，
+補漏框、刪誤框並修正邊界；訓練匯出只使用人工完成的標註。
 
 Label Studio 需人工建立本機帳號與專案。以下在 WSL 啟動，明確綁定 loopback，Windows
 瀏覽器開啟 [http://localhost:8080](http://localhost:8080)：
