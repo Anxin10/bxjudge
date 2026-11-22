@@ -7,6 +7,7 @@ import json
 import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 from .identity_review import validate as validate_identity
 from .reid_review import MANIFEST_SCHEMA, validate_submission
@@ -18,6 +19,20 @@ def _reject_constant(value):
 
 
 class WorkbenchHandler(SimpleHTTPRequestHandler):
+    _cache_header_sent = False
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "cache-control":
+            self._cache_header_sent = True
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        # Regenerated pages must not be served stale from the browser cache.
+        if not self._cache_header_sent:
+            super().send_header("Cache-Control", "no-cache")
+        self._cache_header_sent = False
+        super().end_headers()
+
     def reply(self, status, body):
         data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
         self.send_response(status)
@@ -27,7 +42,53 @@ class WorkbenchHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_video(self):
+        name = unquote(self.path.split("?", 1)[0].removeprefix("/video/"))
+        path = self.server.videos.get(name)
+        if path is None or not path.is_file():
+            return self.reply(404, {"error": "影片不在本次 run 的允許清單"})
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        ranged = self.headers.get("Range")
+        if ranged:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", ranged.strip())
+            if match is None or match[1] == match[2] == "":
+                start = size  # malformed: force 416 below
+            elif match[1] == "":
+                start = max(0, size - int(match[2]))
+            else:
+                start = int(match[1])
+                end = min(end, int(match[2])) if match[2] else end
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+        self.send_response(206 if ranged else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if ranged:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        with path.open("rb") as stream:
+            stream.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = stream.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break  # Browsers abort range requests while seeking.
+                remaining -= len(chunk)
+        return None
+
     def do_GET(self):
+        if self.path.startswith("/video/"):
+            return self.send_video()
         save_route = self.path.removesuffix("/saved") + "/save"
         route = (
             self.server.review_routes.get(save_route)
@@ -107,8 +168,25 @@ class WorkbenchHandler(SimpleHTTPRequestHandler):
         )
 
 
+def video_allowlist(runs: list[Path]) -> dict[str, Path]:
+    """Original videos named by each run's videos.json; read-only, existing files only."""
+    allowed = {}
+    for run in runs:
+        for name, info in json.loads((Path(run) / "videos.json").read_text()).items():
+            if Path(name).name != name or not name.lower().endswith(".mp4"):
+                raise ValueError(f"invalid video name in videos.json: {name!r}")
+            source = (info or {}).get("source_video")
+            if source and Path(source).is_file():
+                allowed[name] = Path(source).resolve()
+    return allowed
+
+
 def make_server(
-    site: Path, identity_submissions: Path, reid_sets: dict[str, Path], port: int
+    site: Path,
+    identity_submissions: Path,
+    reid_sets: dict[str, Path],
+    port: int,
+    videos: dict[str, Path] | None = None,
 ):
     site = Path(site).resolve()
     if (
@@ -147,6 +225,7 @@ def make_server(
         ("127.0.0.1", port), functools.partial(WorkbenchHandler, directory=str(site))
     )
     server.review_routes = routes
+    server.videos = dict(videos or {})
     return server
 
 
@@ -162,11 +241,24 @@ def main():
         metavar=("NAME", "SUBMISSIONS"),
     )
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument(
+        "--video-run",
+        type=Path,
+        action="append",
+        default=[],
+        help="run dir whose videos.json source_video files may be streamed read-only",
+    )
     args = parser.parse_args()
     reid_sets = {name: Path(folder) for name, folder in args.reid_set}
     if len(reid_sets) != len(args.reid_set):
         parser.error("duplicate reid set names")
-    server = make_server(args.site, args.identity_submissions, reid_sets, args.port)
+    server = make_server(
+        args.site,
+        args.identity_submissions,
+        reid_sets,
+        args.port,
+        videos=video_allowlist(args.video_run),
+    )
     print(f"Local workbench http://127.0.0.1:{server.server_port}/", flush=True)
     try:
         server.serve_forever()

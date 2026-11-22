@@ -175,6 +175,88 @@ def test_challenge_manifest_labels_and_revisions_are_isolated_from_original_revi
     assert post(srv, "/reid-review/save", challenge)[0] == 422
 
 
+def get(srv, path, headers=None):
+    req = Request(f"http://127.0.0.1:{srv.server_port}{path}", headers=headers or {})
+    try:
+        with urlopen(req, timeout=3) as response:
+            return response.status, dict(response.headers), response.read()
+    except HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read()
+
+
+@pytest.fixture
+def video_server(tmp_path):
+    from bxjudge.workbench_server import make_server
+
+    site = tmp_path / "site"
+    for name in ("identity-audit", "reid-review"):
+        (site / name).mkdir(parents=True)
+    (site / "identity-audit/manifest.json").write_text("{}")
+    m, _, _ = fixtures()
+    (site / "reid-review/manifest.json").write_text(json.dumps(m))
+    (tmp_path / "secret.mp4").write_bytes(b"no")
+    clip = tmp_path / "videos" / "a.mp4"
+    clip.parent.mkdir()
+    clip.write_bytes(bytes(range(100)))
+    srv = make_server(site, tmp_path / "old", {"reid-review": tmp_path / "new"}, 0,
+                      videos={"a.mp4": clip})
+    thread = Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv, clip
+    srv.shutdown()
+    srv.server_close()
+    thread.join()
+
+
+def test_video_route_serves_allowlisted_file_with_ranges(video_server):
+    srv, clip = video_server
+    status, headers, body = get(srv, "/video/a.mp4")
+    assert status == 200 and body == clip.read_bytes()
+    assert headers["Accept-Ranges"] == "bytes" and headers["Content-Type"] == "video/mp4"
+    status, headers, body = get(srv, "/video/a.mp4", {"Range": "bytes=10-19"})
+    assert status == 206 and body == bytes(range(10, 20))
+    assert headers["Content-Range"] == "bytes 10-19/100"
+    status, _, body = get(srv, "/video/a.mp4", {"Range": "bytes=95-"})
+    assert status == 206 and body == bytes(range(95, 100))
+    status, _, body = get(srv, "/video/a.mp4", {"Range": "bytes=-3"})
+    assert status == 206 and body == bytes([97, 98, 99])
+    status, headers, _ = get(srv, "/video/a.mp4", {"Range": "bytes=200-"})
+    assert status == 416 and headers["Content-Range"] == "bytes */100"
+
+
+def test_static_pages_revalidate_and_json_replies_stay_no_store(video_server):
+    srv, _ = video_server
+    status, headers, _ = get(srv, "/reid-review/manifest.json")
+    assert status == 200 and headers["Cache-Control"] == "no-cache"
+    status, headers, _ = get(srv, "/reid-review/saved")
+    assert status == 200 and headers["Cache-Control"] == "no-store"
+
+
+def test_video_route_refuses_unlisted_and_traversal_names(video_server):
+    srv, _ = video_server
+    for path in ("/video/secret.mp4", "/video/..%2Fsecret.mp4", "/video/../secret.mp4",
+                 "/video/", "/video/a.mp4/x"):
+        assert get(srv, path)[0] == 404
+
+
+def test_video_allowlist_reads_run_videos_json(tmp_path):
+    from bxjudge.workbench_server import video_allowlist
+
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "videos.json").write_text(json.dumps({
+        "v.mp4": {"source_video": str(clip)},
+        "gone.mp4": {"source_video": str(tmp_path / "gone.mp4")},
+        "x.mp4": {},
+    }))
+    assert video_allowlist([run]) == {"v.mp4": clip.resolve()}
+    with pytest.raises(ValueError, match="name"):
+        (run / "videos.json").write_text(json.dumps({"../v.mp4": {"source_video": str(clip)}}))
+        video_allowlist([run])
+
+
 def test_review_routes_cannot_share_storage_or_escape_their_url_prefix(tmp_path):
     from bxjudge.workbench_server import make_server
 

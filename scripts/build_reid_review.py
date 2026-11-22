@@ -14,6 +14,7 @@ from pathlib import Path
 
 from bxjudge.manifest import probe
 from bxjudge.reid_review import MANIFEST_SCHEMA
+from bxjudge.workbench_theme import render_reid_page
 
 
 def sha(path):
@@ -271,10 +272,7 @@ def build(
         ).encode()
         (stage / "manifest.json").write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
-        encoded = json.dumps(
-            {"manifest": manifest, "sha": digest}, ensure_ascii=False
-        ).replace("<", "\\u003c")
-        page = f"""<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>斷點局部核對</title><link rel="stylesheet" href="reid_review.css"><main><a href="/#identity">← 回工作台</a><h1>只核對新增的 {len(cases)} 組斷點</h1><p class="notice">不用重做原本三回合覆核。這裡沒有預填人工作證，也不改勝負。看不清可選「看不清／不知道」。X／B 與可見性可另外標記，沒有把握可以留空。</p><p>先播放前後短片，再比較藍框①／橘框②。確認本組後，按底部「保存到專案」；瀏覽器草稿不等於已保存。</p><div class="load"><select id="saved" aria-label="已存專案版本"><option>讀取已存版本</option></select><button id="restore" disabled>載入選定版本</button></div><div id="cases"></div><div class="toolbar"><strong id="progress"></strong><div class="buttons"><button id="save" class="primary">保存到專案</button><button id="export">匯出 JSON 備份</button></div><p id="status" role="status">尚未保存；草稿僅在此瀏覽器。</p><p id="error" role="alert"></p></div><small>本頁 manifest SHA-256 {digest}。新核對獨立保存；原提交與判決保留。</small></main><script id="data" type="application/json">{encoded}</script><script type="module" src="reid_review.js"></script></html>"""
+        page = render_reid_page(manifest, digest)
         (stage / "index.html").write_text(page)
         web = Path(__file__).resolve().parents[1] / "src/bxjudge/web"
         for name in ("reid_review.js", "reid_review.css"):
