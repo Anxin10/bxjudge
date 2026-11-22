@@ -33,6 +33,12 @@ from .calibration_store import (
     vetoed_ids,
     write_preview,
 )
+from .camera_motion import (
+    DEFAULT_CAMERA_MODE_CONFIG,
+    decide_camera_mode,
+    load_camera_policy,
+    measure_video_motion,
+)
 from .config import Thresholds, load_thresholds
 from .detect import Detector, load_detector
 from .detector_config import load_policy
@@ -51,8 +57,14 @@ from .finish import (
     spin_activity,
     stop_frame,
 )
+from .handheld_calibration import HandheldCalibration
 from .identity import anchor_sides, inherited_sides, load_identity_policy
 from .launch_check import analyze_launch
+from .launch_mask_review import (
+    SamLaunchMaskReviewer,
+    build_release_probes,
+    review_release_probes,
+)
 from .launch_phase import (
     launch_sample_count,
     load_launch_policy,
@@ -81,13 +93,6 @@ from .output import (
 )
 from .rules import Rules, finish_points, is_not_a_round, load_rules
 from .segment import segment_rounds
-from .camera_motion import (
-    DEFAULT_CAMERA_MODE_CONFIG,
-    decide_camera_mode,
-    load_camera_policy,
-    measure_video_motion,
-)
-from .handheld_calibration import HandheldCalibration
 from .stadium_finder import zone_visibility
 from .stadium_locator import KeypointLocator, keypoint_snapshot, load_stadium_tools
 from .stadium_motion import RAW_MOTION_WORKERS, iter_stadium_displacement
@@ -203,6 +208,7 @@ def judge_video(
     anomaly_policy: AnomalyPolicy | None = None,
     stadium_tools=None,
     camera_policy: dict | None = None,
+    launch_mask_reviewer: SamLaunchMaskReviewer | None = None,
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
@@ -228,6 +234,8 @@ def judge_video(
     """
     if two_bey_config is not None and dynamic_config is None:
         raise ValueError('two-bey tracking requires dynamic calibration')
+    if launch_mask_reviewer is not None and two_bey_config is None:
+        raise ValueError("launch mask review requires two-bey tracking")
     values = timing.values if timing is not None else {}
 
     def converted(policy):
@@ -522,6 +530,8 @@ def judge_video(
         physical_rounds={}
         adjudication_rounds={}
         releases_by_round = {}
+        launch_mask_reviews = {}
+        launch_mask_probes = []
         if two_policy is not None:
             native_segments = observe_launch_segments(native_tracks, info.fps, phase_policy, c.frame_size)
             required_separation_frames = launch_sample_count(phase_policy["separation_s"], info.fps)
@@ -555,11 +565,27 @@ def judge_video(
                     physical, adjudication_rounds[number], side_hints, native_segments, c,
                     required_frames=required_separation_frames,
                 )
+                if launch_mask_reviewer is not None:
+                    launch_mask_probes.extend(build_release_probes(
+                        number, physical, side_hints, native_segments, releases_by_round[number],
+                    ))
+            if launch_mask_probes:
+                launch_mask_reviews = review_release_probes(
+                    launch_mask_probes, native_tracks,
+                    lambda: iter_frames(info.path, long_edge=th.infer_long_edge,
+                                        hwaccel=th.decode_hwaccel),
+                    launch_mask_reviewer,
+                )
+                with info.path.open("rb") as source:
+                    if hashlib.file_digest(source, "sha256").hexdigest() != source_before:
+                        raise ValueError("source changed during launch mask review")
             record["launch_timing"] = {
                 "native_segments": {str(k): [asdict(segment) for segment in segments]
                                     for k, segments in native_segments.items()},
                 "round_releases": releases_by_round,
             }
+            if launch_mask_reviewer is not None:
+                record["launch_timing"]["mask_review"] = launch_mask_reviews
             record["identity"]["opponent_anchors"] = opponent_anchors
             record['two_bey_tracking']={'policy':two_policy,'rounds':{str(n):p.record for n,p in physical_rounds.items()},
                 'raw_source_tracks':[asdict(t) for t in native_tracks], 'association_source':'native_tracks',
@@ -686,7 +712,11 @@ def judge_video(
             def relevant(frame, candidate=candidate):
                 return not is_after_finish(candidate, None, frame, th)
 
-            dynamic_notes = []
+            dynamic_notes = [
+                f"launch_mask_{review['status']}@{side_hints[track_id]}:{review['frame']}"
+                for track_id, review in launch_mask_reviews.get(number, {}).items()
+                if review["status"] in {"disagrees", "candidate_without_box_release"}
+            ]
             if geometry is not None:
                 missing = [
                     f for f in range(start, end + 1)
@@ -1125,6 +1155,7 @@ def run_batch(
     two_bey_config: Path | None = None,
     stadium_keypoints: bool = False,
     camera_config: Path = DEFAULT_CAMERA_MODE_CONFIG,
+    launch_mask_weights: Path | None = None,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -1158,6 +1189,21 @@ def run_batch(
         if dynamic_config is None:
             raise ValueError('two-bey tracking requires dynamic calibration')
         load_two_bey_policy(two_bey_config)
+    launch_mask_reviewer = None
+    launch_mask_signature = None
+    if launch_mask_weights is not None:
+        if two_bey_config is None:
+            raise ValueError("launch mask review requires --two-bey-tracking")
+        weights = Path(launch_mask_weights).expanduser().resolve()
+        with weights.open("rb") as source:
+            weights_sha = hashlib.file_digest(source, "sha256").hexdigest()
+        launch_mask_signature = {
+            "weights_sha256": weights_sha,
+            "implementation_sha256": hashlib.sha256(
+                Path(__file__).with_name("launch_mask_review.py").read_bytes()
+            ).hexdigest(),
+        }
+        launch_mask_reviewer = SamLaunchMaskReviewer(weights)
     # Plan 2026-11-12-dynamic-calibration: keypoint stadiums and camera modes are opt-in.
     camera_policy = (
         load_camera_policy(Path(camera_config).expanduser()) if stadium_keypoints else None
@@ -1251,6 +1297,8 @@ def run_batch(
                 'implementation_sha256':{name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                          for name in ('two_bey_tracking.py','two_bey_integration.py')},
             }
+        if launch_mask_signature is not None:
+            dynamic_signature["launch_mask_review"] = launch_mask_signature
         if provenance is not None:
             provenance["dynamic_calibration"] = dynamic_signature
     if source_policy is not None:
@@ -1464,6 +1512,8 @@ def run_batch(
                         else {}
                     ),
                     **({'two_bey_config':two_bey_config} if two_bey_config is not None else {}),
+                    **({"launch_mask_reviewer": launch_mask_reviewer}
+                       if launch_mask_reviewer is not None else {}),
                 )
             except Exception:
                 log.exception("analysis failed for %s; continuing batch", path)

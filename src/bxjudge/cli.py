@@ -150,6 +150,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   rejudge=args.rejudge,
                   dynamic_config=Path(args.dynamic_calibration).expanduser() if args.dynamic_calibration else None,
                   two_bey_config=Path(args.two_bey_tracking).expanduser() if args.two_bey_tracking else None,
+                  launch_mask_weights=Path(args.launch_mask_review).expanduser() if args.launch_mask_review else None,
                   stadium_keypoints=args.stadium_keypoints,
                   camera_config=Path(args.camera_mode).expanduser(),
                   trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
@@ -170,6 +171,8 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
                    help="explicit selected detector manifest; synthetic output requires review")
     p.add_argument("--dynamic-calibration", metavar="YAML", help="record moving-stadium geometry, observed launch release and conservative identity evidence")
     p.add_argument('--two-bey-tracking',metavar='YAML',help='reconstruct at most two physical top identities per round; requires dynamic calibration; no interpolation in adjudication')
+    p.add_argument("--launch-mask-review", metavar="SAM2_WEIGHTS",
+                   help="recheck launch masks for known pairs; requires two-bey tracking and CUDA")
     p.add_argument("--stadium-keypoints", action="store_true",
                    help="find stadiums no calibration matches from the keypoint model, relocate "
                         "and re-find from keypoints, and judge each camera as fixed or handheld "
