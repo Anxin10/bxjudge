@@ -190,8 +190,7 @@ def anchor_sides(
                     and d.box[1] > max(box[3] for _, box in observed) + body_margin_px
                 )
                 if (
-                    not observed
-                    or below_bodies
+                    below_bodies
                     or observed_free
                     or paired
                     or prefix_side is not None

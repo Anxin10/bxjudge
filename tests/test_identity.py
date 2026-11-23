@@ -229,3 +229,17 @@ def test_conflicting_registered_regions_and_source_pair_remain_unknown():
         ).sides
         == {}
     )
+
+
+def test_delayed_launcher_within_context_wait_anchors_side():
+    from bxjudge.identity import anchor_sides
+
+    # Bey starts inside launch_left with no launcher detected until frame 10 (0.33s < 0.75s).
+    bey = make_track(1, "bey", {f: (200, 80) for f in range(16)})
+    body = make_track(2, "launcher", {f: (200, 40) for f in range(10, 16)}, size=60)
+    result = anchor_sides(
+        [bey, body], [bey, body], make_calibration(),
+        required_frames=4, fps=30, body_margin_px=12,
+    )
+    assert result.sides == {1: "X"}
+    assert [x["frame"] for x in result.evidence[1]] == [10, 11, 12, 13]
