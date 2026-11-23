@@ -112,6 +112,7 @@ class DynamicCalibration:
         self.previous = -1
         self.rejected_at = None
         self.last_retry = -math.inf
+        self.last_keypoint_retry = -math.inf
         self.pending = []
         self.good_run = 0
         self.lost = False
@@ -308,12 +309,20 @@ class DynamicCalibration:
                 self.last_retry = frame
                 candidate = self.relocator.align(image)
                 diagnostic["relocation"] = dict(self.relocator.last_diagnostic)
+                keypoint_skipped_cooldown = False
                 if candidate is None and self.keypoint_locator is not None:
-                    candidate = self._keypoint_candidate(image, diagnostic)
-                    if candidate is not None:
-                        self._keypoint_frames.add(frame)
+                    if (
+                        frame - self.last_keypoint_retry
+                    ) / self.fps >= max(self.policy["retry_s"], 0.5):
+                        self.last_keypoint_retry = frame
+                        candidate = self._keypoint_candidate(image, diagnostic)
+                        if candidate is not None:
+                            self._keypoint_frames.add(frame)
+                    else:
+                        keypoint_skipped_cooldown = True
                 if candidate is None:
-                    self.pending.clear()
+                    if not keypoint_skipped_cooldown:
+                        self.pending.clear()
                 else:
                     if self.pending:
                         old = warp_calibration(

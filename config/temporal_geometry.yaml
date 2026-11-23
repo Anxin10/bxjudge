@@ -6,7 +6,7 @@ consistency_px: 4.0
 foreground_margin_px: 8.0
 motion_threshold: 35
 motion_dilate_px: 3
-min_visible_fraction: 0.6
+min_visible_fraction: 0.45
 lk_window: 21
 lk_levels: 3
 lk_iterations: 20

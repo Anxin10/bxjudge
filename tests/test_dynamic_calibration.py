@@ -231,3 +231,21 @@ def test_without_a_locator_behaviour_is_unchanged():
     assert [s["kind"] for s in plain.segments] == ["recorded_snapshot", "relocated"]
     none.finish()  # a no-op in fixed mode
     assert plain.record() == none.record()
+
+
+def test_keypoint_cooldown_preserves_pending_at_120fps():
+    ref, c = stadium_scene(size=(640, 360))
+    moved, _ = stadium_scene(size=(640, 360), shift=(45, -4))
+    fake = FakeLocator(c, _translation(45, -4))
+    policy = load_dynamic_policy()
+    policy["reject_s"] = 0.0625
+    policy["retry_s"] = 0.0625
+    obj = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], policy, keypoint_locator=fake
+    )
+    obj.relocator.align = lambda image: None
+    assert obj.update(0, ref).alignment is not None
+    samples = [obj.update(f, moved) for f in range(1, 100)]
+    assert fake.calls == 2
+    assert [s["kind"] for s in obj.segments] == ["recorded_snapshot", "relocated_keypoints"]
+    assert any(s.status == "relocated" for s in samples)
