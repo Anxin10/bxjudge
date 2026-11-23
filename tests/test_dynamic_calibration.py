@@ -249,3 +249,31 @@ def test_keypoint_cooldown_preserves_pending_at_120fps():
     assert fake.calls == 2
     assert [s["kind"] for s in obj.segments] == ["recorded_snapshot", "relocated_keypoints"]
     assert any(s.status == "relocated" for s in samples)
+
+
+def test_fixed_camera_reuses_alignment_between_checks_and_survives_brief_blur():
+    ref, c = stadium_scene(size=(640, 360))
+    obj = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], load_dynamic_policy(),
+        fixed_camera=True,
+    )
+    assert obj.check_stride == 8
+    assert obj.update(0, ref).status == "tracking"
+    # Intermediate frames reuse the verified alignment without calling align().
+    calls = 0
+    orig_align = obj.anchor.align
+    def counting_align(img):
+        nonlocal calls
+        calls += 1
+        return orig_align(img)
+    obj.anchor.align = counting_align
+    for f in range(1, 8):
+        s = obj.update(f, ref)
+        assert s.status == "tracking" and s.alignment is not None
+    assert calls == 0
+    # A transient soft-blur failure on a check frame stays tracking within grace window.
+    obj.anchor.align = lambda img: (
+        obj.anchor.last_diagnostic.update({"reason": "distinct_matches_insufficient"}) or None
+    )
+    s8 = obj.update(8, ref)
+    assert s8.status == "tracking" and s8.alignment is not None

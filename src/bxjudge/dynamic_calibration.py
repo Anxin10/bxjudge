@@ -80,7 +80,7 @@ class DynamicCalibration:
     """
 
     def __init__(self, c: Calibration, reference, fps, follow_policy, policy, *,
-                 temporal_policy=None, keypoint_locator=None):
+                 temporal_policy=None, keypoint_locator=None, fixed_camera=False):
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("fps must be positive finite")
         self.c = c
@@ -88,6 +88,11 @@ class DynamicCalibration:
         self.fps = fps
         self.policy = policy
         self.follow_policy = follow_policy
+        self.fixed_camera = bool(fixed_camera)
+        self.check_stride = max(1, round(fps / 15)) if self.fixed_camera else 1
+        self._last_good_alignment = None
+        self._last_good_frame = -math.inf
+        self._blur_grace_s = 0.5
         self.anchor = StadiumFollower(c, reference, follow_policy)
         broad = {
             **follow_policy,
@@ -272,6 +277,22 @@ class DynamicCalibration:
         if (image.shape[1], image.shape[0]) != self.c.frame_size:
             raise ValueError("geometry frame size mismatch")
         self.previous = frame
+        if (
+            self.fixed_camera
+            and not self.lost
+            and self._last_good_alignment is not None
+            and frame % self.check_stride != 0
+        ):
+            sample = GeometrySample(
+                frame, self._last_good_alignment, len(self.segments) - 1, "tracking"
+            )
+            self.samples[frame] = sample
+            self.diagnostics[frame] = {
+                "tracking": {"reason": None, "strided_reuse": True},
+                "relocation": None,
+                "reason": None,
+            }
+            return sample
         proposal = self.temporal.observe(frame, image, self.foreground_boxes)
         for follower in (self.anchor, self.relocator):
             follower.set_foreground_mask(
@@ -287,6 +308,28 @@ class DynamicCalibration:
         if local is not None and a is None:
             diagnostic["reason"] = "global_transform_out_of_bounds"
         status = "tracking"
+        _SOFT_BLUR_REASONS = (
+            "distinct_matches_insufficient",
+            "final_inliers_insufficient",
+            "edge_score_below_minimum",
+            "ecc_nonconvergent",
+        )
+        if (
+            a is None
+            and self.fixed_camera
+            and not self.lost
+            and self._last_good_alignment is not None
+            and diagnostic["reason"] in _SOFT_BLUR_REASONS
+            and (frame - self._last_good_frame) / self.fps <= self._blur_grace_s
+        ):
+            sample = GeometrySample(
+                frame, self._last_good_alignment, len(self.segments) - 1, "tracking"
+            )
+            self.samples[frame] = sample
+            diagnostic["tracking"]["soft_blur_reuse"] = diagnostic["reason"]
+            diagnostic["reason"] = None
+            self.diagnostics[frame] = diagnostic
+            return sample
         if a is not None:
             self.pending.clear()
             self.good_run += 1
@@ -297,7 +340,10 @@ class DynamicCalibration:
             else:
                 self.lost = False
                 self.rejected_at = None
+                self._last_good_alignment = a
+                self._last_good_frame = frame
         else:
+            self._last_good_alignment = None
             self.good_run = 0
             self.lost = True
             if self.rejected_at is None:

@@ -403,6 +403,10 @@ def judge_video(
                         **({"temporal_policy": converted(load_temporal_policy())}
                            if timing else {}),
                         keypoint_locator=locator,
+                        fixed_camera=(
+                            camera_record is not None
+                            and camera_record.get("mode") == "fixed"
+                        ),
                     )
             disp = {}
             crops = {}

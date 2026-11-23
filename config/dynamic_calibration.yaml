@@ -6,6 +6,6 @@ resume_frames: 3
 consistent_error_px: 8.0
 max_shift_frac: 0.15
 max_rotation_deg: 8.0
-min_scale: 0.85
-max_scale: 1.15
+min_scale: 0.80
+max_scale: 1.25
 min_score: 0.75
