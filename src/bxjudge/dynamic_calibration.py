@@ -16,6 +16,7 @@ from .autocalib import (
     warp_calibration,
 )
 from .config import config_loader
+from .geometry import zone_of
 from .stadium_follow import StadiumFollower
 from .temporal_geometry import TemporalRimTracker, _points, load_temporal_policy
 from .types import Calibration, Detection, Track
@@ -28,7 +29,7 @@ DEFAULT_DYNAMIC_CONFIG = (
 @config_loader
 def load_dynamic_policy(path=DEFAULT_DYNAMIC_CONFIG):
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    names = {
+    required = {
         "reject_s",
         "retry_s",
         "confirmations",
@@ -40,22 +41,35 @@ def load_dynamic_policy(path=DEFAULT_DYNAMIC_CONFIG):
         "max_scale",
         "min_score",
     }
-    if not isinstance(raw, dict) or set(raw) != names:
+    defaults = {
+        "conditional_gap_enabled": False,
+        "conditional_gap_max_s": 0.80,
+        "conditional_gap_max_error_px": 4.0,
+        "conditional_gap_min_pocket_margin_px": 12.0,
+    }
+    if not isinstance(raw, dict) or not required.issubset(raw) or not set(raw).issubset(required | defaults.keys()):
         raise ValueError("incomplete dynamic_calibration policy")
-    for k, v in raw.items():
+    merged = {**defaults, **raw}
+    if type(merged["conditional_gap_enabled"]) is not bool:
+        raise ValueError("dynamic_calibration.conditional_gap_enabled must be bool")
+    for k, v in merged.items():
+        if k == "conditional_gap_enabled":
+            continue
         if k in {"confirmations", "resume_frames"}:
             if type(v) is not int or v < 2:
                 raise ValueError(f"dynamic_calibration.{k} must be integer >=2")
         elif type(v) not in (int, float) or not math.isfinite(v) or v <= 0:
             raise ValueError(f"dynamic_calibration.{k} must be positive finite")
     if (
-        raw["min_score"] > 1
-        or raw["max_shift_frac"] > 1
-        or raw["max_rotation_deg"] >= 90
-        or not raw["min_scale"] <= 1 <= raw["max_scale"]
+        merged["min_score"] > 1
+        or merged["max_shift_frac"] > 1
+        or merged["max_rotation_deg"] >= 90
+        or not merged["min_scale"] <= 1 <= merged["max_scale"]
+        or merged["conditional_gap_max_s"] > 2.0
+        or merged["conditional_gap_max_error_px"] > 20.0
     ):
         raise ValueError("dynamic_calibration policy outside bounds")
-    return dict(raw)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -137,6 +151,8 @@ class DynamicCalibration:
             load_temporal_policy() if temporal_policy is None else temporal_policy,
         )
         self.foreground_boxes = []
+        self._current_bey_boxes = []
+        self._bey_boxes_by_frame = {}
         self.last_verified = None
         self.keypoint_locator = keypoint_locator
         self._keypoint_frames = set()  # pending candidates that came from keypoints
@@ -170,10 +186,116 @@ class DynamicCalibration:
 
     def set_foreground(self, detections):
         self.foreground_boxes = [d.box for d in detections]
+        self._current_bey_boxes = [
+            d.box for d in detections if getattr(d, "cls", None) == "bey"
+        ]
 
     def finish(self):
-        """End of the video: nothing to check in fixed mode (the handheld tracker re-finds
-        its tail here); the pipeline calls it for either mode."""
+        """End of the video: nothing to check in fixed mode unless conditional_gap_enabled."""
+        if not self.fixed_camera or not self.policy.get("conditional_gap_enabled", False):
+            return
+        frames = sorted(self.samples)
+        if not frames:
+            return
+        pockets = [
+            np.asarray(poly, np.float32).reshape(-1, 1, 2)
+            for poly in (self.c.xtreme, self.c.over_left, self.c.over_right)
+            if poly
+        ]
+        max_s = self.policy.get("conditional_gap_max_s", 0.80)
+        max_err = self.policy.get("conditional_gap_max_error_px", 4.0)
+        min_pocket = self.policy.get("conditional_gap_min_pocket_margin_px", 12.0)
+        spans = []
+        cur = None
+        for f in frames:
+            s = self.samples[f]
+            if s.alignment is None or s.status == "bridged":
+                if cur is None or f != cur[1] + 1:
+                    if cur is not None:
+                        spans.append(cur)
+                    cur = [f, f]
+                else:
+                    cur[1] = f
+            elif cur is not None:
+                spans.append(cur)
+                cur = None
+        if cur is not None:
+            spans.append(cur)
+        for s0, s1 in spans:
+            if (s1 - s0 + 1) / self.fps > max_s:
+                continue
+            before = self.samples.get(s0 - 1)
+            after = self.samples.get(s1 + 1)
+            if (
+                before is None
+                or after is None
+                or before.alignment is None
+                or after.alignment is None
+                or before.status in ("bridged", "conditional_gap")
+                or after.status in ("bridged", "conditional_gap")
+            ):
+                continue
+            if any(
+                self.diagnostics.get(f, {}).get("reason") == "temporal_template_disagreement"
+                for f in range(s0, s1 + 1)
+            ):
+                continue
+            cb = warp_calibration(self.c, before.alignment, self.c.frame_size, self.c.name)
+            ca = warp_calibration(self.c, after.alignment, self.c.frame_size, self.c.name)
+            mbe = mean_boundary_error(cb, ca, max(self.c.frame_size))
+            if not math.isfinite(mbe) or mbe > max_err:
+                continue
+            hb = np.array(before.alignment.homography, dtype=np.float64)
+            ha = np.array(after.alignment.homography, dtype=np.float64)
+            try:
+                hb_inv = np.linalg.inv(hb)
+                ha_inv = np.linalg.inv(ha)
+            except np.linalg.LinAlgError:
+                continue
+            req_margin = max(min_pocket, 3.0 * mbe)
+            total_beys = 0
+            interior_safe = True
+            for f in range(s0, s1 + 1):
+                for x0, y0, x1, y1 in self._bey_boxes_by_frame.get(f, []):
+                    total_beys += 1
+                    pt_src = np.array([[[(x0 + x1) / 2.0, (y0 + y1) / 2.0]]], dtype=np.float64)
+                    for h_inv in (hb_inv, ha_inv):
+                        pt = cv2.perspectiveTransform(pt_src, h_inv)[0, 0]
+                        px, py = float(pt[0]), float(pt[1])
+                        if zone_of((px, py), self.c) not in ("battle_area", "lid"):
+                            interior_safe = False
+                            break
+                        if any(-cv2.pointPolygonTest(pk, (px, py), True) < req_margin for pk in pockets):
+                            interior_safe = False
+                            break
+                    if not interior_safe:
+                        break
+                if not interior_safe:
+                    break
+            if not interior_safe or total_beys == 0:
+                continue
+            min_score = min(before.alignment.score, after.alignment.score)
+            span_denom = float(after.frame - before.frame)
+            candidates = {}
+            for f in range(s0, s1 + 1):
+                t = (f - before.frame) / span_denom
+                interp = (1.0 - t) * hb + t * ha
+                raw_al = self.temporal.alignment(interp, min_score)
+                orig_anchor = self.anchor_h
+                self.anchor_h = np.eye(3)
+                composed = self._compose(raw_al)
+                self.anchor_h = orig_anchor
+                if composed is None:
+                    candidates.clear()
+                    break
+                candidates[f] = composed
+            for f, composed in candidates.items():
+                self.samples[f] = GeometrySample(f, composed, after.segment, "conditional_gap")
+                self.diagnostics[f]["conditional_gap"] = {
+                    "endpoints": [before.frame, after.frame],
+                    "mean_boundary_error_px": round(float(mbe), 4),
+                }
+                self.diagnostics[f]["reason"] = None
 
     def _keypoint_candidate(self, image, diagnostic):
         """One keypoint fit as a relocation candidate within the broad global bounds."""
@@ -277,6 +399,7 @@ class DynamicCalibration:
         if (image.shape[1], image.shape[0]) != self.c.frame_size:
             raise ValueError("geometry frame size mismatch")
         self.previous = frame
+        self._bey_boxes_by_frame[frame] = list(self._current_bey_boxes)
         if (
             self.fixed_camera
             and not self.lost

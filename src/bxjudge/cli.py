@@ -153,7 +153,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   launch_mask_weights=Path(args.launch_mask_review).expanduser() if args.launch_mask_review else None,
                   stadium_keypoints=args.stadium_keypoints,
                   camera_config=Path(args.camera_mode).expanduser(),
-                  trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
+                  trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None,
+                  identity_config=Path(args.identity).expanduser() if args.identity else None,
+                  finish_fusion_config=Path(args.finish_fusion).expanduser() if args.finish_fusion else None)
     except (ValueError, OSError, RuntimeError) as error:
         if args.debug:
             raise
@@ -171,6 +173,10 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
                    help="explicit selected detector manifest; synthetic output requires review")
     p.add_argument("--dynamic-calibration", metavar="YAML", help="record moving-stadium geometry, observed launch release and conservative identity evidence")
     p.add_argument('--two-bey-tracking',metavar='YAML',help='reconstruct at most two physical top identities per round; requires dynamic calibration; no interpolation in adjudication')
+    p.add_argument("--identity", metavar="YAML", default="config/identity.yaml",
+                   help="identity context and prelaunch setup anchor policy")
+    p.add_argument("--finish-fusion", metavar="YAML",
+                   help="multi-feature finish fusion policy (e.g. config/finish_fusion.yaml)")
     p.add_argument("--launch-mask-review", metavar="SAM2_WEIGHTS",
                    help="recheck launch masks for known pairs; requires two-bey tracking and CUDA")
     p.add_argument("--stadium-keypoints", action="store_true",

@@ -1,6 +1,7 @@
 """Two physical top identities per round; raw observations and display estimates differ."""
 
 import math
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -41,6 +42,11 @@ def load_policy(path):
         "reacquire_min_gap_s",
         "reacquire_confirm_frames",
         "reacquire_min_score",
+        "circular_prediction_enabled",
+        "circular_history_size",
+        "circular_min_points",
+        "circular_max_residual_ratio",
+        "max_prediction_drift_ratio",
     }
     if (
         not isinstance(p, dict)
@@ -53,7 +59,22 @@ def load_policy(path):
         raise ValueError('two-bey pair requires at least two actual source frames')
     if type(p["reacquire_confirm_frames"]) is not int:
         raise ValueError("re-acquisition needs a whole number of source frames")
-    for k in keys - {"max_targets", "appearance_bins"}:
+    if type(p["circular_prediction_enabled"]) is not bool:
+        raise ValueError("circular_prediction_enabled must be a boolean")
+    if (
+        type(p["circular_history_size"]) is not int
+        or type(p["circular_min_points"]) is not int
+        or p["circular_min_points"] < 3
+        or p["circular_history_size"] < p["circular_min_points"]
+    ):
+        raise ValueError("invalid circular history policy")
+    for k in keys - {
+        "max_targets",
+        "appearance_bins",
+        "circular_prediction_enabled",
+        "circular_history_size",
+        "circular_min_points",
+    }:
         if type(p[k]) not in (int, float) or not math.isfinite(p[k]) or p[k] <= 0:
             raise ValueError("invalid two-bey policy value")
     if any(
@@ -69,6 +90,8 @@ def load_policy(path):
             "reanchor_appearance_margin",
             "duplicate_containment",
             "reacquire_min_score",
+            "circular_max_residual_ratio",
+            "max_prediction_drift_ratio",
         )
     ):
         raise ValueError("invalid bounded matching gate")
@@ -135,10 +158,83 @@ def _vote(margin, required):
     return "identity" if margin > 0 else "exchange"
 
 
+def _fit_circle_lsq(points: np.ndarray) -> tuple[float, float, float] | None:
+    """Fit a 2D circle (cx, cy, radius) via algebraic least squares; None if degenerate."""
+    if len(points) < 3:
+        return None
+    x = points[:, 0]
+    y = points[:, 1]
+    a = np.column_stack([2.0 * x, 2.0 * y, np.ones(len(points), dtype=np.float64)])
+    b = x * x + y * y
+    sol, _, rank, _ = np.linalg.lstsq(a, b, rcond=None)
+    if rank < 3:
+        return None
+    cx, cy, c = float(sol[0]), float(sol[1]), float(sol[2])
+    r_sq = c + cx * cx + cy * cy
+    if not math.isfinite(r_sq) or r_sq <= 0:
+        return None
+    return cx, cy, math.sqrt(r_sq)
+
+
+def _predict_circular_arc(
+    history: list[tuple[int, np.ndarray]],
+    target_frame: int,
+    min_points: int,
+    max_residual_ratio: float,
+    diagonal: float,
+) -> np.ndarray | None:
+    """Extrapolate circular arc position for association; returns None on degenerate arcs."""
+    if len(history) < min_points:
+        return None
+    frames = np.array([f for f, _ in history], dtype=np.float64)
+    if frames[-1] <= frames[0] or target_frame <= frames[-1]:
+        return None
+    pts = np.array([p for _, p in history], dtype=np.float64)
+    fit = _fit_circle_lsq(pts)
+    if fit is None:
+        return None
+    cx, cy, radius = fit
+    if not (0.03 * diagonal <= radius <= 1.2 * diagonal):
+        return None
+    radial = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+    rms_residual = float(np.sqrt(np.mean((radial - radius) ** 2)))
+    if rms_residual > max_residual_ratio * radius:
+        return None
+    angles = np.unwrap(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+    if abs(float(angles[-1] - angles[0])) < 0.05:
+        return None
+    omega = float(angles[-1] - angles[0]) / float(frames[-1] - frames[0])
+    theta = float(angles[-1]) + omega * float(target_frame - frames[-1])
+    return np.array([cx + radius * math.cos(theta), cy + radius * math.sin(theta)], dtype=np.float64)
+
+
+def _clamp_to_rim(
+    pred: np.ndarray,
+    last_pos: np.ndarray,
+    arena_circle: tuple[float, float, float] | None,
+    max_drift: float,
+) -> np.ndarray:
+    """Bound prediction drift and clamp outward motion onto the stadium rim circle."""
+    out = pred.astype(np.float64, copy=True)
+    delta = out - last_pos
+    drift = float(np.hypot(delta[0], delta[1]))
+    if drift > max_drift > 0:
+        out = last_pos + delta * (max_drift / drift)
+    if arena_circle is not None:
+        acx, acy, ar = arena_circle
+        rel_x = float(out[0]) - acx
+        rel_y = float(out[1]) - acy
+        dist = math.hypot(rel_x, rel_y)
+        if dist > ar > 0:
+            scale = ar / dist
+            out = np.array([acx + rel_x * scale, acy + rel_y * scale], dtype=np.float64)
+    return out
+
+
 class TwoBeyTracker:
     """Bounded one-to-one assignment, distinct from detector and referee evidence."""
 
-    def __init__(self, frame_size, fps, policy):
+    def __init__(self, frame_size, fps, policy, *, arena_circle=None):
         if (
             len(frame_size) != 2
             or any(type(v) is not int or v <= 0 for v in frame_size)
@@ -146,9 +242,18 @@ class TwoBeyTracker:
             or fps <= 0
         ):
             raise ValueError("invalid source coordinates or FPS")
+        if arena_circle is not None:
+            if (
+                len(arena_circle) != 3
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in arena_circle)
+                or arena_circle[2] <= 0
+            ):
+                raise ValueError("invalid arena_circle")
+            arena_circle = tuple(float(v) for v in arena_circle)
         self.frame_size = tuple(frame_size)
         self.fps = fps
         self.policy = dict(policy)
+        self.arena_circle = arena_circle
         self.slots = []
         self.previous = -1
         self.diagonal = math.hypot(*frame_size)
@@ -190,6 +295,10 @@ class TwoBeyTracker:
             "native_id": d["native_id"],
             "last_box": list(d["box"]),
             "last_observed_frame": self.previous,
+            "history": deque(
+                [(self.previous, center(d["box"]))],
+                maxlen=self.policy.get("circular_history_size", 10),
+            ),
         }
         self.slots.append(slot)
         self._own(d["native_id"], slot["entity_id"])
@@ -418,7 +527,20 @@ class TwoBeyTracker:
                 [[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]],
                 dtype=np.float64,
             )
-            predicted.append(s["kalman"].predict()[:2, 0])
+            pred = s["kalman"].predict()[:2, 0]
+            if self.policy.get("circular_prediction_enabled"):
+                circ = _predict_circular_arc(
+                    list(s["history"]),
+                    frame,
+                    self.policy["circular_min_points"],
+                    self.policy["circular_max_residual_ratio"],
+                    self.diagonal,
+                )
+                if circ is not None:
+                    pred = circ
+            max_drift = self.policy.get("max_prediction_drift_ratio", 0.35) * self.diagonal
+            pred = _clamp_to_rim(pred, center(s["last_box"]), self.arena_circle, max_drift)
+            predicted.append(pred)
         # A single observed box covering both recently observed predictions is
         # ambiguous. Native ByteTrack IDs cannot carry player ownership through
         # this merge: retaining their spatial slots does not re-anchor X/B.
@@ -537,6 +659,7 @@ class TwoBeyTracker:
             s["native_id"] = d["native_id"]
             s["last_box"] = list(d["box"])
             s["last_observed_frame"] = frame
+            s["history"].append((frame, center(d["box"])))
             self._own(d["native_id"], s["entity_id"])
             if i == reseed and appearance is not None:
                 # The stale tracking template locked this top out; restart only it.

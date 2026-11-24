@@ -1,0 +1,18 @@
+# E4 Multi-feature stop detection fusion configuration
+# Default: disabled (100% backward compatible with legacy stop_frame)
+enabled: false
+
+# Candidate stop frames must occur on or after landing_frame / battle_start_frame
+min_battle_frame: true
+
+# Multi-feature still stop parameters
+still_frames: 12
+still_moving_px: 3.8
+still_max_rot_rate_deg: 0.3
+still_min_laplacian_var: 80.0
+
+# Precession noise suppression for reversal stops
+reverse_min_laplacian_var: 180.0
+
+# Terminal stop persistence guard (pixels across stadium before considering motion resumed)
+terminal_motion_guard_px: 45.0

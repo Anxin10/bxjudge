@@ -216,3 +216,60 @@ def test_replay_uses_explicit_coordinate_manifest_and_preserves_input_hashes(tmp
         validate_two_bey_set(tmp_path / "preview")
     with pytest.raises(ValueError, match="new directory"):
         build(*args, tmp_path / "result")
+
+
+def _det_at(tid, cx, cy, size=12, color=(1.0, 0.0)):
+    half = size / 2
+    return {
+        "native_id": tid,
+        "box": [float(cx - half), float(cy - half), float(cx + half), float(cy + half)],
+        "score": 0.9,
+        "appearance": list(color),
+    }
+
+
+def test_circular_arc_prediction_reacquires_curved_orbit_after_occlusion():
+    policy = load_policy(Path("config/two_bey_tracking.yaml"))
+    policy["position_gate_ratio"] = 0.12
+    policy["circular_prediction_enabled"] = True
+    t = TwoBeyTracker((300, 300), 30, policy)
+    cx, cy, r, omega = 150.0, 150.0, 80.0, 0.45
+    for f in range(6):
+        theta = f * omega
+        res = t.update(f, [_det_at(10, cx + r * np.cos(theta), cy + r * np.sin(theta))])
+        assert len(res["observed"]) == 1
+    for f in range(6, 9):
+        res_gap = t.update(f, [])
+        assert res_gap["observed"] == []
+    theta_9 = 9 * omega
+    res_9 = t.update(9, [_det_at(99, cx + r * np.cos(theta_9), cy + r * np.sin(theta_9))])
+    assert len(res_9["observed"]) == 1
+    assert res_9["observed"][0]["entity_id"] == 1
+    assert t.entity_count == 1
+
+
+def test_circular_prediction_falls_back_cleanly_on_collinear_motion():
+    policy = load_policy(Path("config/two_bey_tracking.yaml"))
+    t = TwoBeyTracker((300, 200), 30, policy)
+    for f in range(6):
+        t.update(f, [_det_at(10, 40.0 + f * 12.0, 100.0)])
+    t.update(6, [])
+    res = t.update(7, [_det_at(20, 40.0 + 7 * 12.0, 100.0)])
+    assert len(res["observed"]) == 1
+    assert res["observed"][0]["entity_id"] == 1
+    assert t.entity_count == 1
+
+
+def test_rim_velocity_clamp_constrains_outward_prediction_to_arena_circle():
+    policy = load_policy(Path("config/two_bey_tracking.yaml"))
+    t = TwoBeyTracker((300, 300), 30, policy, arena_circle=(150.0, 150.0, 80.0))
+    # Moving radially outward toward the right rim (150 + 80 = 230)
+    for f, x in enumerate([190.0, 205.0, 220.0, 228.0]):
+        t.update(f, [_det_at(10, x, 150.0)])
+    # Predict 2 frames ahead while missing; clamped to rim, so a reappearing
+    # detection just inside the rim at x=228 matches without drifting to x=255+
+    t.update(4, [])
+    res = t.update(5, [_det_at(10, 228.0, 150.0)])
+    assert len(res["observed"]) == 1
+    assert res["observed"][0]["entity_id"] == 1
+

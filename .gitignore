@@ -12,3 +12,8 @@ __pycache__/
 /calib/
 /results/
 /reports/
+
+# Graft runtime data
+.graft/
+antigravity.db
+*.so

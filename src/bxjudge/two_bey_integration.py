@@ -76,9 +76,12 @@ def infer_opponent_side(
          *(start for spans in record["identity_unknown_intervals"].values() for start, _ in spans)],
         default=math.inf,
     )
+    battle_start = record.get("battle_start_frame")
     known_boxes, unknown_boxes = ({d.frame: d.box for d in t.dets} for t in (known, unknown))
     run = []
     for frame in sorted(known_boxes.keys() & unknown_boxes.keys()):
+        if battle_start is not None and frame < battle_start:
+            continue
         if frame >= ambiguous_from:
             return None
         a, b = known_boxes[frame], unknown_boxes[frame]
@@ -192,7 +195,17 @@ def round_release_evidence(
     return selected
 
 def reconstruct_round_tracks(
-    tracks, first, last, fps, frame_size, features, policy, id_offset
+    tracks,
+    first,
+    last,
+    fps,
+    frame_size,
+    features,
+    policy,
+    id_offset,
+    *,
+    battle_start_frame: int | None = None,
+    anchored_native_ids: set[int] | None = None,
 ):
     if (
         type(first) is not int
@@ -270,6 +283,37 @@ def reconstruct_round_tracks(
         )
         for eid in entities
     }
+    if battle_start_frame is not None:
+        anchored_set = set(anchored_native_ids or ())
+        for eid in entities:
+            track_id = id_offset + eid
+            native_ids = members.get(track_id, [])
+            is_anchored = bool(
+                anchored_set and any(nid in anchored_set for nid in native_ids)
+            )
+            if not is_anchored:
+                since = tracker.identity_unknown_since.get(eid)
+                has_battle_reacq = any(
+                    r.get("entity_id") == eid and r.get("frame", 0) >= battle_start_frame
+                    for r in tracker.reacquisitions
+                )
+                if (
+                    since is not None
+                    and since < battle_start_frame
+                    and not has_battle_reacq
+                ):
+                    del tracker.identity_unknown_since[eid]
+                    for obs in observations:
+                        if obs.get("entity_id") == eid and obs.get("frame", 0) >= since:
+                            obs["identity_valid"] = True
+                if eid in tracker.identity_unknown_intervals:
+                    tracker.identity_unknown_intervals[eid] = [
+                        span
+                        for span in tracker.identity_unknown_intervals[eid]
+                        if span[1] >= battle_start_frame
+                    ]
+                    if not tracker.identity_unknown_intervals[eid]:
+                        del tracker.identity_unknown_intervals[eid]
     return PhysicalRound(
         physical,
         members,
@@ -290,6 +334,8 @@ def reconstruct_round_tracks(
             ),
             "raw_input_bey_observations": sum(map(len, by_frame.values())),
             "members": {str(k): v for k, v in members.items()},
+            "battle_start_frame": battle_start_frame,
+            "anchored_native_ids": sorted(anchored_native_ids) if anchored_native_ids else [],
             "observations": observations,
             "identity_unknown_since": {str(id_offset + eid): frame
                 for eid, frame in tracker.identity_unknown_since.items() if eid in entities},

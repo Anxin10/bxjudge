@@ -7,11 +7,24 @@ import yaml
 
 from bxjudge.config import load_thresholds
 from bxjudge.finish import (
-    AFTER_FINISH_PREFIX, detect_finish, id_swap_risk, orbit_direction, rotation_rate,
-    spin_activity, stop_frame,
+    AFTER_FINISH_PREFIX,
+    detect_finish,
+    id_swap_risk,
+    laplacian_variance,
+    load_finish_fusion_config,
+    orbit_direction,
+    rotation_rate,
+    spin_activity,
+    stop_frame,
 )
 from tests.helpers import (
-    circle_path, make_calibration, make_track, rotating_crops, rr, scene, slowing_bey,
+    circle_path,
+    make_calibration,
+    make_track,
+    rotating_crops,
+    rr,
+    scene,
+    slowing_bey,
 )
 
 
@@ -610,3 +623,129 @@ def test_short_jitter_stay_cannot_move_the_last_whole_frame_exception_earlier(th
     result = detect_finish(bey, [], {"X": None, "B": None}, c, th, 30)
     assert (result.finish, result.loser, result.frame) == ("over", "B", 3)
     assert "pocket_corner_jitter@B" not in result.reasons
+
+
+def test_laplacian_variance_calculation():
+    # Uniform black/white crop has zero variance
+    uniform = {0: np.zeros((64, 64), dtype=np.uint8), 1: np.full((64, 64), 128, dtype=np.uint8)}
+    var_map = laplacian_variance(uniform)
+    assert var_map[0] == 0.0
+    assert var_map[1] == 0.0
+
+    # High frequency / textured pattern has high variance
+    checker = np.zeros((64, 64), dtype=np.uint8)
+    checker[::2, ::2] = 255
+    checker[1::2, 1::2] = 255
+    var_checker = laplacian_variance({2: checker})
+    assert var_checker[2] > 500.0
+
+
+def test_stop_frame_fusion_disabled_matches_legacy(th):
+    track, activity, rate = slowing_bey(reverse_at=200)
+    # Both with None and enabled: False
+    res_legacy = stop_frame(track, activity, rate, 'right', th)
+    res_none = stop_frame(track, activity, rate, 'right', th, fusion=None)
+    res_disabled = stop_frame(track, activity, rate, 'right', th, fusion={"enabled": False})
+    assert res_legacy == (200, 'reversed')
+    assert res_none == res_legacy
+    assert res_disabled == res_legacy
+
+
+def test_stop_frame_fusion_landing_frame_filters_prelaunch(th):
+    track, activity, rate = slowing_bey(reverse_at=100)
+    fusion = {"enabled": True, "min_battle_frame": True}
+    laplacian = {f: 200.0 for f in range(320)}
+    # Landing frame after reverse_at: candidate filtered
+    res_filtered = stop_frame(track, activity, rate, 'right', th,
+                              laplacian=laplacian, fusion=fusion, landing_frame=150)
+    assert res_filtered == (None, None)
+
+    # Landing frame before reverse_at: candidate kept
+    res_kept = stop_frame(track, activity, rate, 'right', th,
+                          laplacian=laplacian, fusion=fusion, landing_frame=50)
+    assert res_kept == (100, 'reversed')
+
+
+def test_stop_frame_fusion_precession_blur_suppresses_false_reversal(th):
+    track, activity, rate = slowing_bey(reverse_at=200)
+    fusion = {
+        "enabled": True,
+        "reverse_min_laplacian_var": 180.0,
+    }
+    # Blurry crop (low laplacian variance, like spinning/precessing top)
+    laplacian_blurry = {f: 120.0 for f in range(320)}
+    res_blurry = stop_frame(track, activity, rate, 'right', th,
+                            laplacian=laplacian_blurry, fusion=fusion)
+    assert res_blurry == (None, None)
+
+    # Sharp crop (high laplacian variance, stopped top)
+    laplacian_sharp = {f: 250.0 for f in range(320)}
+    res_sharp = stop_frame(track, activity, rate, 'right', th,
+                           laplacian=laplacian_sharp, fusion=fusion)
+    assert res_sharp == (200, 'reversed')
+
+
+def test_stop_frame_fusion_still_detection(th):
+    # Track moving rapidly (10px/frame) then stationary at (1100, 200) from frame 100 onwards
+    centers = {f: (100.0 + f * 10.0, 200.0) for f in range(100)}
+    centers.update({f: (1100.0, 200.0) for f in range(100, 200)})
+    track = make_track(1, 'bey', centers)
+
+    # Activity is high (diff > 4.0 due to detector jitter on sharp texture), rate is 0.0 (no reversal), laplacian high
+    activity = {f: 8.0 for f in range(200)}
+    rate = {f: 0.0 for f in range(200)}
+    laplacian = {f: 150.0 for f in range(200)}
+
+    fusion = {
+        "enabled": True,
+        "still_frames": 12,
+        "still_moving_px": 2.5,
+        "still_max_rot_rate_deg": 0.3,
+        "still_min_laplacian_var": 100.0,
+    }
+    # Legacy fails because activity (8.0) > still_activity (4.0) and rate=0 (no reversed)
+    assert stop_frame(track, activity, rate, 'right', th, fusion=None) == (None, None)
+
+    # Fusion succeeds because moving < 2.5, |rate| < 0.3, lap >= 100.0 for 12 frames
+    res_fusion = stop_frame(track, activity, rate, 'right', th,
+                            laplacian=laplacian, fusion=fusion)
+    assert res_fusion[1] == 'still'
+    assert res_fusion[0] == 101
+
+
+def test_stop_frame_fusion_terminal_motion_guard(th):
+    # Moving rapidly, stationary pause from f=100 to f=120, then moves away >20px
+    centers = {f: (100.0 + f * 10.0, 200.0) for f in range(100)}
+    centers.update({f: (1100.0, 200.0) for f in range(100, 120)})
+    # Resumes rapid motion at f=120 to f=200
+    centers.update({f: (1100.0 + (f - 120) * 10.0, 200.0) for f in range(120, 200)})
+    track = make_track(1, 'bey', centers)
+
+    activity = {f: 8.0 for f in range(200)}
+    rate = {f: 0.0 for f in range(200)}
+    laplacian = {f: 150.0 for f in range(200)}
+
+    fusion = {
+        "enabled": True,
+        "still_frames": 12,
+        "still_moving_px": 2.5,
+        "still_max_rot_rate_deg": 0.3,
+        "still_min_laplacian_var": 100.0,
+        "terminal_motion_guard_px": 20.0,
+    }
+    # Resumed motion (>20px) rejects candidate
+    res = stop_frame(track, activity, rate, 'right', th,
+                     laplacian=laplacian, fusion=fusion)
+    assert res == (None, None)
+
+
+def test_load_finish_fusion_config(tmp_path):
+    assert load_finish_fusion_config(None) == {}
+    assert load_finish_fusion_config(tmp_path / "nonexistent.yaml") == {}
+    cfg_file = tmp_path / "fusion.yaml"
+    cfg_file.write_text("enabled: true\nstill_frames: 15\n")
+    loaded = load_finish_fusion_config(cfg_file)
+    assert loaded["enabled"] is True
+    assert loaded["still_frames"] == 15
+
+

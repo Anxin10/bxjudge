@@ -172,6 +172,18 @@ def test_ambiguous_mounting_does_not_choose_a_body_for_clearance():
     assert result.releases == {}
 
 
+def test_120fps_brief_launcher_flicker_and_delayed_prefix_recover():
+    # Launcher appears 5 frames after bey starts (within 0.25s at 120fps) and flickers
+    # out for 3 frames (25ms < 50ms launcher_gap_s) while mounted before separating.
+    bey = make_track(1, "bey", {f: (100, 90 if f < 45 else 180) for f in range(80)})
+    launcher_frames = [f for f in range(5, 80) if f not in (28, 29, 30)]
+    body = make_track(9, "launcher", {f: (100, 70) for f in launcher_frames}, size=40)
+    result = prepare_launch_tracks([bey, body], 120.0, load_launch_policy())
+    assert 1 in result.releases
+    assert result.releases[1] == 45
+    assert result.diagnostics[1]["interruption"] is None
+
+
 def test_clearance_confirmation_needs_actual_consecutive_observations():
     # Two clear observations on either side of a missing image cannot make a
     # three-frame confirmed geometric run; no point is inserted at frame22.

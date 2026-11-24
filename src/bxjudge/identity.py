@@ -21,12 +21,20 @@ DEFAULT_IDENTITY_CONFIG = Path(__file__).resolve().parents[2] / "config/identity
 @config_loader
 def load_identity_policy(path=DEFAULT_IDENTITY_CONFIG):
     value = yaml.safe_load(Path(path).read_text())
+    required = {
+        "context_wait_s",
+        "body_duplicate_overlap_min",
+        "prelaunch_setup_anchor_enabled",
+        "prelaunch_setup_wait_s",
+    }
     if (
         not isinstance(value, dict)
-        or set(value) != {"context_wait_s", "body_duplicate_overlap_min"}
+        or set(value) != required
+        or type(value["prelaunch_setup_anchor_enabled"]) is not bool
         or any(
             type(v) not in (int, float) or not math.isfinite(v) or v <= 0
-            for v in value.values()
+            for k, v in value.items()
+            if k != "prelaunch_setup_anchor_enabled"
         )
         or value["body_duplicate_overlap_min"] > 1
     ):
@@ -136,16 +144,23 @@ def anchor_sides(
             for d in track.dets:
                 bodies.setdefault(d.frame, []).append((track.track_id, d.box))
     sides, evidence = {}, {}
+    prelaunch_setup = policy.get("prelaunch_setup_anchor_enabled", False)
     for track in tracks:
         if track.cls != "bey" or not track.dets:
             continue
         run = []
         prefix_side = None
         waiting_for_body = False
+        track_top_entry = False
         for d in sorted(track.dets, key=lambda d: d.frame):
+            max_wait_s = (
+                policy.get("prelaunch_setup_wait_s", 1.5)
+                if (prelaunch_setup and track_top_entry)
+                else policy["context_wait_s"]
+            )
             if (
                 waiting_for_body
-                and (d.frame - track.first_frame()) / fps > policy["context_wait_s"]
+                and (d.frame - track.first_frame()) / fps > max_wait_s
             ):
                 break
             observed = bodies.get(d.frame, [])
@@ -179,12 +194,39 @@ def anchor_sides(
                 for tid, box in observed
                 if boxes_touch(d.box, box, margin=body_margin_px)
             ]
+            registered = reference.get((track.track_id, d.frame))
+            point = registered[1] if registered is not None else None
+            in_launch = registered is not None and (
+                point_in_polygon(point, c.launch_left)
+                or point_in_polygon(point, c.launch_right)
+            )
+            if prelaunch_setup and registered is not None:
+                ba_min_y = min(p[1] for p in c.battle_area)
+                l_min_x = min(p[0] for p in c.launch_left + c.launch_right)
+                l_max_x = max(p[0] for p in c.launch_left + c.launch_right)
+                is_top_zone = (
+                    d.box[1] <= 0
+                    or (
+                        point[1] < ba_min_y
+                        and l_min_x - body_margin_px <= point[0] <= l_max_x + body_margin_px
+                    )
+                ) and not point_in_polygon(point, c.battle_area)
+                if is_top_zone:
+                    track_top_entry = True
             if not nearby:
-                registered = reference.get((track.track_id, d.frame))
-                observed_free = registered is not None and not (
-                    point_in_polygon(registered[1], c.launch_left)
-                    or point_in_polygon(registered[1], c.launch_right)
-                )
+                if prelaunch_setup and registered is not None and not in_launch:
+                    observed_free = not track_top_entry
+                else:
+                    observed_free = registered is not None and not in_launch
+                if prelaunch_setup and track_top_entry:
+                    if (
+                        (d.frame - track.first_frame()) / fps > max_wait_s
+                        or observed_free
+                    ):
+                        break
+                    run = []
+                    waiting_for_body = True
+                    continue
                 below_bodies = (
                     bool(observed)
                     and d.box[1] > max(box[3] for _, box in observed) + body_margin_px
@@ -195,7 +237,7 @@ def anchor_sides(
                     or paired
                     or prefix_side is not None
                     or any(side is not None for side in measured.values())
-                    or (d.frame - track.first_frame()) / fps > policy["context_wait_s"]
+                    or (d.frame - track.first_frame()) / fps > max_wait_s
                 ):
                     # Missing one launcher is not evidence of free motion; a
                     # measured free prefix or expired unknown window still is
@@ -210,35 +252,38 @@ def anchor_sides(
                 point_in_polygon(point, c.launch_left)
                 or point_in_polygon(point, c.launch_right)
             ):
-                # A clipped box's centre cannot establish a free-flight prefix.
-                # Wait only while a real nearby launcher is observed but its
-                # role is unknown; later ownership still needs the full run.
-                x0, y0, x1, y1 = d.box
-                clipped = (
-                    x0 <= 0 or y0 <= 0 or x1 >= c.frame_size[0] or y1 >= c.frame_size[1]
-                )
-                bx0, by0, bx1, by1 = registered[0]
-                left, top = max(0, math.floor(bx0)), max(0, math.floor(by0))
-                right = min(c.frame_size[0], math.ceil(bx1))
-                bottom = min(c.frame_size[1], math.ceil(by1))
-                overlaps_launch = (
-                    left < right
-                    and top < bottom
-                    and bool(launch_mask[top:bottom, left:right].any())
-                )
-                if (
-                    clipped
-                    and overlaps_launch
-                    and not conflict
-                    and prefix_side is None
-                    and all(side is None for _, side in nearby)
-                    and (d.frame - track.first_frame()) / fps
-                    <= policy["context_wait_s"]
-                ):
-                    run = []
-                    waiting_for_body = True
-                    continue
-                break
+                if prelaunch_setup and track_top_entry:
+                    pass
+                else:
+                    # A clipped box's centre cannot establish a free-flight prefix.
+                    # Wait only while a real nearby launcher is observed but its
+                    # role is unknown; later ownership still needs the full run.
+                    x0, y0, x1, y1 = d.box
+                    clipped = (
+                        x0 <= 0 or y0 <= 0 or x1 >= c.frame_size[0] or y1 >= c.frame_size[1]
+                    )
+                    bx0, by0, bx1, by1 = registered[0]
+                    left, top = max(0, math.floor(bx0)), max(0, math.floor(by0))
+                    right = min(c.frame_size[0], math.ceil(bx1))
+                    bottom = min(c.frame_size[1], math.ceil(by1))
+                    overlaps_launch = (
+                        left < right
+                        and top < bottom
+                        and bool(launch_mask[top:bottom, left:right].any())
+                    )
+                    if (
+                        clipped
+                        and overlaps_launch
+                        and not conflict
+                        and prefix_side is None
+                        and all(side is None for _, side in nearby)
+                        and (d.frame - track.first_frame()) / fps
+                        <= max_wait_s
+                    ):
+                        run = []
+                        waiting_for_body = True
+                        continue
+                    break
             context = {side for _, side in nearby}
             if None in context:
                 run = []

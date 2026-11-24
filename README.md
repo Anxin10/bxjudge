@@ -161,6 +161,18 @@ PYTHONPATH=src .venv/bin/python -m bxjudge.cli run \
   --two-bey-tracking config/two_bey_tracking.yaml --no-vlm --rejudge
 ```
 
+### 發射遮罩覆核
+
+在上述雙陀螺模式加入 `--launch-mask-review /path/to/sam2.1_hiera_tiny.pt`，
+並把本機 SAM 2.1 runtime 加入 `PYTHONPATH`。此選項需要 CUDA。
+程式只在可辨別陀螺身分與同側發射器的短視窗重切遮罩。兩個遮罩各有至少
+70% 面積落在自己的偵測框內，該格才納入比較。發射候選需要連續兩格分離比例低於
+50%，接著連續兩格達到 50%，缺格會中斷確認。
+
+逐格比例與候選影格存入回合的幾何證據 `launch_timing.mask_review`。
+若新候選和現有發射時間相差超過一格，或提供了原本未能確認的候選，回合會標為待覆核。
+落地計時仍採用核心裁判已確認的發射證據。
+
 `two_bey_tracking.yaml`管理最多兩個身分、關聯、重複框及Kalman參數。連續兩個來源影格
 都實際觀測到兩顆後，才發布該回合的正式物理身分；單顆或未連續共現的片段只保留
 暫定觀測，不發布新的正式身分，也不產生發射／勝負分析。每個來源回合重設，
@@ -379,9 +391,14 @@ IoU 達 `config/launch_phase.yaml` 門檻；相反身分錨點拒絕接續。共
 
 ```bash
 cd ~/bxjudge
-bash scripts/setup_wsl.sh      # ffmpeg、rclone、uv、Python 依賴
+bash scripts/setup_wsl.sh      # ffmpeg、rclone、uv、Rust 與 Python 依賴
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 uv run pytest                  # 確認環境正常
 ```
+
+環境需有 Rust 1.83 以上與 C 編譯工具。開新終端機時，先執行上方的 PATH 設定。
+Python 套件安裝時會編譯裁判幾何擴充，包含多邊形判定、矩形接觸、
+整框入袋與軌跡速度。修改 Rust 原始碼後，執行 uv sync 會重新編譯。
 
 ## 同步影片（rclone，Google Drive 唯讀）
 

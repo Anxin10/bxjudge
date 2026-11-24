@@ -57,7 +57,7 @@
     video.py                     # ffmpeg 解碼（NVDEC → CPU 後備）
     stadium_motion.py            # 盤面位移序列（ECC）
     landing.py                   # 落地時間點
-    launch_check.py              # 方別、觸碰、落入、空碰
+    launch_check.py              # 方別、觸碰、落入、空測
     finish.py                    # 停轉、終結判定、ID 互換風險
     segment.py                   # 回合切分
     detect.py                    # Detector 介面、RF-DETR / YOLO26 adapter

@@ -50,15 +50,24 @@ from .dynamic_calibration import (
 )
 from .finish import (
     AFTER_FINISH_PREFIX,
+    DEFAULT_FINISH_FUSION_CONFIG,
     detect_finish,
     is_after_finish,
+    laplacian_variance,
+    load_finish_fusion_config,
     orbit_direction,
     rotation_rate,
     spin_activity,
     stop_frame,
 )
+from .geometry import box_center, zone_of
 from .handheld_calibration import HandheldCalibration
-from .identity import anchor_sides, inherited_sides, load_identity_policy
+from .identity import (
+    DEFAULT_IDENTITY_CONFIG,
+    anchor_sides,
+    inherited_sides,
+    load_identity_policy,
+)
 from .launch_check import analyze_launch
 from .launch_mask_review import (
     SamLaunchMaskReviewer,
@@ -209,6 +218,8 @@ def judge_video(
     stadium_tools=None,
     camera_policy: dict | None = None,
     launch_mask_reviewer: SamLaunchMaskReviewer | None = None,
+    identity_config: Path | str = DEFAULT_IDENTITY_CONFIG,
+    finish_fusion_config: Path | str | None = DEFAULT_FINISH_FUSION_CONFIG,
 ) -> list[RoundResult]:
     """Analyze one video using playback fps and untouched source frame indices.
 
@@ -246,6 +257,7 @@ def judge_video(
     two_policy = (
         converted(load_two_bey_policy(two_bey_config)) if two_bey_config is not None else None
     )
+    finish_fusion_policy = load_finish_fusion_config(finish_fusion_config)
     evidence_confidence = load_policy(detection_config)["confidence"]
     source_before = None
     if dynamic_config is not None:
@@ -492,12 +504,13 @@ def judge_video(
         if geometry is not None:
             phase_policy = converted(load_launch_policy())
             required_anchor_frames = launch_sample_count(phase_policy["held_s"], info.fps)
+            identity_policy = load_identity_policy(identity_config)
             anchors = anchor_sides(
                 tracks, normalize_tracks(tracks, geometry.samples), c,
                 required_frames=required_anchor_frames,
                 body_margin_px=phase_policy["body_margin_px"],
                 fps=info.fps,
-                **({"policy": converted(load_identity_policy())} if timing else {}),
+                policy=converted(identity_policy) if timing else identity_policy,
             )
             phase = prepare_launch_tracks(
                 tracks, info.fps, phase_policy, side_hints=anchors.sides
@@ -542,7 +555,23 @@ def judge_video(
             offset=max((t.track_id for t in native_tracks),default=0)
             phase_keys={(d.frame,tuple(d.box),d.score) for t in raw_tracks if t.cls=='bey' for d in t.dets}
             for number,(start,end) in enumerate(rounds,1):
-                physical=reconstruct_round_tracks(native_tracks,start,end,info.fps,c.frame_size,appearances,two_policy,offset+number*2)
+                battle_start = min(
+                    (d.frame for t in native_tracks if t.cls == "bey" for d in t.dets
+                     if start <= d.frame <= end and zone_of(box_center(d.box), c) == "battle_area"),
+                    default=None,
+                )
+                physical=reconstruct_round_tracks(
+                    native_tracks,
+                    start,
+                    end,
+                    info.fps,
+                    c.frame_size,
+                    appearances,
+                    two_policy,
+                    offset+number*2,
+                    battle_start_frame=battle_start,
+                    anchored_native_ids=set(anchors.sides) if anchors.sides else None,
+                )
                 for observation in physical.record['unassigned']:
                     observation['adjudication_eligible'] = (
                         observation['frame'], tuple(observation['box']), observation['score']
@@ -696,19 +725,68 @@ def judge_video(
                         key = (d.frame, tuple(raw_box))
                         if key in crops:
                             observed_crops[d.frame] = crops[key]
-                    stopped, reason = stop_frame(
-                        t,
-                        spin_activity(observed_crops),
-                        rotation_rate(observed_crops),
-                        spin[side],
-                        th,
-                    )
+                    fusion_enabled = bool(finish_fusion_policy and finish_fusion_policy.get("enabled"))
+                    if fusion_enabled:
+                        laplacian = laplacian_variance(observed_crops)
+                        landing_f = (
+                            launch.landing_frame.get(side)
+                            if (launch and hasattr(launch, "landing_frame") and isinstance(launch.landing_frame, dict))
+                            else None
+                        )
+                        if landing_f is None and t is not None:
+                            landing_f = next(
+                                (
+                                    d.frame
+                                    for d in t.dets
+                                    if zone_of(((d.box[0] + d.box[2]) / 2, (d.box[1] + d.box[3]) / 2), c) == "battle_area"
+                                ),
+                                None,
+                            )
+                        stopped, reason = stop_frame(
+                            t,
+                            spin_activity(observed_crops),
+                            rotation_rate(observed_crops),
+                            spin[side],
+                            th,
+                            laplacian=laplacian,
+                            fusion=finish_fusion_policy,
+                            landing_frame=landing_f,
+                        )
+                    else:
+                        stopped, reason = stop_frame(
+                            t,
+                            spin_activity(observed_crops),
+                            rotation_rate(observed_crops),
+                            spin[side],
+                            th,
+                        )
                     stops[side] = stopped
                     if reason:
                         stop_kinds[side] = reason
                 else:
                     stops[side] = None
-            finish = detect_finish(bey, parts, stops, c, th, info.fps)
+            battle_bey = {}
+            for side, bt in bey.items():
+                lf = (
+                    launch.landing_frame.get(side)
+                    if (launch and hasattr(launch, "landing_frame") and isinstance(launch.landing_frame, dict))
+                    else None
+                )
+                if lf is None and bt is not None:
+                    lf = next(
+                        (
+                            d.frame
+                            for d in bt.dets
+                            if zone_of(((d.box[0] + d.box[2]) / 2, (d.box[1] + d.box[3]) / 2), c) == "battle_area"
+                        ),
+                        None,
+                    )
+                if finish_fusion_policy and finish_fusion_policy.get("enabled") and lf is not None:
+                    battle_dets = [d for d in bt.dets if d.frame >= lf]
+                    battle_bey[side] = Track(bt.track_id, bt.cls, battle_dets)
+                else:
+                    battle_bey[side] = bt
+            finish = detect_finish(battle_bey, parts, stops, c, th, info.fps)
             # Voids judge evidence only up to the settled candidate result (R55);
             # an earlier void must not change what a later check counts.
             candidate = finish
@@ -883,6 +961,11 @@ def judge_video(
                 },
                 "impact_frames": sorted(analysis.impacts),
             }
+            if finish.loser is not None and stops.get(finish.loser) is not None:
+                r.motion_evidence["loser_stop_frame"] = stops[finish.loser]
+                r.motion_evidence["stop_frame"] = stops[finish.loser]
+            elif finish.frame is not None:
+                r.motion_evidence["stop_frame"] = finish.frame
             if camera_record is not None:
                 r.motion_evidence["camera"] = camera_record
             if keypoint_record is not None:
@@ -1160,6 +1243,8 @@ def run_batch(
     stadium_keypoints: bool = False,
     camera_config: Path = DEFAULT_CAMERA_MODE_CONFIG,
     launch_mask_weights: Path | None = None,
+    identity_config: Path = DEFAULT_IDENTITY_CONFIG,
+    finish_fusion_config: Path | str | None = None,
 ) -> None:
     # R61: batch wall-clock from here (before config/model init) to the end of the VLM phase.
     run_began = time.perf_counter()
@@ -1518,6 +1603,9 @@ def run_batch(
                     **({'two_bey_config':two_bey_config} if two_bey_config is not None else {}),
                     **({"launch_mask_reviewer": launch_mask_reviewer}
                        if launch_mask_reviewer is not None else {}),
+                    identity_config=identity_config,
+                    **({"finish_fusion_config": finish_fusion_config}
+                       if finish_fusion_config is not None else {}),
                 )
             except Exception:
                 log.exception("analysis failed for %s; continuing batch", path)

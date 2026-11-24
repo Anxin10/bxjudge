@@ -7,15 +7,40 @@ gaps and nonfinite measurements never count as consecutive motion evidence.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import math
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
+import yaml
 
 from bxjudge.config import Thresholds
 from bxjudge.geometry import boxes_touch, point_in_polygon, zone_of
-from bxjudge.types import Box, Calibration, Detection, Finish, Polygon, Side, SpinDir, Track
+from bxjudge.types import (
+    Box,
+    Calibration,
+    Detection,
+    Finish,
+    Polygon,
+    Side,
+    SpinDir,
+    Track,
+)
+
+DEFAULT_FINISH_FUSION_CONFIG = Path(__file__).resolve().parents[2] / "config/finish_fusion.yaml"
+
+
+def load_finish_fusion_config(path: Path | str | None = DEFAULT_FINISH_FUSION_CONFIG) -> dict[str, Any]:
+    if path is None:
+        return {}
+    p = Path(path).expanduser()
+    if not p.is_file():
+        return {}
+    with open(p, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return raw if isinstance(raw, dict) else {}
 
 # Farneback solver parameters, not rule/decision thresholds. Inputs are 64x64
 # gray crops per the interface; no rule compares motion to these solver values.
@@ -112,6 +137,17 @@ def rotation_rate(crops: dict[int, np.ndarray]) -> dict[int, float]:
     return out
 
 
+def laplacian_variance(crops: dict[int, np.ndarray]) -> dict[int, float]:
+    """Variance of the Laplacian for 64x64 grayscale crops; higher variance indicates sharper texture."""
+    out: dict[int, float] = {}
+    for f, crop in sorted(crops.items()):
+        if crop.shape == (64, 64) and np.isfinite(crop).all():
+            out[f] = float(cv2.Laplacian(crop.astype(np.float32), cv2.CV_32F).var())
+        else:
+            out[f] = math.nan
+    return out
+
+
 def _positive_fps(fps: float) -> None:
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('fps must be positive and finite')
@@ -157,26 +193,62 @@ def orbit_direction(t: Track, c: Calibration, landing_frame: int | None,
     return th.orbit_to_spin['cw' if total > 0 else 'ccw']
 
 
-def stop_frame(t: Track, activity: dict[int, float], rate: dict[int, float],
-               spin_dir: SpinDir, th: Thresholds) -> tuple[int | None, str | None]:
+def stop_frame(
+    t: Track,
+    activity: dict[int, float],
+    rate: dict[int, float],
+    spin_dir: SpinDir,
+    th: Thresholds,
+    *,
+    laplacian: dict[int, float] | None = None,
+    fusion: dict[str, Any] | None = None,
+    landing_frame: int | None = None,
+) -> tuple[int | None, str | None]:
     """First fully observed still/slow-reversal run, by run start (R33 applies)."""
     centers = t.centers()
     baseline = next((1 if orbit == 'cw' else -1
                      for orbit, spin in th.orbit_to_spin.items() if spin == spin_dir), None)
+    fusion_enabled = bool(fusion and fusion.get("enabled", False))
+    min_frame = landing_frame if (fusion_enabled and landing_frame is not None) else 0
+
     still_run = reverse_run = learn_run = 0
     learn_sign = None
-    candidates = []
-    for f in sorted(centers):
+    candidates: list[tuple[int, str]] = []
+
+    req_still_frames = fusion.get("still_frames", th.still_frames) if fusion_enabled else th.still_frames
+    still_moving_px = fusion.get("still_moving_px", 2.5) if fusion_enabled else th.still_px
+    still_max_rot = fusion.get("still_max_rot_rate_deg", 0.3) if fusion_enabled else 0.5
+    still_min_lap = fusion.get("still_min_laplacian_var", 100.0) if fusion_enabled else 100.0
+    rev_min_lap = fusion.get("reverse_min_laplacian_var", 180.0) if fusion_enabled else 180.0
+    guard_disp = fusion.get("terminal_motion_guard_px", 20.0) if fusion_enabled else None
+
+    sorted_frames = sorted(centers)
+    frame_indices = {f: i for i, f in enumerate(sorted_frames)}
+
+    for f in sorted_frames:
         moving = math.inf
         if f - 1 in centers:
             moving = math.dist(centers[f - 1], centers[f])
         if not math.isfinite(moving):
             moving = math.inf
         a, r = activity.get(f, math.nan), rate.get(f, math.nan)
+        lap = laplacian.get(f, math.nan) if laplacian is not None else math.nan
+
         still = moving < th.still_px and math.isfinite(a) and a < th.still_activity
+        if fusion_enabled:
+            fusion_still = (
+                moving < still_moving_px
+                and math.isfinite(r) and abs(r) < still_max_rot
+                and math.isfinite(lap) and lap >= still_min_lap
+            )
+            still = still or fusion_still
+
         still_run = still_run + 1 if still else 0
-        if still_run == th.still_frames:
-            candidates.append((f - still_run + 1, 'still'))
+        if still_run == req_still_frames:
+            cand_frame = f - still_run + 1
+            if cand_frame >= min_frame:
+                candidates.append((cand_frame, 'still'))
+
         slow = (moving < th.reverse_max_move_px and math.isfinite(r)
                 and 0 < abs(r) < th.reverse_max_rate_deg)
         sign = 1 if r > 0 else -1
@@ -186,9 +258,26 @@ def stop_frame(t: Track, activity: dict[int, float], rate: dict[int, float],
             if learn_run >= th.reverse_frames:
                 baseline = sign
         reversed_now = slow and baseline is not None and sign != baseline
+
+        if fusion_enabled and reversed_now and not (math.isfinite(lap) and lap >= rev_min_lap):
+            reversed_now = False
+
         reverse_run = reverse_run + 1 if reversed_now else 0
         if reverse_run == th.reverse_frames:
-            candidates.append((f - reverse_run + 1, 'reversed'))
+            cand_frame = f - reverse_run + 1
+            if cand_frame >= min_frame:
+                candidates.append((cand_frame, 'reversed'))
+
+    if fusion_enabled and guard_disp is not None and candidates:
+        valid_candidates = []
+        for cand_frame, kind in candidates:
+            idx = frame_indices[cand_frame]
+            pt = centers[cand_frame]
+            active = [centers[sorted_frames[k]] for k in range(idx, max(idx + 1, len(sorted_frames) - 30))]
+            if not any(math.dist(pt, p2) > guard_disp for p2 in active):
+                valid_candidates.append((cand_frame, kind))
+        candidates = valid_candidates
+
     return min(candidates, default=(None, None), key=lambda item: item[0])
 
 
@@ -425,12 +514,32 @@ def detect_finish(bey: dict[Side, Track], parts: list[Track],
         f = stops.get(side)
         if f is None:
             continue
-        if all(f in ds and zone_of(centers[s][f], c) == 'battle_area'
-               for s, ds in observations.items()):
-            events.append((FinishResult('spin', side, f,
-                                        _score([ds[f] for ds in observations.values()]), []), f))
+        matched_f = next(
+            (
+                cand_f
+                for cand_f in range(f, f + 4)
+                if all(
+                    cand_f in ds and zone_of(centers[s][cand_f], c) == "battle_area"
+                    for s, ds in observations.items()
+                )
+            ),
+            None,
+        )
+        if matched_f is not None:
+            events.append(
+                (
+                    FinishResult(
+                        "spin",
+                        side,
+                        matched_f,
+                        _score([ds[matched_f] for ds in observations.values()]),
+                        [],
+                    ),
+                    matched_f,
+                )
+            )
         else:
-            notes.append(_Note(f, f'stop_evidence_missing@{side}', side, True))
+            notes.append(_Note(f, f"stop_evidence_missing@{side}", side, True))
 
     latest = max(max(ds) for ds in observations.values())
     for side, dets in observations.items():

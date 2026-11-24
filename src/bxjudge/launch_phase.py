@@ -25,6 +25,8 @@ def load_launch_policy(path=DEFAULT_LAUNCH_POLICY):
     names = {
         "held_s",
         "separation_s",
+        "launcher_gap_s",
+        "prefix_wait_s",
         "body_margin_px",
         "link_gap_s",
         "link_error_px",
@@ -234,6 +236,8 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
     side_hints = dict(side_hints or {})
     held_n = launch_sample_count(policy["held_s"], fps)
     free_n = launch_sample_count(policy["separation_s"], fps)
+    gap_max = max(0, int(round(float(policy.get("launcher_gap_s", 0.05)) * fps)))
+    prefix_wait_frames = max(0, int(round(float(policy.get("prefix_wait_s", 0.25)) * fps)))
     bodies = {}
     for t in tracks:
         if t.cls == "launcher":
@@ -249,11 +253,13 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
             prepared.append(Track(t.track_id, t.cls, list(t.dets)))
             continue
         ordered = sorted(t.dets, key=lambda d: d.frame)
+        prefix_deadline = ordered[0].frame + prefix_wait_frames
         held = []
         free = []
         owner = None
         release = None
         mounted = False
+        missing_since = None
         interruption = None
         for index, d in enumerate(ordered):
             if mounted and d.frame != ordered[index - 1].frame + 1:
@@ -270,37 +276,49 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
             ]
             if not mounted:
                 if len(candidates) == 1:
-                    if held and (d.frame != held[-1] + 1 or owner != candidates[0]):
+                    if held and (d.frame - held[-1] > gap_max + 1 or owner != candidates[0]):
                         held = []
                     owner = candidates[0]
                     held.append(d.frame)
                     if len(held) >= held_n:
                         mounted = True
-                else:
+                elif len(candidates) > 1:
                     held = []
-                # Only an observed prefix mounting can redefine this track's first appearance.
-                if not held:
                     interruption = {
-                        "reason": "prefix_launcher_ambiguous"
-                        if candidates
-                        else "prefix_launcher_missing",
+                        "reason": "prefix_launcher_ambiguous",
                         "frame": d.frame,
+                    }
+                    break
+                else:
+                    if held and d.frame - held[-1] > gap_max:
+                        held = []
+                # Only an observed prefix mounting can redefine this track's first appearance.
+                if not held and d.frame > prefix_deadline:
+                    interruption = {
+                        "reason": "prefix_launcher_missing",
+                        "frame": ordered[0].frame,
                     }
                     break
             else:
                 observed = [b for tid, b in bodies.get(d.frame, []) if tid == owner]
-                if len(observed) != 1:
+                if len(observed) > 1:
                     interruption = {
-                        "reason": "launcher_observation_missing"
-                        if not observed
-                        else "launcher_observation_ambiguous",
+                        "reason": "launcher_observation_ambiguous",
                         "frame": d.frame,
                     }
                     break
-                if (
-                    len(observed) == 1
-                    and _distance(d.box, observed[0]) > policy["body_margin_px"]
-                ):
+                if len(observed) == 0:
+                    if missing_since is None:
+                        missing_since = d.frame
+                    if d.frame - missing_since >= gap_max:
+                        interruption = {
+                            "reason": "launcher_observation_missing",
+                            "frame": missing_since,
+                        }
+                        break
+                    continue
+                missing_since = None
+                if _distance(d.box, observed[0]) > policy["body_margin_px"]:
                     if free and d.frame != free[-1] + 1:
                         free = []
                     free.append(d.frame)
@@ -309,6 +327,11 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
                         break
                 else:
                     free = []
+        if not mounted and interruption is None:
+            interruption = {
+                "reason": "prefix_launcher_missing",
+                "frame": ordered[0].frame,
+            }
         # This evidence can recover after an interruption, but cannot change the
         # strict release result, track lifetime, or eligibility deadline.
         diagnostics[t.track_id] = {

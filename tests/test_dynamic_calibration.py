@@ -277,3 +277,105 @@ def test_fixed_camera_reuses_alignment_between_checks_and_survives_brief_blur():
     )
     s8 = obj.update(8, ref)
     assert s8.status == "tracking" and s8.alignment is not None
+
+
+def test_conditional_gap_disabled_by_default_keeps_gap_unknown():
+    from bxjudge.types import Detection
+
+    ref, c = stadium_scene(size=(640, 360))
+    policy = load_dynamic_policy()
+    assert policy["conditional_gap_enabled"] is False
+    obj = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], policy, fixed_camera=True
+    )
+    cx, cy = np.mean(c.battle_area, axis=0)
+    det = lambda f: [Detection(f, "bey", (float(cx - 8), float(cy - 8), float(cx + 8), float(cy + 8)), 0.9)]
+    obj.set_foreground(det(0))
+    assert obj.update(0, ref).alignment is not None
+    flat = np.full_like(ref, 128)
+    for f in range(1, 16):
+        obj.set_foreground(det(f))
+        obj.update(f, flat if f == 8 else ref)
+    for f in range(16, 20):
+        obj.set_foreground(det(f))
+        obj.update(f, ref)
+    assert obj.samples[8].alignment is None or obj.samples[8].status == "bridged"
+    obj.finish()
+    norm = normalize_tracks([make_track(1, "bey", {8: (float(cx), float(cy))})], obj.samples)
+    assert norm[0].dets == []
+
+
+def test_conditional_gap_interpolates_fixed_camera_interior_battle_span():
+    from bxjudge.types import Detection
+
+    ref, c = stadium_scene(size=(640, 360))
+    policy = load_dynamic_policy()
+    policy["conditional_gap_enabled"] = True
+    obj = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], policy, fixed_camera=True
+    )
+    cx, cy = np.mean(c.battle_area, axis=0)
+    det = lambda f: [Detection(f, "bey", (float(cx - 8), float(cy - 8), float(cx + 8), float(cy + 8)), 0.9)]
+    obj.set_foreground(det(0))
+    assert obj.update(0, ref).alignment is not None
+    flat = np.full_like(ref, 128)
+    for f in range(1, 8):
+        obj.set_foreground(det(f))
+        obj.update(f, ref)
+    obj.set_foreground(det(8))
+    obj.update(8, flat)
+    for f in range(9, 13):
+        obj.set_foreground(det(f))
+        obj.update(f, ref)
+    assert obj.samples[8].alignment is None or obj.samples[8].status == "bridged"
+    obj.finish()
+    assert obj.samples[8].status == "conditional_gap"
+    assert obj.samples[8].alignment is not None
+    norm = normalize_tracks([make_track(1, "bey", {8: (float(cx), float(cy))})], obj.samples)
+    assert len(norm[0].dets) == 1
+
+
+def test_conditional_gap_rejects_outside_pickup_or_non_fixed_camera():
+    from bxjudge.types import Detection
+
+    ref, c = stadium_scene(size=(640, 360))
+    policy = load_dynamic_policy()
+    policy["conditional_gap_enabled"] = True
+    # 1) Outside box (referee pickup) must keep gap unusable for judging
+    obj = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], policy, fixed_camera=True
+    )
+    out_det = lambda f: [Detection(f, "bey", (2.0, 2.0, 18.0, 18.0), 0.9)]
+    obj.set_foreground(out_det(0))
+    obj.update(0, ref)
+    for f in range(1, 8):
+        obj.set_foreground(out_det(f))
+        obj.update(f, ref)
+    obj.set_foreground(out_det(8))
+    obj.update(8, np.full_like(ref, 128))
+    for f in range(9, 13):
+        obj.set_foreground(out_det(f))
+        obj.update(f, ref)
+    obj.finish()
+    assert obj.samples[8].alignment is None or obj.samples[8].status == "bridged"
+    norm = normalize_tracks([make_track(1, "bey", {8: (10.0, 10.0)})], obj.samples)
+    assert norm[0].dets == []
+
+    # 2) Non-fixed camera must keep gap unusable even when bey is in battle_area
+    cx, cy = np.mean(c.battle_area, axis=0)
+    in_det = lambda f: [Detection(f, "bey", (float(cx - 8), float(cy - 8), float(cx + 8), float(cy + 8)), 0.9)]
+    moving = DynamicCalibration(
+        c, ref, 120.0, load_video_policy()["stadium_follow"], policy, fixed_camera=False
+    )
+    moving.set_foreground(in_det(0))
+    moving.update(0, ref)
+    moving.set_foreground(in_det(1))
+    moving.update(1, np.full_like(ref, 128))
+    for f in range(2, 6):
+        moving.set_foreground(in_det(f))
+        moving.update(f, ref)
+    moving.finish()
+    assert moving.samples[1].alignment is None or moving.samples[1].status == "bridged"
+    norm_moving = normalize_tracks([make_track(1, "bey", {1: (float(cx), float(cy))})], moving.samples)
+    assert norm_moving[0].dets == []
+

@@ -32,3 +32,10 @@ duplicate_containment: 0.8
 reacquire_min_gap_s: 1.0
 reacquire_confirm_frames: 5
 reacquire_min_score: 0.5
+# Circular arc motion proposal & physical velocity constraints (plan item E3,
+# association only). Off by default: E0 showed no gain on the 3 identity-test videos.
+circular_prediction_enabled: false
+circular_history_size: 10
+circular_min_points: 4
+circular_max_residual_ratio: 0.15
+max_prediction_drift_ratio: 0.35

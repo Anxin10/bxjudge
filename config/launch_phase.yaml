@@ -1,6 +1,8 @@
 # Observed launcher-body support only; never infer release from landing or finish.
 held_s: 0.2
 separation_s: 0.1
+launcher_gap_s: 0.05
+prefix_wait_s: 0.25
 body_margin_px: 12.0
 link_gap_s: 0.12
 link_error_px: 24.0
