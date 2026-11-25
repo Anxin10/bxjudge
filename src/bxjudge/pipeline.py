@@ -313,7 +313,11 @@ def judge_video(
                 snap, found = keypoint_snapshot(info.path, out_dir, stadium_tools, autocalib,
                                                 vetoed, hwaccel=th.decode_hwaccel,
                                                 allow_single=handheld,
-                                                keypoint_errors=keypoint_errors)
+                                                keypoint_errors=keypoint_errors,
+                                                # E9: only a measured fixed camera may use a
+                                                # later reference frame for the whole video.
+                                                later_windows=(camera is not None
+                                                               and camera.mode == "fixed"))
                 if snap is None:
                     found = None
             if on_snapshot is not None:

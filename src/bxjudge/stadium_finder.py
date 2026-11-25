@@ -88,8 +88,14 @@ class StadiumFinderConfig:
     keypoint_min_rail_coverage: float
     keypoint_min_rail_precision: float
     keypoint_agreement_px: float
+    # E9 (default off): when the first window finds no stadium, try the following windows of
+    # the same length that start no later than later_windows_max_start_s. Optional keys so
+    # older config copies keep loading; callers enable it for fixed cameras only.
+    later_windows_enabled: bool = False
+    later_windows_max_start_s: float = 30.0
 
 
+_OPTIONAL = ("later_windows_enabled", "later_windows_max_start_s")
 _INT_FIELDS = ("model_points", "hue_halfwidth", "min_saturation", "min_value",
                "candidate_frames", "work_width", "coarse_scale_steps", "coarse_top_k",
                "refine_iterations", "keypoint_imgsz", "keypoint_min_inliers")
@@ -109,15 +115,17 @@ def load_stadium_finder_config(path: Path = DEFAULT_STADIUM_FINDER_CONFIG) -> St
         raise TypeError(f"{path}: expected a mapping of setting names to values")
     names = [f.name for f in fields(StadiumFinderConfig)]
     unknown = sorted(set(raw) - set(names))
-    missing = sorted(set(names) - set(raw))
+    missing = sorted(set(names) - set(raw) - set(_OPTIONAL))
     if unknown or missing:
         raise ValueError(f"{path}: unknown keys {unknown}, missing keys {missing}")
     values: dict = {}
     for name in names:
+        if name not in raw:
+            continue
         v = raw[name]
-        if name == "edge_refinement":
+        if name in ("edge_refinement", "later_windows_enabled"):
             if not isinstance(v, bool):
-                raise ValueError(f"{path}: edge_refinement must be true or false, got {v!r}")
+                raise ValueError(f"{path}: {name} must be true or false, got {v!r}")
         elif name == "model_template":
             if not isinstance(v, str) or not v or "/" in v or "\\" in v:
                 raise ValueError(f"{path}: model_template must be a calibration name, got {v!r}")
@@ -1006,8 +1014,13 @@ def _alignment(fit: StadiumFit, model: StadiumModel, frame_size: tuple[int, int]
 def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
                  hwaccel: str = "cpu", keypoints=None,
                  keypoint_errors: list[str] | None = None,
-                 keypoint_fits: list | None = None) -> FoundStadium | None:
+                 keypoint_fits: list | None = None,
+                 later_windows: bool = False) -> FoundStadium | None:
     """Stadium zones for ``video`` from its clearest early frames, or ``None``.
+
+    ``later_windows`` (callers pass it for fixed cameras only) lets
+    ``cfg.later_windows_enabled`` retry later windows of the same length when the first
+    finds nothing; each window still needs its own two agreeing fits.
 
     Frames are sampled every ``sample_step_s`` within the first ``sample_window_s`` (playback
     seconds until the physical time base lands, ledger ruling T4), ranked by rail pixels, and
@@ -1035,10 +1048,35 @@ def find_stadium(video: Path, model: StadiumModel, cfg: StadiumFinderConfig, *,
 
     acfg = load_autocalib_config()
     try:
-        fps = probe(Path(video)).fps
+        meta = probe(Path(video))
+    except (VideoDecodeError, ValueError, OSError):
+        return None
+    starts = [0.0]
+    if later_windows and cfg.later_windows_enabled:
+        # E9: a stadium hidden at the start (scoreboard overlay, setup) may be clear later.
+        k = 1
+        while (k * cfg.sample_window_s <= cfg.later_windows_max_start_s
+               and k * cfg.sample_window_s < meta.duration):
+            starts.append(k * cfg.sample_window_s)
+            k += 1
+    for start in starts:
+        result = _find_in_window(video, model, cfg, acfg, meta.fps, start, hwaccel=hwaccel,
+                                 keypoints=keypoints, keypoint_errors=keypoint_errors,
+                                 keypoint_fits=keypoint_fits)
+        if result is not None:
+            return result
+    return None
+
+
+def _find_in_window(video, model, cfg, acfg, fps, start, *, hwaccel, keypoints,
+                    keypoint_errors, keypoint_fits) -> FoundStadium | None:
+    from bxjudge.autocalib import warp_calibration
+    from bxjudge.video import VideoDecodeError, iter_frames
+
+    try:
         step = max(1, round(cfg.sample_step_s * fps))
         samples = []
-        for idx, frame in iter_frames(Path(video), 0.0, cfg.sample_window_s,
+        for idx, frame in iter_frames(Path(video), start, start + cfg.sample_window_s,
                                       long_edge=_REF_LONG_EDGE, hwaccel=hwaccel):
             if idx % step == 0:
                 mask = rail_mask(frame, cfg)

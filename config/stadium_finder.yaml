@@ -136,3 +136,10 @@ keypoint_min_rail_precision: 0.3
 # inference px). Provisional, wider than agreement_px: points scatter more frame to frame
 # than the rail fit.
 keypoint_agreement_px: 12.0
+
+# --- E9 later reference windows (default off). When the first sample_window_s finds no
+# stadium (e.g. a scoreboard overlay at the start), retry the next windows of the same
+# length starting no later than later_windows_max_start_s. Fixed cameras only (the caller
+# decides); every window still needs two agreeing fits.
+later_windows_enabled: false
+later_windows_max_start_s: 30.0

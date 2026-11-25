@@ -508,7 +508,7 @@ def test_keypoint_snapshot_is_the_third_choice(tmp_path, monkeypatch, th, rules)
     [r] = _judge(source, tmp_path, th, rules, stadium_tools=_tools(), on_snapshot=chosen.append)
     assert chosen == [kp] and r.calibration_id == kp.id
     assert calls == [{"hwaccel": th.decode_hwaccel, "allow_single": False,
-                      "keypoint_errors": []}]
+                      "keypoint_errors": [], "later_windows": False}]
     assert "zone_out_of_frame@xtreme" in r.review_reasons and r.needs_review
     assert r.motion_evidence["stadium_keypoints"] == {
         "snapshot_id": kp.id, "method": "keypoints", "frame_index": 42, "agreeing_frames": 2,

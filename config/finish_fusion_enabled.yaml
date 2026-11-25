@@ -15,3 +15,9 @@ reverse_min_laplacian_var: 180.0
 
 # Terminal stop persistence guard (pixels across stadium before considering motion resumed)
 terminal_motion_guard_px: 45.0
+
+# E4b continuous-approach guard (default off). A stop candidate is rejected unless the
+# top was observed in every one of the preceding frames. A gap right before a "stop"
+# means occlusion (typically a hand taking the top), not a battle stop.
+continuous_approach_guard_enabled: false
+continuous_approach_frames: 30  # 0.25 s at 120 FPS; physical choice, not fitted to holdout

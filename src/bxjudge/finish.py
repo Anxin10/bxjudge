@@ -193,6 +193,19 @@ def orbit_direction(t: Track, c: Calibration, landing_frame: int | None,
     return th.orbit_to_spin['cw' if total > 0 else 'ccw']
 
 
+def continuous_approach_frames(fusion: dict[str, Any]) -> int | None:
+    """Validated look-back for the continuous-approach guard (E4b); None when off."""
+    enabled = fusion.get("continuous_approach_guard_enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("continuous_approach_guard_enabled must be a boolean")
+    if not enabled:
+        return None
+    frames = fusion.get("continuous_approach_frames")
+    if type(frames) is not int or frames < 1:
+        raise ValueError("continuous_approach_frames must be a positive integer")
+    return frames
+
+
 def stop_frame(
     t: Track,
     activity: dict[int, float],
@@ -267,6 +280,15 @@ def stop_frame(
             cand_frame = f - reverse_run + 1
             if cand_frame >= min_frame:
                 candidates.append((cand_frame, 'reversed'))
+
+    lookback = continuous_approach_frames(fusion) if fusion_enabled else None
+    if lookback is not None and candidates:
+        # A real stop decelerates in plain view. A detection gap just before the
+        # candidate means the top was occluded (typically a hand reaching in);
+        # whatever follows the gap cannot be attributed to the battle.
+        observed = set(sorted_frames)
+        candidates = [(cand_frame, kind) for cand_frame, kind in candidates
+                      if all(g in observed for g in range(cand_frame - lookback, cand_frame))]
 
     if fusion_enabled and guard_disp is not None and candidates:
         valid_candidates = []

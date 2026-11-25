@@ -191,6 +191,7 @@ def _single_fit_stadium(video: Path, model: StadiumModel, idx: int, frame: np.nd
 def keypoint_snapshot(video: Path, out_dir: Path, tools: StadiumTools, autocalib, vetoed, *,
                       hwaccel: str = "cpu", allow_single: bool = False,
                       keypoint_errors: list[str] | None = None,
+                      later_windows: bool = False,
                       ) -> tuple[Snapshot | None, FoundStadium | None]:
     """``find_stadium`` with the keypoint ensemble, stored as a ``keypoints`` snapshot
     (reference image = the found frame, score = fit coverage, homography = model px ->
@@ -204,7 +205,7 @@ def keypoint_snapshot(video: Path, out_dir: Path, tools: StadiumTools, autocalib
     fits: list = []
     found = find_stadium(Path(video), tools.model, tools.cfg, hwaccel=hwaccel,
                          keypoints=tools.finder, keypoint_fits=fits,
-                         keypoint_errors=keypoint_errors)
+                         keypoint_errors=keypoint_errors, later_windows=later_windows)
     if found is None or found.method != "keypoints":
         if not (allow_single and fits):
             return None, found
