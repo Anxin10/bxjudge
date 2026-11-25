@@ -500,3 +500,21 @@ def prepare_launch_tracks(tracks, fps, policy, *, side_hints=None):
         diagnostics,
         joins,
     )
+
+
+def trim_rounds_to_release(rounds, releases, pre_frames):
+    """Start each round at its earliest observed release minus ``pre_frames`` (E1c).
+
+    Only observed launcher releases (``prepare_launch_tracks``) clock a round;
+    a round without one is unchanged and a start never moves backwards. This
+    removes setup aiming from the round; it never assigns or infers a side.
+    """
+    if type(pre_frames) is not int or pre_frames < 0:
+        raise ValueError("pre_frames must be a nonnegative integer")
+    trimmed = []
+    for start, end in rounds:
+        inside = [f for f in releases.values() if start <= f <= end]
+        if inside:
+            start = max(start, min(inside) - pre_frames)
+        trimmed.append((start, end))
+    return trimmed

@@ -26,15 +26,17 @@ def load_identity_policy(path=DEFAULT_IDENTITY_CONFIG):
         "body_duplicate_overlap_min",
         "prelaunch_setup_anchor_enabled",
         "prelaunch_setup_wait_s",
+        "release_clock_trim_enabled",
     }
     if (
         not isinstance(value, dict)
         or set(value) != required
         or type(value["prelaunch_setup_anchor_enabled"]) is not bool
+        or type(value["release_clock_trim_enabled"]) is not bool
         or any(
             type(v) not in (int, float) or not math.isfinite(v) or v <= 0
             for k, v in value.items()
-            if k != "prelaunch_setup_anchor_enabled"
+            if k not in ("prelaunch_setup_anchor_enabled", "release_clock_trim_enabled")
         )
         or value["body_duplicate_overlap_min"] > 1
     ):

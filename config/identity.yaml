@@ -5,3 +5,6 @@ body_duplicate_overlap_min: 0.8
 prelaunch_setup_anchor_enabled: false
 prelaunch_setup_wait_s: 1.5
 
+# E1c: start a round at its earliest observed launcher release (minus
+# launch_pre_s). Setup aiming is not battle; never infers a release.
+release_clock_trim_enabled: false

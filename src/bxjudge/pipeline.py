@@ -79,6 +79,7 @@ from .launch_phase import (
     load_launch_policy,
     observe_launch_segments,
     prepare_launch_tracks,
+    trim_rounds_to_release,
 )
 from .manifest import (
     VideoInfo,
@@ -544,6 +545,16 @@ def judge_video(
         raw_by_id = {t.track_id: t for t in raw_tracks}
         bey_tracks = [t for t in raw_tracks if t.cls == "bey"]
         rounds = segment_rounds(bey_tracks, info.fps, th)
+        if phase is not None and identity_policy["release_clock_trim_enabled"]:
+            # E1c: setup aiming before the first observed release is not battle.
+            untrimmed = rounds
+            rounds = trim_rounds_to_release(
+                rounds, phase.releases, round(th.launch_pre_s * info.fps)
+            )
+            record["identity"]["release_clock_trim"] = [
+                {"segmented": list(a), "start": b[0]}
+                for a, b in zip(untrimmed, rounds) if a != b
+            ]
         physical_rounds={}
         adjudication_rounds={}
         releases_by_round = {}
