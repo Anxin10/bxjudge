@@ -518,3 +518,18 @@ def trim_rounds_to_release(rounds, releases, pre_frames):
             start = max(start, min(inside) - pre_frames)
         trimmed.append((start, end))
     return trimmed
+
+
+def missing_geometry_start(start, end, landing_frame):
+    """First frame whose missing stadium geometry can void a round (E1d).
+
+    Battle begins at the earlier of the two observed landings; setup and launch
+    frames before it are not battle. Unless both landings are observed inside the
+    round, the whole round still counts (the round start is returned).
+    """
+    if type(start) is not int or type(end) is not int or end < start:
+        raise ValueError("invalid round span")
+    frames = [None if landing_frame is None else landing_frame.get(side) for side in ("X", "B")]
+    if any(type(f) is not int or not start <= f <= end for f in frames):
+        return start
+    return min(frames)

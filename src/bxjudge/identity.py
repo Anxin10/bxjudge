@@ -21,22 +21,26 @@ DEFAULT_IDENTITY_CONFIG = Path(__file__).resolve().parents[2] / "config/identity
 @config_loader
 def load_identity_policy(path=DEFAULT_IDENTITY_CONFIG):
     value = yaml.safe_load(Path(path).read_text())
+    switches = (
+        "prelaunch_setup_anchor_enabled",
+        "release_clock_trim_enabled",
+        "phase_release_evidence_enabled",
+        "geometry_window_from_landing_enabled",
+    )
     required = {
         "context_wait_s",
         "body_duplicate_overlap_min",
-        "prelaunch_setup_anchor_enabled",
         "prelaunch_setup_wait_s",
-        "release_clock_trim_enabled",
+        *switches,
     }
     if (
         not isinstance(value, dict)
         or set(value) != required
-        or type(value["prelaunch_setup_anchor_enabled"]) is not bool
-        or type(value["release_clock_trim_enabled"]) is not bool
+        or any(type(value[k]) is not bool for k in switches)
         or any(
             type(v) not in (int, float) or not math.isfinite(v) or v <= 0
             for k, v in value.items()
-            if k not in ("prelaunch_setup_anchor_enabled", "release_clock_trim_enabled")
+            if k not in switches
         )
         or value["body_duplicate_overlap_min"] > 1
     ):

@@ -79,6 +79,7 @@ from .launch_phase import (
     load_launch_policy,
     observe_launch_segments,
     prepare_launch_tracks,
+    missing_geometry_start,
     trim_rounds_to_release,
 )
 from .manifest import (
@@ -608,6 +609,12 @@ def judge_video(
                 releases_by_round[number] = round_release_evidence(
                     physical, adjudication_rounds[number], side_hints, native_segments, c,
                     required_frames=required_separation_frames,
+                    phase_releases=(
+                        {native_id: (frame, phase.diagnostics[native_id]["body_track_id"])
+                         for native_id, frame in phase.releases.items()}
+                        if phase is not None and identity_policy["phase_release_evidence_enabled"]
+                        else None
+                    ),
                 )
                 if launch_mask_reviewer is not None:
                     launch_mask_probes.extend(build_release_probes(
@@ -811,8 +818,14 @@ def judge_video(
                 if review["status"] in {"disagrees", "candidate_without_box_release"}
             ]
             if geometry is not None:
+                geometry_start = start
+                if identity_policy["geometry_window_from_landing_enabled"]:
+                    # E1d: setup and launch frames are not battle; both observed
+                    # landings are required, else the whole round still counts.
+                    # Auditable from the round's saved landing_X / landing_B.
+                    geometry_start = missing_geometry_start(start, end, launch.landing_frame)
                 missing = [
-                    f for f in range(start, end + 1)
+                    f for f in range(geometry_start, end + 1)
                     if geometry.samples[f].alignment is None or geometry.samples[f].status == "bridged"
                 ]
                 if missing and not any(map(relevant, missing)):

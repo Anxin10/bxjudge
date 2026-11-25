@@ -11,7 +11,7 @@
 | 開關 | `config/identity.yaml` 的 `release_clock_trim_enabled`，**預設 `false`**，必須是布林值（嚴格載入） |
 | 函式 | `launch_phase.trim_rounds_to_release(rounds, releases, pre_frames)` |
 | 接入點 | `pipeline.py`，在 `segment_rounds` 之後、軌跡重建之前 |
-| 規則 | 回合內如果有**觀察到的發射器放手**（`prepare_launch_tracks` 的 `phase.releases`），起點改成「最早的放手 − `launch_pre_s`（0.5 秒）」 |
+| 規則 | 回合內如果有**觀察到的發射器放手**（`prepare_launch_tracks` 的 `phase.releases`），起點改成「最早的放手 − `launch_pre_s`」。**更正：** 實際執行時 `config/physical_time.yaml` 會把它覆寫成 62.5 ms（120 FPS 下約 8 幀），不是 `thresholds.yaml` 的 0.5 秒 |
 | 不做的事 | 沒有放手的回合不改；起點只會往後、不會往前；不推測放手時間；不指派 X/B |
 | 稽核 | 被修剪的回合記在 geometry json 的 `identity.release_clock_trim`（原始區間與新起點） |
 
@@ -55,7 +55,11 @@
 
 - 其他 11 局沒有修剪，因為回合內沒有 `phase.releases` 觀察到的放手。這正是上游診斷中的「沒觀察到放手」問題（11 側）。
 - **E1c 單獨開時，18、19 的覆蓋率反而是 0**。修剪只是去掉準備階段，真正的身份錨定還要靠 E1b 的發射前錨點。兩者要一起開才有效。
-- 18、19 的發射時間仍然未知（`launch_timing_unknown`）。推測是 `round_release_evidence` 需要 native 軌跡的「上膛→分離」片段，而新起點（放手前 0.5 秒）把上膛片段切掉了。這點**尚未驗證**，留給 E1d。
+- 18、19 的發射時間仍然未知（`launch_timing_unknown`）。~~推測是新起點把上膛片段切掉了~~
+  - **E1d 查證後的原因：** `round_release_evidence` 只認逐幀分類器（`observe_launch_segments`）判出的「上膛→分離」。
+  - 18 號放手那幾幀，同一個發射器被偵測成兩個重疊的框（22、23），之後發射器又在約 10 幀內離開畫面，所以分類器從頭到尾沒有判出「分離」。
+  - `prepare_launch_tracks` 可以容忍短暫缺失，所以有抓到放手（1576 幀）。
+  - 詳見 E1d 報告。
 
 ### 3.3 identity-test（3 支，有逐框真值）
 

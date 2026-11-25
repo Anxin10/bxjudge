@@ -8,3 +8,12 @@ prelaunch_setup_wait_s: 1.5
 # E1c: start a round at its earliest observed launcher release (minus
 # launch_pre_s). Setup aiming is not battle; never infers a release.
 release_clock_trim_enabled: false
+# E1d: a strict launch-phase release (prepare_launch_tracks) of a physical
+# actor's native member is release evidence when the per-frame segment
+# classifier could not see the separation (duplicate launcher boxes, launcher
+# leaving view). Same unique-side, pair and observation checks apply.
+phase_release_evidence_enabled: false
+# E1d: count missing stadium geometry from the first observed landing of the
+# round (both sides' landings known), not from setup/launch frames. Without
+# both landings the whole round still counts.
+geometry_window_from_landing_enabled: false

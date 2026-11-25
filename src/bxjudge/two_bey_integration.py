@@ -130,8 +130,14 @@ def round_release_evidence(
     calibration: Calibration,
     *,
     required_frames: int,
+    phase_releases: dict[int, tuple[int, int | None]] | None = None,
 ) -> dict[int, dict]:
-    """Use only release evidence assigned to this physical actor in this round."""
+    """Use only release evidence assigned to this physical actor in this round.
+
+    ``phase_releases`` (E1d, off when ``None``): strict launch-phase releases
+    by native id, as ``(release_frame, launcher_id)``. One counts only for a native member without a segment proof,
+    and passes the same in-round and observation checks over its separation run.
+    """
     record = physical.record
     if len(registered) != 2 or record["pair_confirmed_at_frame"] is None:
         return {}
@@ -148,6 +154,7 @@ def round_release_evidence(
             continue
         for native_id in physical.members[track.track_id]:
             states = segments.get(native_id, [])
+            proofs = len(candidates[track.track_id])
             for mount, release in pairwise(states):
                 if (
                     mount.state != "mounted" or release.state != "separated"
@@ -166,6 +173,23 @@ def round_release_evidence(
                     "mounted": [mount.first_frame, mount.last_frame],
                     "frame": first, "confirmed_at_frame": confirmed,
                 })
+            if (
+                phase_releases is not None
+                and len(candidates[track.track_id]) == proofs
+                and native_id in phase_releases
+            ):
+                first, launcher_id = phase_releases[native_id]
+                confirmed = first + required_frames - 1
+                if (
+                    record["first_frame"] <= first <= confirmed <= record["last_frame"]
+                    and all(observed.get((actor, f)) == native_id
+                            for f in range(first, confirmed + 1))
+                ):
+                    candidates[track.track_id].append({
+                        "native_id": native_id, "launcher_id": launcher_id,
+                        "mounted": [first, first], "source": "launch_phase",
+                        "frame": first, "confirmed_at_frame": confirmed,
+                    })
     selected = {track_id: choices[0] for track_id, choices in candidates.items() if len(choices) == 1}
     if not selected:
         return {}
