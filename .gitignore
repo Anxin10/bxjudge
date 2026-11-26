@@ -17,3 +17,18 @@ __pycache__/
 .graft/
 antigravity.db
 *.so
+
+# Local tooling and caches (not part of the project)
+.ruff_cache/
+.superpowers/
+.agents/
+.research/
+.graft/
+.graftignore
+.graphifyignore
+graphify-out/
+src/graphify-out/
+*.code-workspace
+CLAUDE.md
+# Rust build output (the crate sources are not kept here)
+rust/
