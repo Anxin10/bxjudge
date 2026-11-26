@@ -36,4 +36,4 @@ for run in sys.argv[2:]:
     print(f"  identity coverage (observed bey rows with X/B) mean {sum(cov)/max(1,len(cov)):.3f}; rounds with any >0: {sum(1 for c in cov if c>0)}/{len(cov)}")
     print("  top blockers:", ", ".join(f"{k}({n})" for k,n in res["reasons"].most_common(8)))
     out[run]={k:(dict(v) if isinstance(v,Counter) else v) for k,v in res.items()}
-json.dump(out,open("/home/<user>/bxjudge/runs/holdout21-20261125/holdout-eval.json","w"),ensure_ascii=False,indent=1)
+json.dump(out,open(__import__("pathlib").Path(__file__).resolve().parents[2] / "runs/holdout21-20261125/holdout-eval.json","w"),ensure_ascii=False,indent=1)

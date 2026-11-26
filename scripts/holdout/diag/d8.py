@@ -1,6 +1,7 @@
 import json,glob,os,csv
 from collections import Counter
-H="/home/<user>/bxjudge/runs/holdout21-20261125"
+from pathlib import Path
+H=str(Path(__file__).resolve().parents[3] / "runs/holdout21-20261125")
 truth={r["video"][:-4]:r for r in csv.DictReader(open(f"{H}/truth-working.csv",encoding="utf-8-sig"))}
 tot=Counter()
 for p in sorted(glob.glob(f"{H}/combined/geometry/*.json")):

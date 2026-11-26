@@ -24,7 +24,7 @@
 | 8b | field_right_lower | 內場右側斜邊下端 |
 
 - 左右都以場地為準：貓耳朝向觀看者時的左邊，與 X／B 的定義相同。
-- 參考圖：`C:\Users\<user>\AppData\Local\Temp\...\calibview\kp_proposal_v2.jpg`。實作時另存一份到 `docs/superpowers/specs/2026-11-11-stadium-keypoints.jpg`。
+- 參考圖：（本機暫存檔，未納入 repo）。實作時另存一份到 `docs/superpowers/specs/2026-11-11-stadium-keypoints.jpg`。
 
 ## 做法
 

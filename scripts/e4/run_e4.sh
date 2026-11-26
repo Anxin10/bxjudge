@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # E4 controlled experiment: multi-feature finish fusion enabled with E1 & E1b
 set -euo pipefail
-B=/home/<user>/bxjudge
+B="$(cd "$(dirname "$0")/../.." && pwd)"
 E0=$B/runs/e0-baseline-20261124
 E1B=$B/runs/e1b-eval-20261125
 E4=$B/runs/e4-eval-20261125

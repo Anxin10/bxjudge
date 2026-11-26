@@ -67,7 +67,7 @@
    - `adjudication_rounds` 為求 100% 安全，將 `identity_unknown_at` 之後的幀全部過濾；
    - 導致裁決器只看到截斷的 6 幀，不足以達到 `still_frames: 12`，轉而報告 `track_lost`。
 2. **架構路線圖的完全吻合性：**
-   - 本次實驗完美印證了 [COMPETITIVE_GAP_ANALYSIS.md](file:///home/<user>/bxjudge/COMPETITIVE_GAP_ANALYSIS.md) §3.3 原始設計的遠見：**E7 (ROI 原解析度重推論)** 與 **E2 (離線雙向縫合)** 必須與 E4 配合。
+   - 本次實驗完美印證了 [COMPETITIVE_GAP_ANALYSIS.md](../docs/COMPETITIVE_GAP_ANALYSIS.md) §3.3 原始設計的遠見：**E7 (ROI 原解析度重推論)** 與 **E2 (離線雙向縫合)** 必須與 E4 配合。
    - **E7 (ROI 原解析度重推論)**：對終結候選與微小目標以高解析度重新推論，消除末端 19 幀的掉檢；
    - **E2 (離線雙向縫合)**：由末端向前反向縫合，恢復因短暫 gap 造成的 unknown，使 E4 的多特徵停轉能直接在批次裁決中全面發布！
 
@@ -76,8 +76,8 @@
 ## 5. 安全護欄與向後相容
 
 1. **零破壞性與回滾安全：**
-   - [config/finish_fusion.yaml](file:///home/<user>/bxjudge/config/finish_fusion.yaml) 預設為 `enabled: false`，所有既有測試與舊有管線行為 100% 不受影響。
-   - 實驗設定獨立存放於 [config/finish_fusion_enabled.yaml](file:///home/<user>/bxjudge/config/finish_fusion_enabled.yaml)，由 CLI `--finish-fusion` 動態載入。
+   - [config/finish_fusion.yaml](../config/finish_fusion.yaml) 預設為 `enabled: false`，所有既有測試與舊有管線行為 100% 不受影響。
+   - 實驗設定獨立存放於 [config/finish_fusion_enabled.yaml](../config/finish_fusion_enabled.yaml)，由 CLI `--finish-fusion` 動態載入。
 2. **單元測試全數通過：**
    - `test_finish.py` 新增 7 項多特徵停轉單元測試（包含 Laplacian 計算、融合判定、著地時間閘門、Guard 位移驗證等），**86/86 通過 (1.10s)**。
    - `test_pipeline.py` 全 **118 項整合測試通過 (116s)**。
@@ -86,7 +86,7 @@
 
 ## 6. 下一步推進（Next Steps）
 
-依據 [COMPETITIVE_GAP_ANALYSIS.md](file:///home/<user>/bxjudge/COMPETITIVE_GAP_ANALYSIS.md) 規劃路線：
+依據 [COMPETITIVE_GAP_ANALYSIS.md](../docs/COMPETITIVE_GAP_ANALYSIS.md) 規劃路線：
 1. **推進至 E7（ROI 原解析度重推論）**：
    - 針對停轉候選視窗與邊緣掉檢區域進行原解析度再推論，補齊末端 15~20 幀的細微偵測；
 2. **推進至 E2（離線雙向縫合）**：

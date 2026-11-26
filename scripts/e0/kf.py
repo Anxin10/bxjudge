@@ -1,16 +1,16 @@
 """E0 identity keyframes: every 0.25 s inside each round window; candidate bey boxes from the production detector (tracker-independent)."""
 import json, cv2, numpy as np, sys
 from pathlib import Path
-sys.path.insert(0, "/home/<user>/bxjudge/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from bxjudge.detect import load_detector
-E = Path("/home/<user>/bxjudge/runs/e0-baseline-20261124/truth"); E.mkdir(parents=True, exist_ok=True)
-W = Path("/mnt/c/Users/<user>/AppData/Local/Temp/claude/0d05d5ae05dd15db/76cf77f2-3949-4532-8b09-753d801c1ee2/scratchpad/w/kf"); W.mkdir(exist_ok=True)
+E = Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/truth"; E.mkdir(parents=True, exist_ok=True)
+W = Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/kf"; W.mkdir(exist_ok=True)
 WIN = {"20261024_201331": (5.5, 28.0), "20261024_201410": (3.6, 19.0), "20261024_201444": (4.4, 19.0)}
-sel = json.load(open("/home/<user>/bxjudge/weights/selected.json"))
+sel = json.load(open(Path(__file__).resolve().parents[2] / "weights/selected.json"))
 det = load_detector("rfdetr", sel["weights"], conf=0.2)
 out = {}
 for v, (t0, t1) in WIN.items():
-    cap = cv2.VideoCapture(f"/home/<user>/bx/videos/20261024/{v}.mp4"); fps = cap.get(cv2.CAP_PROP_FPS)
+    cap = cv2.VideoCapture(str(Path.home() / "bx/videos/20261024" / f"{v}.mp4")); fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
     t = t0
     while t <= t1 + 1e-6:

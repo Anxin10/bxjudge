@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # E1b controlled experiment: clean code with E1b & E1 enabled
 set -euo pipefail
-B=/home/<user>/bxjudge
+B="$(cd "$(dirname "$0")/../.." && pwd)"
 E0=$B/runs/e0-baseline-20261124
 E1B=$B/runs/e1b-eval-20261125
 mkdir -p "$E1B"

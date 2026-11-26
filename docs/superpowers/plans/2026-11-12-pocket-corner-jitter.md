@@ -1,6 +1,6 @@
 # BXJudge 入袋框角抖動與發射審查補項
 
-基底 9a51211，沿用 feat/local-judge。開發案例為 210934 第 1 回合的右 Over 袋 f4246–4281。[影格與原始診斷](/home/<user>/bxjudge/.superpowers/sdd/identity-task4-20261112/followup/REPORT.md)
+基底 9a51211，沿用 feat/local-judge。開發案例為 210934 第 1 回合的右 Over 袋 f4246–4281。[影格與原始診斷（本機 `.superpowers/sdd/identity-task4-20261112/followup/REPORT.md`，未納入 repo）
 
 ## 入袋規則
 

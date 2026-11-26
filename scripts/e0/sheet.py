@@ -1,7 +1,7 @@
 import json, cv2, numpy as np
 from pathlib import Path
-E = Path("/home/<user>/bxjudge/runs/e0-baseline-20261124/truth")
-W = Path("/mnt/c/Users/<user>/AppData/Local/Temp/claude/0d05d5ae05dd15db/76cf77f2-3949-4532-8b09-753d801c1ee2/scratchpad/w/kf")
+E = Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/truth"
+W = Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/kf"
 K = json.loads((E / "keyframes.json").read_text())
 C, CW, CH = 3, 112, 112
 cells = []

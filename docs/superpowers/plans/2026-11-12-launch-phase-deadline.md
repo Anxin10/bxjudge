@@ -1,6 +1,6 @@
 # BXJudge 發射階段分段與落地期限計畫
 
-基底為 feat/local-judge 的 415ea34。開發案例為 210934 與 214640 的第 1 回合。Task 4 的 20 回合重判作為比較基準。[兩案例證據](/home/<user>/bxjudge/.superpowers/sdd/identity-task4-20261112/followup/REPORT.md)
+基底為 feat/local-judge 的 415ea34。開發案例為 210934 與 214640 的第 1 回合。Task 4 的 20 回合重判作為比較基準。[兩案例證據（本機 `.superpowers/sdd/identity-task4-20261112/followup/REPORT.md`，未納入 repo）
 
 ## 判定與資料流
 

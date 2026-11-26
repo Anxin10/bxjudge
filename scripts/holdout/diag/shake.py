@@ -1,5 +1,6 @@
 import cv2,numpy as np,sys
-V="/home/<user>/bx/videos/20261024/"
+from pathlib import Path
+V=str(Path.home() / "bx/videos/20261024") + "/"
 for no,name in [("01","20261025_000157"),("04","20261025_000458"),("13","20261025_001454"),("03","20261025_000239"),("19","20261025_002801")]:
     cap=cv2.VideoCapture(V+name+".mp4"); fps=cap.get(5); n=int(cap.get(7))
     ref=None; shifts=[]

@@ -92,7 +92,7 @@
 
 ```bash
 mkdir -p ~/bxjudge && cd ~/bxjudge && git init
-cp "/mnt/c/Users/<user>/VSC/Edge/docs/specs/2026-10-21-beyblade-x-local-judge-design.md" docs/spec.md
+cp "<原始設計稿>/2026-10-21-beyblade-x-local-judge-design.md" docs/spec.md
 ```
 
 - [ ] **Step 2: 撰寫 `scripts/setup_wsl.sh`**

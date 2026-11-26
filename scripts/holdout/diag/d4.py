@@ -1,5 +1,6 @@
 import json,glob,csv,os
-H="/home/<user>/bxjudge/runs/holdout21-20261125"
+from pathlib import Path
+H=str(Path(__file__).resolve().parents[3] / "runs/holdout21-20261125")
 truth={r["video"][:-4]:r for r in csv.DictReader(open(f"{H}/truth-working.csv",encoding="utf-8-sig"))}
 rounds=json.load(open(f"{H}/combined/rounds.json")); main={}
 for r in rounds:

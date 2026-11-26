@@ -118,7 +118,7 @@ def main():
             batches.append(
                 (
                     "real",
-                    Path("/home/<user>/bx/videos/20261001"),
+                    Path.home() / "bx/videos/20261001",
                     root / "no-real-calibration",
                     Path("config/detection.yaml"),
                 )
@@ -179,7 +179,7 @@ def main():
     )
     assert not Path("weights/selected.json").exists()
     metadata = {
-        r["video"]: vars(probe(Path("/home/<user>/bx/videos/20261001") / r["video"]))
+        r["video"]: vars(probe(Path.home() / "bx/videos/20261001" / r["video"]))
         for r in real
     }
     (root / "real-metadata.json").write_text(

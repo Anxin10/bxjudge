@@ -18,7 +18,7 @@
 
 ## Global Constraints
 
-- repo 在 WSL `/home/<user>/bxjudge`，分支 `feat/local-judge`。指令都在 WSL 內執行（例：`.venv/bin/python -m pytest -q -p no:cacheprovider ...`；從 Git Bash 呼叫時前置 `MSYS_NO_PATHCONV=1 wsl.exe -d ubuntu -- bash -lc "cd ~/bxjudge && ..."`）。
+- repo 在 WSL `~/bxjudge`，分支 `feat/local-judge`。指令都在 WSL 內執行（例：`.venv/bin/python -m pytest -q -p no:cacheprovider ...`；從 Git Bash 呼叫時前置 `MSYS_NO_PATHCONV=1 wsl.exe -d ubuntu -- bash -lc "cd ~/bxjudge && ..."`）。
 - 不動他人未提交的修改：`.gitignore`、`README.md`、`pyproject.toml`、`scripts/build_reid_review.py`、`scripts/setup_wsl.sh`、`src/bxjudge/finish.py`、`src/bxjudge/geometry.py`、`src/bxjudge/web/reid_review.*`、`src/bxjudge/workbench_server.py`、`tests/test_geometry.py`、`tests/test_workbench_server.py`，以及未追蹤的 `rust/`、`judge_view.py`、`bx_fx.js`、`bx_theme.css`、`judge_view.js`、`tests/test_judge_evidence.py`、`workbench_restyle.py`、`workbench_theme.py`。受保護的未追蹤檔（`.agents/ AGENTS.md CLAUDE.md .claude.code-workspace antigravity.db .graftignore .graphifyignore graphify-out/ src/graphify-out/`）不 stage、不刪。
 - 只提交自己的檔案：`git commit -o <paths>`（新檔先 `git add -- <新檔>`）；commit 訊息結尾 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。不 push、不 merge。
 - `pipeline.py`、`launch_check.py`、`rules.py` 是 Codex 也在改的檔案（落地回歸 D265／G555／202324）。動這些檔案前先 `git status --short` 與 `git log -3`，確認 Codex 沒有未提交的修改；有的話等它提交。

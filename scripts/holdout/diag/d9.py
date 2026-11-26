@@ -1,6 +1,7 @@
 import json,csv
 from collections import Counter
-H="/home/<user>/bxjudge/runs/holdout21-20261125"
+from pathlib import Path
+H=str(Path(__file__).resolve().parents[3] / "runs/holdout21-20261125")
 truth={r["video"]:r for r in csv.DictReader(open(f"{H}/truth-working.csv",encoding="utf-8-sig"))}
 for run in ("baseline","combined"):
     rows=json.load(open(f"{H}/{run}/rounds.json")); per=Counter(r["video"] for r in rows)

@@ -1,6 +1,9 @@
 import csv, json, sys, glob, os
+from pathlib import Path
+from pathlib import Path
+from pathlib import Path
 run=sys.argv[1]
-truth=json.load(open("/home/<user>/bxjudge/runs/e0-baseline-20261124/truth/e0-truth.json"))
+truth=json.load(open(Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/truth/e0-truth.json"))
 for p in sorted(glob.glob(run+"/trajectories/*.csv")):
     v=os.path.basename(p).rsplit("_r",1)[0]+".mp4"
     fps=truth["videos"][v]["fps"]; rnd=truth["videos"][v]["round"]

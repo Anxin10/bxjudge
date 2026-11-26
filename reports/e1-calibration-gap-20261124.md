@@ -37,16 +37,16 @@
 
 ## 2. 第二階段：開關實作與測試
 
-- **設定檔 [config/dynamic_calibration.yaml](file:///home/<user>/bxjudge/config/dynamic_calibration.yaml)**（預設關閉）：
+- **設定檔 [config/dynamic_calibration.yaml](../config/dynamic_calibration.yaml)**（預設關閉）：
   - `conditional_gap_enabled: false`
   - `conditional_gap_max_s: 0.80`
   - `conditional_gap_max_error_px: 4.0`
   - `conditional_gap_min_pocket_margin_px: 12.0`
-- **實作位置 [src/bxjudge/dynamic_calibration.py](file:///home/<user>/bxjudge/src/bxjudge/dynamic_calibration.py)**：
+- **實作位置 [src/bxjudge/dynamic_calibration.py](../src/bxjudge/dynamic_calibration.py)**：
   - 於 `DynamicCalibration.finish()` 中檢查固定機位、缺口時長、前後已驗證端點之 `mean_boundary_error`、無 `temporal_template_disagreement`，以及區間內陀螺觀測框對 `outside`/得分口之安全邊距；通過者線性內插 Homography 並標記 `status = "conditional_gap"`（保留 `diagnostics[f]["conditional_gap"]` 稽核紀錄）。
   - `judge_view.py` 維持僅接受 `tracking` / `relocated` / `temporal_verified` 作為發射參考圖，不混用內插幾何。
 - **測試驗證**：
-  - 新增 3 項單元測試於 [tests/test_dynamic_calibration.py](file:///home/<user>/bxjudge/tests/test_dynamic_calibration.py)（預設關閉不補齊、固定機位場內短缺口補齊、賽後 `outside` 與非固定機位拒絕補齊）。
+  - 新增 3 項單元測試於 [tests/test_dynamic_calibration.py](../tests/test_dynamic_calibration.py)（預設關閉不補齊、固定機位場內短缺口補齊、賽後 `outside` 與非固定機位拒絕補齊）。
   - 完整測試套件 `uv run pytest -q`：**`1984 passed, 4 xfailed`**（零失敗）。
 
 ---

@@ -2,7 +2,7 @@
 
 > **結論：不通過，不實作。** 沒有修改任何產品程式碼、設定或權重。
 >
-> **對應：** `COMPETITIVE_GAP_ANALYSIS.md` §3.3 的 E7。
+> **對應：** `docs/COMPETITIVE_GAP_ANALYSIS.md` §3.3 的 E7。
 >
 > **資料：** E4 批次輸出 `runs/e4-eval-20261125/production/`（commit `b3ce75f`，E1＋E1b＋E4 開啟），使用 production 權重 `train-rfdetr-20261023b`，信心門檻 0.01，用 PyTorch 推論。
 
@@ -46,7 +46,7 @@ E4 報告認為：3 局仍需覆核的主因是「陀螺停轉後偵測斷掉」
 ## 3. 判斷
 
 - E7 的通過門檻是「Finish F1 和 launcher 召回提升，延遲增加 ≤ 15%」。現有權重下，局部重新推論**沒有任何一幀的增益**，邊緣 launcher 還變差，所以不通過。
-- 依 `COMPETITIVE_GAP_ANALYSIS.md` §3.4 的規則，不寫入產品程式碼。
+- 依 `docs/COMPETITIVE_GAP_ANALYSIS.md` §3.4 的規則，不寫入產品程式碼。
 - 如果之後要再試，前提是先用多尺度或裁切資料增強重新訓練偵測器；這會動到訓練，不屬於本輪的最小侵入範圍。
 
 ## 4. 對 E4 報告的更正

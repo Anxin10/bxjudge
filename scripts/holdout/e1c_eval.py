@@ -1,7 +1,8 @@
 """E1c metrics per run: launch clock, setup pairing, geometry-missing, verdicts, identity coverage.
 usage: e1c_eval.py SET RUN_DIR... (SET = holdout | idtest)"""
 import json,glob,os,csv,sys,re
-R="/home/<user>/bxjudge/runs"
+from pathlib import Path
+R=str(Path(__file__).resolve().parents[2] / "runs")
 L={"20261025_000157":2.1,"20261025_000239":2.7,"20261025_000458":16.9,"20261025_000545":5.7,"20261025_000603":5.37,
    "20261025_001054":5.5,"20261025_001118":6.9,"20261025_001200":7.8,"20261025_001425":11.05,"20261025_001454":10.2,
    "20261025_001522":21.1,"20261025_002731":13.1,"20261025_002801":12.3,"20261025_001330":18.4,

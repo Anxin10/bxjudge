@@ -1,9 +1,9 @@
 import sys, math, csv
-sys.path.insert(0, "/home/<user>/bxjudge/src")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "src"))
 import cv2, numpy as np
 from pathlib import Path
 from bxjudge.detect import load_detector
-ROOT=Path("/home/<user>/bxjudge")
+ROOT=Path(__file__).resolve().parents[2]
 det=load_detector("rfdetr", next((ROOT/"runs/train-rfdetr-20261023b").rglob("checkpoint_best_ema.pth")), conf=0.01)
 VID=ROOT/"runs/e0-baseline-20261124/videos"
 RUN=ROOT/"runs/e4-eval-20261125/production"

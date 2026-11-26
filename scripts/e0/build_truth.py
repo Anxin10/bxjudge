@@ -1,7 +1,7 @@
 """Assemble E0 truth from the visually adjudicated keyframe labels (Claude, 2026-11-24; NOT human truth)."""
 import json, hashlib
 from pathlib import Path
-T = Path("/home/<user>/bxjudge/runs/e0-baseline-20261124/truth")
+T = Path(__file__).resolve().parents[2] / "runs/e0-baseline-20261124/truth"
 K = json.loads((T / "keyframes.json").read_text())
 # One token per detector box, in box order: X / B / U(unknown) / N(not a bey) / D(duplicate box of an already-labelled bey).
 # A trailing "+m" means a visible bey had no box (detector miss) on that keyframe.
