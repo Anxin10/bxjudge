@@ -307,3 +307,5 @@ WSL 的 `~/bxjudge` 下執行；各步驟的細節在後面的章節。產生的
 
 標註、評估門檻校正與規則核對見 [docs/guide/labeling-eval-rules.md](docs/guide/labeling-eval-rules.md)；
 選用功能見 [docs/guide/advanced-features.md](docs/guide/advanced-features.md)。
+
+已有輸出要套用新設定或重新計時時，對新的結果資料夾執行 `bxjudge run --rejudge` 重新分析。
