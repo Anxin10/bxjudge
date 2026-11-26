@@ -13,6 +13,11 @@ from bxjudge.camera_motion import CameraMotion
 from tests.helpers import make_video, shipped_autocalib, stadium_scene
 from tests.test_stadium_finder import synth_model  # noqa: F401  (fixture)
 
+# The keypoint weights live in weights/ (gitignored); tests that load them skip in CI.
+needs_keypoint_weights = pytest.mark.skipif(
+    not (PROJECT_ROOT / "weights" / "stadium-keypoints-20261112" / "run.pt").exists(),
+    reason="local stadium keypoint weights are not present")
+
 
 def _load():
     spec = importlib.util.spec_from_file_location(
@@ -33,6 +38,7 @@ def _batch(root, name, videos):
     return folder
 
 
+@needs_keypoint_weights
 def test_modes_summarises_per_batch(tmp_path, monkeypatch):
     a = _batch(tmp_path / "videos", "20261101", ["h1.mp4", "h2.mp4", "f1.mp4"])
     b = _batch(tmp_path / "videos", "20261108", ["f2.mp4"])
@@ -199,6 +205,7 @@ def test_rows_are_keyed_by_split_and_errors_are_retried(tmp_path):
     assert len(latest) == 1 and latest[0]["batch"] == "unmatched"
 
 
+@needs_keypoint_weights
 def test_resume_refuses_another_configuration(tmp_path, monkeypatch):
     a = _batch(tmp_path / "videos", "20261101", ["h1.mp4"])
     monkeypatch.setattr(ev, "measure_video_motion", lambda video, *x, **k: CameraMotion(60.0, 9))
@@ -226,6 +233,7 @@ def test_a_custom_dataset_is_protected(tmp_path):
 # ---- Codex re-review R2 (Task 8) ------------------------------------------------------
 
 
+@needs_keypoint_weights
 def test_resume_refuses_another_tracker_configuration(tmp_path, monkeypatch):
     a = _batch(tmp_path / "videos", "20261101", ["h1.mp4"])
     monkeypatch.setattr(ev, "measure_video_motion", lambda video, *x, **k: CameraMotion(60.0, 9))
@@ -237,6 +245,7 @@ def test_resume_refuses_another_tracker_configuration(tmp_path, monkeypatch):
         ev.main(["modes", "--out", str(out), str(a)])
 
 
+@needs_keypoint_weights
 def test_a_batch_name_stays_bound_to_its_source_folder(tmp_path, monkeypatch):
     a = _batch(tmp_path / "A", "20261101", ["clip.mp4"])
     b = _batch(tmp_path / "B", "20261101", ["clip.mp4"])
@@ -252,6 +261,7 @@ def test_a_batch_name_stays_bound_to_its_source_folder(tmp_path, monkeypatch):
     assert len((out / "rows.jsonl").read_text().splitlines()) == 2
 
 
+@needs_keypoint_weights
 def test_a_changed_video_or_label_is_measured_again(tmp_path, monkeypatch):
     import os
 
@@ -297,6 +307,7 @@ def test_a_file_link_inside_the_snapshot_folder_is_refused_before_any_write(tmp_
     assert not (out / "manifest.json").exists()
 
 
+@needs_keypoint_weights
 def test_a_changed_batch_mapping_re_measures_and_replaces_the_image(tmp_path, monkeypatch):
     import hashlib
 

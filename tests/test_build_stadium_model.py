@@ -29,7 +29,10 @@ def fake_root(tmp_path, monkeypatch):
     calib = tmp_path / "calib"
     calib.mkdir()
     for suffix in (".json", ".png"):
-        shutil.copy(PROJECT_ROOT / "calib" / f"20261014_202713{suffix}", calib)
+        source = PROJECT_ROOT / "calib" / f"20261014_202713{suffix}"
+        if not source.exists():  # calib/ is local-only (gitignored); absent in CI
+            pytest.skip(f"local calibration template missing: {source.name}")
+        shutil.copy(source, calib)
     monkeypatch.setattr(bm, "PROJECT_ROOT", tmp_path)
     return tmp_path
 
