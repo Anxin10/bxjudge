@@ -1,0 +1,23 @@
+{
+  "speed_gate": "PASS",
+  "speed_ratio": 0.842,
+  "human_reviewed_rows_in_previous_results": 6,
+  "side_assignment": {"correct": 9, "wrong": 0, "unknown": 3},
+  "continuation": {"before_tracks": 41, "after_tracks": 23, "applied_joins": 18},
+  "identity_label_conflicts": 0,
+  "core_commit": "0123456789abcdef",
+  "local_reid_review": {"case_count": 2},
+  "challenge_review": {"selected_by_category": {"overlap": 4, "similar": 3, "blur": 2}},
+  "two_bey_preview": {"previews": [
+    {"video": "synthetic_match_a.mp4", "round": 1, "entity_count": 2},
+    {"video": "synthetic_match_b.mp4", "round": 2, "entity_count": 3}
+  ]},
+  "rounds": [
+    {"video": "synthetic_match_a.mp4", "round": 1, "ai_outcome": "X 超出 · 2 分", "ai_needs_review": false,
+     "human_outcome_recorded": "X 超出 · 2 分", "human_reviewed_in_previous_results": true},
+    {"video": "synthetic_match_a.mp4", "round": 2, "ai_outcome": "未判定", "ai_needs_review": true,
+     "human_outcome_recorded": "B 耐久 · 1 分", "human_reviewed_in_previous_results": true},
+    {"video": "synthetic_match_b.mp4", "round": 1, "ai_outcome": "未判定", "ai_needs_review": true,
+     "human_outcome_recorded": "—", "human_reviewed_in_previous_results": false}
+  ]
+}

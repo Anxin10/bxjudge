@@ -1,0 +1,11 @@
+{
+  "run": "runs/synthetic-storybook",
+  "round_count": 3,
+  "review_count": 2,
+  "top_reasons": [
+    ["launch_release_unobserved", 2, "detect"],
+    ["id_swap_risk", 1, "identity"],
+    ["X_stop_reversed", 1, "finish"]
+  ],
+  "stores": {"reid-review": 1, "identity-audit": 2, "corrections": 0}
+}
