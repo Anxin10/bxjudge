@@ -36,6 +36,7 @@ Beyblade X 比賽影片的本機 AI 裁判（Local AI referee for Beyblade X mat
 - [進階功能與設定](docs/guide/advanced-features.md)（TensorRT、軌跡動畫、動態校準等）
 - [競品差距分析與實驗路線](docs/COMPETITIVE_GAP_ANALYSIS.md)
 - [設計與實作計畫（superpowers）](docs/superpowers/)
+- [工作台 Storybook](storybook/README.md)（用合成資料檢視工作台頁面狀態）
 - [2026-10 開發日誌](docs/history/dev-log-2026-10.md)
 
 ## 環境設定

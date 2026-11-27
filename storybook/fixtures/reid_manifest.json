@@ -1,0 +1,27 @@
+{
+  "sha": "5f0c3a9e1b7d24e68c0f9a3b5d7e1c2a4b6d8f0e1a3c5b7d9e2f4a6c8b0d1e3f",
+  "manifest": {
+    "cases": [
+      {
+        "case_id": "synthetic-001",
+        "video": "synthetic_match_a.mp4",
+        "clip": {"path": "data:,"},
+        "source_size": [1280, 720],
+        "before": {"frame": 2410, "box": [512, 300, 572, 360], "score": 0.91, "image": "@synthetic-frame:542,330"},
+        "after": {"frame": 2436, "box": [600, 330, 662, 392], "score": 0.74, "image": "@synthetic-frame:631,361"},
+        "reasons": ["軌跡在交疊後中斷", "外觀相似度低於門檻"],
+        "native_ids": [3, 7]
+      },
+      {
+        "case_id": "synthetic-002",
+        "video": "synthetic_match_b.mp4",
+        "clip": {"path": "data:,"},
+        "source_size": [1280, 720],
+        "before": {"frame": 980, "box": [700, 250, 756, 306], "score": 0.88, "image": "@synthetic-frame:728,278"},
+        "after": {"frame": 1012, "box": [420, 410, 478, 468], "score": 0.62, "image": "@synthetic-frame:449,439"},
+        "reasons": ["位置跳動超過上限"],
+        "native_ids": [2, 9]
+      }
+    ]
+  }
+}

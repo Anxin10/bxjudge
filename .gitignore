@@ -32,3 +32,8 @@ src/graphify-out/
 CLAUDE.md
 # Rust build output (the crate sources are not kept here)
 rust/
+
+# Storybook (workbench pages, synthetic data only)
+node_modules/
+storybook-static/
+storybook/generated/
